@@ -5,6 +5,7 @@ from datetime import timedelta
 from alvarezgui.action import validate_action
 from alvarezgui.app import create_app
 from alvarezgui.config import Settings
+from testdb import test_settings
 from alvarezgui.consumer import Consumer
 from alvarezgui.db import connect
 from alvarezgui.node_agent.runtime import FakeRuntime, SandboxState
@@ -26,7 +27,7 @@ from test_tasks_api import request
 class BoundariesTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.settings = Settings()
+        cls.settings = test_settings()
 
     def setUp(self) -> None:
         with connect(self.settings) as connection:

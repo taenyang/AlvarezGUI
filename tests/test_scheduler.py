@@ -4,6 +4,7 @@ from datetime import timedelta
 from unittest.mock import Mock
 
 from alvarezgui.config import Settings
+from testdb import test_settings
 from alvarezgui.consumer import Consumer
 from alvarezgui.db import connect
 from alvarezgui.model import FakeModelService
@@ -16,7 +17,7 @@ from alvarezgui.task_store import TaskCreateRequest, TaskStore
 class SchedulerTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.settings = Settings()
+        cls.settings = test_settings()
 
     def setUp(self) -> None:
         import redis

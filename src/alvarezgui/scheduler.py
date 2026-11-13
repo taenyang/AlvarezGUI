@@ -21,12 +21,14 @@ class Scheduler:
         stream: str = TASK_STREAM,
         group: str = TASK_CONSUMER_GROUP,
         stale_after: timedelta = timedelta(minutes=5),
+        max_active: int | None = None,
     ) -> None:
         self.settings = settings or Settings()
         self.redis = redis_client or client(self.settings)
         self.stream = stream
         self.group = group
         self.stale_after = stale_after
+        self.max_active = max_active
 
     def run_once(self) -> dict[str, Any] | None:
         ensure_group(self.redis, self.stream, self.group)
@@ -35,7 +37,11 @@ class Scheduler:
             store.requeue_expired_leases()
             store.requeue_stale_allocating(self.stale_after)
         with connect(self.settings) as connection:
-            dispatch = TaskStore(connection).claim_next_queued()
+            store = TaskStore(connection)
+            if self.max_active is not None and store.count_active() >= self.max_active:
+                # Leave work QUEUED so priorities still apply and stale-ALLOCATING recovery never churns.
+                return None
+            dispatch = store.claim_next_queued()
         if dispatch is not None:
             publish(self.redis, dispatch["task_id"], dispatch["episode_id"], self.stream)
         return dispatch

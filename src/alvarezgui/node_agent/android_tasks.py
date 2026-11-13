@@ -66,3 +66,35 @@ def resolve_android_task(task_type: str, app_image: str) -> AndroidTask:
         f"no offline Android task oracle for task_type={task_type!r}, "
         f"app_image={app_image!r}"
     )
+
+
+SHOPPING_INSTRUCTION = (
+    "Buy the Blue Widget test item. Tap Buy test item and finish only after Order complete is visible.\n"
+    "Screenshot is 720x1280; tap/swipe coordinates are absolute screenshot pixels, "
+    "not normalized 0..1000 or cropped-WebView coordinates."
+)
+
+# Tasks the console offers; each entry must resolve through resolve_android_task.
+TASK_CATALOG: tuple[dict[str, str], ...] = (
+    {
+        "task_type": "shopping",
+        "app_image": "android-shop-v1",
+        "label": "测试商城下单",
+        "instruction": SHOPPING_INSTRUCTION,
+    },
+    {
+        "task_type": "android_launch_smoke",
+        "app_image": "android-settings-v1",
+        "label": "打开系统设置",
+        "instruction": "Open the Android Settings app.\n"
+        "Screenshot is 720x1280; tap/swipe coordinates are absolute screenshot pixels.",
+    },
+)
+
+
+def default_instruction(task_type: str, app_image: str) -> str:
+    for entry in TASK_CATALOG:
+        if entry["task_type"] == task_type and entry["app_image"] == app_image:
+            return entry["instruction"]
+    resolve_android_task(task_type, app_image)
+    raise UnsupportedAndroidTask(f"no default instruction for {task_type!r}/{app_image!r}")

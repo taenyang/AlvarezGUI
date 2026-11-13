@@ -20,6 +20,11 @@ class TaskCreateRequest(BaseModel):
     policy_version: str = Field(min_length=1)
     max_steps: int = Field(ge=1)
     priority: int = 5
+    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    seed: int | None = None
+
+
+TASK_LINK_FIELDS = ("run_id", "round", "group_id", "eval_id")
 
 
 class CancelRequest(BaseModel):
@@ -42,9 +47,18 @@ class TaskStore:
     def __init__(self, connection: psycopg.Connection) -> None:
         self.connection = connection
 
-    def create_task(self, request: TaskCreateRequest, idempotency_key: str) -> tuple[dict[str, Any], bool]:
+    def create_task(
+        self,
+        request: TaskCreateRequest,
+        idempotency_key: str,
+        links: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Create a task; ``links`` ties internal rollouts and eval trials to their parent."""
+        links = links or {}
+        if set(links) - set(TASK_LINK_FIELDS):
+            raise ValueError("unknown task link field")
         values = request.model_dump(mode="json")
-        fingerprint = self._fingerprint(values)
+        fingerprint = self._fingerprint({**values, **links})
         task_id = f"task_{uuid.uuid4().hex}"
 
         with self.connection.transaction():
@@ -53,8 +67,10 @@ class TaskStore:
                 INSERT INTO tasks (
                     task_id, task_type, instruction, app_image, policy_version,
                     max_steps, priority, status, sandbox_id, current_step,
-                    idempotency_key, request_fingerprint
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'QUEUED', NULL, 0, %s, %s)
+                    idempotency_key, request_fingerprint, temperature, seed,
+                    run_id, round, group_id, eval_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'QUEUED', NULL, 0, %s, %s,
+                          %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (idempotency_key) DO NOTHING
                 RETURNING task_id
                 """,
@@ -68,6 +84,9 @@ class TaskStore:
                     values["priority"],
                     idempotency_key,
                     fingerprint,
+                    values["temperature"],
+                    values["seed"],
+                    *(links.get(name) for name in TASK_LINK_FIELDS),
                 ),
             ).fetchone()
             if inserted is None:
@@ -166,6 +185,12 @@ class TaskStore:
             if updated.rowcount != 1 or episode_updated.rowcount != 1:
                 raise RuntimeError("queued task changed while claiming")
             return row
+
+    def count_active(self) -> int:
+        with self.connection.transaction():
+            return self.connection.execute(
+                "SELECT count(*) AS count FROM tasks WHERE status IN ('ALLOCATING', 'RUNNING_ENV', 'WAITING_MODEL')"
+            ).fetchone()["count"]
 
     def requeue_stale_allocating(self, stale_after: timedelta = timedelta(minutes=5)) -> int:
         with self.connection.transaction():
@@ -276,7 +301,7 @@ class TaskStore:
             return self.connection.execute(
                 """
                 SELECT t.task_id, t.task_type, t.instruction, t.app_image, t.policy_version,
-                       t.max_steps, t.current_step, t.status,
+                       t.max_steps, t.current_step, t.status, t.temperature, t.seed,
                        e.episode_id, e.status AS episode_status
                 FROM tasks AS t
                 JOIN episodes AS e ON e.task_id = t.task_id
@@ -486,6 +511,8 @@ class TaskStore:
         reward: dict[str, Any],
         done: bool,
         lease_id: str | None = None,
+        model_output: dict[str, Any] | None = None,
+        final_observation: dict[str, Any] | None = None,
     ) -> bool:
         with self.connection.transaction():
             existing = self.connection.execute(
@@ -522,8 +549,8 @@ class TaskStore:
 
             self.connection.execute(
                 """
-                INSERT INTO steps (episode_id, step_id, observation, action, reward, done)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO steps (episode_id, step_id, observation, action, reward, done, model_output)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     episode_id,
@@ -532,6 +559,7 @@ class TaskStore:
                     Json(action),
                     Json(reward),
                     done,
+                    Json(model_output) if model_output is not None else None,
                 ),
             )
             status = (
@@ -557,7 +585,12 @@ class TaskStore:
                     SET status = %s, result = %s, updated_at = CURRENT_TIMESTAMP
                     WHERE task_id = %s AND episode_id = %s
                     """,
-                    (status, Json({"final_reward": reward}), task_id, episode_id),
+                    (
+                        status,
+                        Json({"final_reward": reward, "final_observation": final_observation}),
+                        task_id,
+                        episode_id,
+                    ),
                 )
             else:
                 self.connection.execute(

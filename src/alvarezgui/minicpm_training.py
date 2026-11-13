@@ -6,7 +6,7 @@ import math
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from alvarezgui.action import validate_action
 from alvarezgui.minicpm_service import _read_image
@@ -161,17 +161,20 @@ def _checkpoint(model: Any, processor: Any, accelerator: Any, output_dir: Path) 
         processor.save_pretrained(output_dir)
 
 
-def _validate_grpo_rows(rows: list[dict[str, Any]], group_size: int) -> None:
+def _validate_grpo_rows(rows: list[dict[str, Any]], group_size: int, require_old_logprob: bool = True) -> None:
     group_counts = defaultdict(int)
     for row in rows:
         group_counts[str(row["group_id"])] += 1
         if "old_logprob" not in row:
+            if not require_old_logprob:
+                continue
             raise DatasetValidationError("GRPO rows require old_logprob from rollout collection")
         try:
             float(row["old_logprob"])
         except (TypeError, ValueError) as exc:
             raise DatasetValidationError("GRPO old_logprob must be numeric") from exc
-    if any(count < group_size for count in group_counts.values()):
+    # Precomputed episode-level advantages already encode the group baseline.
+    if not all("advantage" in row for row in rows) and any(count < group_size for count in group_counts.values()):
         raise DatasetValidationError("each GRPO group must contain group_size rollouts")
 
 
@@ -186,13 +189,20 @@ def train(
     gradient_accumulation: int = 1,
     clip_epsilon: float = 0.2,
     group_size: int = 2,
+    on_step: Callable[[int, dict[str, float]], None] | None = None,
+    compute_old_logprob: bool = False,
 ) -> dict[str, Any]:
+    """Train and save a checkpoint.
+
+    ``compute_old_logprob`` fills missing GRPO ``old_logprob`` values with the loaded base policy
+    before any update, which matches on-policy rollouts sampled from that same checkpoint.
+    """
     if algorithm not in {"sft", "grpo"}:
         raise ValueError("algorithm must be sft or grpo")
     if algorithm == "grpo":
         if group_size < 2:
             raise ValueError("GRPO requires group_size >= 2")
-        _validate_grpo_rows(rows, group_size)
+        _validate_grpo_rows(rows, group_size, require_old_logprob=not compute_old_logprob)
     torch, Accelerator, AutoModelForImageTextToText, AutoProcessor = _imports()
     accelerator = Accelerator(gradient_accumulation_steps=gradient_accumulation, mixed_precision="bf16")
     processor = AutoProcessor.from_pretrained(base_model)
@@ -205,7 +215,25 @@ def train(
     started = time.monotonic()
     losses: list[float] = []
     updates = 0
-    advantages = group_advantages(rows) if algorithm == "grpo" else []
+    advantages: list[float] = []
+    if algorithm == "grpo":
+        # Multi-step rollouts carry an episode-level advantage; single-step rows are grouped here.
+        if all("advantage" in row for row in rows):
+            advantages = [float(row["advantage"]) for row in rows]
+        else:
+            advantages = group_advantages(rows)
+    if algorithm == "grpo" and compute_old_logprob:
+        model.eval()
+        with torch.no_grad():
+            for row in rows:
+                if "old_logprob" in row:
+                    continue
+                batch, labels = _masked_batch(processor, row, torch)
+                batch = _move(batch, accelerator.device)
+                with accelerator.autocast():
+                    logits = model(**batch, use_cache=False).logits
+                row["old_logprob"] = float(_sequence_logprob(torch, logits, labels.to(accelerator.device)))
+        model.train()
     for _ in range(epochs):
         for index, row in enumerate(rows):
             batch, labels = _masked_batch(processor, row, torch)
@@ -223,19 +251,31 @@ def train(
                             ignore_index=-100,
                         )
                     else:
-                        mask = labels[..., 1:] != -100
-                        log_probs = torch.log_softmax(outputs.logits[..., :-1, :], dim=-1)
-                        token_log_probs = log_probs.gather(-1, labels[..., 1:].clamp_min(0).unsqueeze(-1)).squeeze(-1)
-                        current_logprob = token_log_probs.masked_select(mask).sum()
+                        current_logprob = _sequence_logprob(torch, outputs.logits, labels)
                         old_logprob = torch.as_tensor(float(row["old_logprob"]), device=accelerator.device)
                         ratio = torch.exp(current_logprob - old_logprob)
                         advantage = torch.as_tensor(advantages[index], device=accelerator.device)
                         loss = -torch.minimum(ratio * advantage, ratio.clamp(1 - clip_epsilon, 1 + clip_epsilon) * advantage)
                 accelerator.backward(loss)
+                grad_norm = (
+                    float(accelerator.clip_grad_norm_(model.parameters(), float("inf")))
+                    if accelerator.sync_gradients
+                    else None
+                )
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 updates += 1
             losses.append(float(loss.detach().cpu()))
+            if on_step is not None:
+                step_metrics = {"train/loss": losses[-1], "train/learning_rate": learning_rate}
+                if grad_norm is not None and math.isfinite(grad_norm):
+                    step_metrics["train/grad_norm"] = grad_norm
+                if algorithm == "grpo":
+                    ratio_value = float(ratio.detach().cpu())
+                    step_metrics["train/ratio"] = ratio_value
+                    step_metrics["train/advantage"] = advantages[index]
+                    step_metrics["train/clipped"] = float(abs(ratio_value - 1) > clip_epsilon)
+                on_step(updates, step_metrics)
     _checkpoint(model, processor, accelerator, Path(output_dir))
     metrics = {
         "algorithm": algorithm,
@@ -252,6 +292,14 @@ def train(
     if accelerator.is_main_process:
         Path(output_dir, "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     return metrics
+
+
+def _sequence_logprob(torch: Any, logits: Any, labels: Any) -> Any:
+    """Sum of completion-token log-probabilities; prompt tokens are masked with -100."""
+    mask = labels[..., 1:] != -100
+    log_probs = torch.log_softmax(logits[..., :-1, :].float(), dim=-1)
+    token_log_probs = log_probs.gather(-1, labels[..., 1:].clamp_min(0).unsqueeze(-1)).squeeze(-1)
+    return token_log_probs.masked_select(mask).sum()
 
 
 def main() -> None:

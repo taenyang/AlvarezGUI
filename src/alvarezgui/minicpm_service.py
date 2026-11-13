@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import argparse
 import base64
+import gc
 import json
+import os
 import threading
 import time
-from dataclasses import dataclass
+from collections import OrderedDict, deque
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.error import HTTPError
+from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 from alvarezgui.action import validate_action
@@ -46,6 +50,19 @@ def _read_image(uri: str, timeout: float) -> Any:
     return Image.open(BytesIO(payload)).convert("RGB")
 
 
+def service_instruction(instruction: str) -> str:
+    """The exact user prompt the policy sees; training rows must reuse it verbatim."""
+    return (
+        f"{instruction}\n"
+        "Return exactly one JSON object and nothing else. Use exactly one of these schemas: "
+        '{"type":"tap","x":integer,"y":integer}, '
+        '{"type":"swipe","x1":integer,"y1":integer,"x2":integer,"y2":integer,"duration_ms":integer}, '
+        '{"type":"text","text":"..."}, {"type":"back"}, '
+        '{"type":"wait","duration_ms":integer}, or {"type":"terminate","reason":"..."}. '
+        "Never output a key named action, an action list, parentheses, Markdown, or explanation."
+    )
+
+
 def _parse_action(raw_output: str) -> dict[str, Any]:
     decoder = json.JSONDecoder()
     candidates = [raw_output.strip()]
@@ -65,46 +82,116 @@ def _parse_action(raw_output: str) -> dict[str, Any]:
     raise InvalidActionOutputError("MiniCPM output did not contain a valid Android action")
 
 
-@dataclass(slots=True)
+Resolver = Callable[[str], str]
+Loader = Callable[[str], tuple[Any, Any, Any]]
+
+
+def load_pretrained(model_path: str) -> tuple[Any, Any, Any]:
+    try:
+        import torch
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+    except ImportError as exc:
+        raise MiniCPMDependencyError(
+            "real MiniCPM serving requires torch, torchvision and transformers>=5.18"
+        ) from exc
+    processor = AutoProcessor.from_pretrained(model_path)
+    model = AutoModelForImageTextToText.from_pretrained(
+        model_path,
+        torch_dtype="auto",
+        device_map="auto",
+    )
+    model.eval()
+    return model, processor, torch
+
+
+def control_plane_resolver(base_url: str, password: str, timeout: float = 5.0) -> Resolver:
+    """Resolve model versions through the control plane registry (file:// checkpoints on this host)."""
+
+    def resolve(version: str) -> str:
+        request = Request(
+            f"{base_url.rstrip('/')}/internal/v1/model-versions/{quote(version, safe='')}",
+            headers={"Authorization": f"Bearer {password}"},
+        )
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                row = json.loads(response.read())
+        except HTTPError as exc:
+            if exc.code == 404:
+                raise ModelVersionNotFoundError(version) from exc
+            raise
+        uri = row.get("checkpoint_uri") or ""
+        if not uri.startswith("file://"):
+            raise ModelVersionNotFoundError(f"{version} has no local checkpoint")
+        return unquote(urlparse(uri).path)
+
+    return resolve
+
+
 class MiniCPMService:
-    model: Any
-    processor: Any
-    model_version: str
-    generation_lock: threading.Lock
-    torch: Any
+    """Serves several checkpoints, loading on demand and evicting the least recently used."""
+
+    def __init__(self, resolver: Resolver, max_loaded: int = 2, loader: Loader = load_pretrained) -> None:
+        if max_loaded < 1:
+            raise ValueError("max_loaded must be at least 1")
+        self.resolver = resolver
+        self.max_loaded = max_loaded
+        self.loader = loader
+        self.models: OrderedDict[str, tuple[Any, Any]] = OrderedDict()
+        self.torch: Any = None
+        self.generation_lock = threading.Lock()
+        self.waiting = 0
+        self.requests = 0
+        self.rejected = 0
+        self.latencies: deque[int] = deque(maxlen=200)
 
     @classmethod
     def load(cls, model_path: str | Path, model_version: str) -> "MiniCPMService":
-        try:
-            import torch
-            from transformers import AutoModelForImageTextToText, AutoProcessor
-        except ImportError as exc:
-            raise MiniCPMDependencyError(
-                "real MiniCPM serving requires torch, torchvision and transformers>=5.18"
-            ) from exc
-        processor = AutoProcessor.from_pretrained(str(model_path))
-        model = AutoModelForImageTextToText.from_pretrained(
-            str(model_path),
-            torch_dtype="auto",
-            device_map="auto",
-        )
-        model.eval()
-        return cls(model, processor, model_version, threading.Lock(), torch)
+        service = cls(_static_resolver({model_version: str(model_path)}), max_loaded=1)
+        with service.generation_lock:
+            service._model(model_version)
+        return service
+
+    def _model(self, version: str) -> tuple[Any, Any]:
+        """Caller must hold generation_lock."""
+        if version in self.models:
+            self.models.move_to_end(version)
+            return self.models[version]
+        path = self.resolver(version)
+        while len(self.models) >= self.max_loaded:
+            self._evict()
+        model, processor, self.torch = self.loader(path)
+        self.models[version] = (model, processor)
+        return model, processor
+
+    def _evict(self) -> None:
+        self.models.popitem(last=False)
+        gc.collect()
+        if self.torch is not None and self.torch.cuda.is_available():
+            self.torch.cuda.empty_cache()
+
+    def unload_all(self) -> list[str]:
+        with self.generation_lock:
+            versions = list(self.models)
+            while self.models:
+                self._evict()
+        return versions
+
+    def health(self) -> dict[str, Any]:
+        latencies = sorted(self.latencies)
+        return {
+            "loaded_versions": list(self.models),
+            "max_loaded": self.max_loaded,
+            "waiting_requests": self.waiting,
+            "requests": self.requests,
+            "rejected_outputs": self.rejected,
+            "latency_p50_ms": latencies[len(latencies) // 2] if latencies else None,
+            "latency_p95_ms": latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))] if latencies else None,
+        }
 
     def infer(self, request: InferenceRequest) -> InferenceResponse:
-        if request.model_version != self.model_version:
-            raise ModelVersionNotFoundError(request.model_version)
         started = time.monotonic()
         image = _read_image(request.image_uri, request.timeout_ms / 1000)
-        instruction = (
-            f"{request.instruction}\n"
-            "Return exactly one JSON object and nothing else. Use exactly one of these schemas: "
-            '{"type":"tap","x":integer,"y":integer}, '
-            '{"type":"swipe","x1":integer,"y1":integer,"x2":integer,"y2":integer,"duration_ms":integer}, '
-            '{"type":"text","text":"..."}, {"type":"back"}, '
-            '{"type":"wait","duration_ms":integer}, or {"type":"terminate","reason":"..."}. '
-            "Never output a key named action, an action list, parentheses, Markdown, or explanation."
-        )
+        instruction = service_instruction(request.instruction)
         messages = [
             {
                 "role": "user",
@@ -114,43 +201,79 @@ class MiniCPMService:
                 ],
             }
         ]
+        self.waiting += 1
         with self.generation_lock:
-            inputs = self.processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt",
-                downsample_mode="16x",
-                max_slice_nums=36,
-                enable_thinking=False,
-            ).to(self.model.device)
-            generation_args: dict[str, Any] = {
-                "max_new_tokens": request.max_tokens,
-                "downsample_mode": "16x",
-                "do_sample": request.temperature > 0,
-            }
-            if request.temperature > 0:
-                generation_args["temperature"] = request.temperature
-            with self.torch.inference_mode():
-                generated_ids = self.model.generate(**inputs, **generation_args)
-            trimmed = [
-                output_ids[len(input_ids) :]
-                for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            raw_output = self.processor.batch_decode(
-                trimmed,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-            )[0]
-        action = _parse_action(raw_output)
+            self.waiting -= 1
+            model, processor = self._model(request.model_version)
+            raw_output = self._generate(model, processor, messages, request)
+        self.requests += 1
+        try:
+            action = _parse_action(raw_output)
+        except InvalidActionOutputError:
+            self.rejected += 1
+            raise
+        latency_ms = max(0, round((time.monotonic() - started) * 1000))
+        self.latencies.append(latency_ms)
         return InferenceResponse(
             request_id=request.request_id,
             action=action,
             raw_output=raw_output,
-            model_version=self.model_version,
-            latency_ms=max(0, round((time.monotonic() - started) * 1000)),
+            model_version=request.model_version,
+            latency_ms=latency_ms,
         )
+
+    def _generate(self, model: Any, processor: Any, messages: list[dict[str, Any]], request: InferenceRequest) -> str:
+        inputs = processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+            downsample_mode="16x",
+            max_slice_nums=36,
+            enable_thinking=False,
+        ).to(model.device)
+        generation_args: dict[str, Any] = {
+            "max_new_tokens": request.max_tokens,
+            "downsample_mode": "16x",
+            "do_sample": request.temperature > 0,
+        }
+        if request.temperature > 0:
+            generation_args["temperature"] = request.temperature
+            if request.seed is not None:
+                self.torch.manual_seed(request.seed)
+        with self.torch.inference_mode():
+            generated_ids = model.generate(**inputs, **generation_args)
+        trimmed = [
+            output_ids[len(input_ids) :]
+            for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        return processor.batch_decode(
+            trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )[0]
+
+
+def _static_resolver(paths: dict[str, str]) -> Resolver:
+    def resolve(version: str) -> str:
+        if version not in paths:
+            raise ModelVersionNotFoundError(version)
+        return paths[version]
+
+    return resolve
+
+
+def _chain(*resolvers: Resolver) -> Resolver:
+    def resolve(version: str) -> str:
+        for resolver in resolvers[:-1]:
+            try:
+                return resolver(version)
+            except ModelVersionNotFoundError:
+                continue
+        return resolvers[-1](version)
+
+    return resolve
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -168,7 +291,16 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def do_GET(self) -> None:
+        if self.path != "/health":
+            self._reply(404, {"detail": "not found"})
+            return
+        self._reply(200, self.server.service.health())
+
     def do_POST(self) -> None:
+        if self.path == "/internal/v1/model/unload":
+            self._reply(200, {"unloaded": self.server.service.unload_all()})
+            return
         if self.path != "/internal/v1/model/infer":
             self._reply(404, {"detail": "not found"})
             return
@@ -195,8 +327,7 @@ class _ModelServer(ThreadingHTTPServer):
     service: MiniCPMService
 
 
-def serve(model_path: str, model_version: str, host: str, port: int) -> None:
-    service = MiniCPMService.load(model_path, model_version)
+def serve(service: MiniCPMService, host: str, port: int) -> None:
     server = _ModelServer((host, port), _Handler)
     server.service = service
     try:
@@ -207,12 +338,22 @@ def serve(model_path: str, model_version: str, host: str, port: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", required=True)
-    parser.add_argument("--model-version", default="minicpm-v-4.7-1b")
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--model", action="append", default=[], metavar="VERSION=PATH",
+                        help="statically known checkpoint; may repeat")
+    parser.add_argument("--control-plane-url", help="resolve other versions via the registry; "
+                        "password comes from CONSOLE_PASSWORD")
+    parser.add_argument("--max-loaded", type=int, default=2)
+    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18081)
     args = parser.parse_args()
-    serve(args.model_path, args.model_version, args.host, args.port)
+    static = dict(entry.split("=", 1) for entry in args.model)
+    resolvers = [_static_resolver(static)]
+    if args.control_plane_url:
+        password = os.environ.get("CONSOLE_PASSWORD")
+        if not password:
+            raise SystemExit("CONSOLE_PASSWORD is required with --control-plane-url")
+        resolvers.append(control_plane_resolver(args.control_plane_url, password))
+    serve(MiniCPMService(_chain(*resolvers), max_loaded=args.max_loaded), args.host, args.port)
 
 
 if __name__ == "__main__":

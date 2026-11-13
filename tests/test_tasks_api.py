@@ -4,6 +4,7 @@ import unittest
 from typing import Any
 
 from alvarezgui.config import Settings
+from testdb import test_settings
 from alvarezgui.db import connect
 from alvarezgui.app import create_app
 
@@ -48,7 +49,7 @@ def request(app: Any, method: str, path: str, body: dict | None = None, headers:
 class TasksApiTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.settings = Settings()
+        cls.settings = test_settings()
         cls.app = create_app(cls.settings)
 
     def setUp(self) -> None:

@@ -49,6 +49,12 @@ class Settings(BaseSettings):
     model_backend: str = Field(default="fake_policy", pattern="^(fake_policy|http)$")
     model_service_url: str = "http://127.0.0.1:18081"
     model_request_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    console_password: SecretStr | None = None
+    console_host: str = "0.0.0.0"
+    console_port: int = Field(default=8600, ge=1, le=65535)
+    node_id: str = "node-local"
+    node_address: str = ""
+    fixture_port: int = Field(default=18090, ge=1, le=65535)
 
     @property
     def minio_endpoint(self) -> str:

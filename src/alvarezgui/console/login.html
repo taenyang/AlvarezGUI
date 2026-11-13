@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 · AlvarezGUI 实验平台</title>
+<link rel="stylesheet" href="/console/static/style.css">
+</head>
+<body>
+<div class="login card">
+  <h2>AlvarezGUI 实验平台</h2>
+  <form method="post" action="/console/login">
+    <label class="secondary" for="password">访问密码</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+    <p id="error" class="error-text" role="alert" hidden></p>
+    <button class="primary" type="submit">登录</button>
+  </form>
+</div>
+<script>
+  const error = new URLSearchParams(location.search).get("error");
+  if (error) {
+    const node = document.getElementById("error");
+    node.textContent = error === "locked" ? "失败次数过多，请 5 分钟后再试。" : "密码错误。";
+    node.hidden = false;
+  }
+</script>
+</body>
+</html>

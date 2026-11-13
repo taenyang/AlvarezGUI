@@ -7,7 +7,9 @@ from typing import Any, Literal
 
 import psycopg
 from psycopg.types.json import Json
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from alvarezgui.node_agent.android_tasks import resolve_android_task
 
 
 class RegistryConflictError(Exception):
@@ -37,13 +39,71 @@ class DatasetRequest(BaseModel):
     sample_count: int = Field(ge=0)
 
 
+class TaskSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    task_type: str = Field(min_length=1)
+    app_image: str = Field(min_length=1)
+    instruction: str | None = Field(default=None, min_length=1, max_length=2_000)
+
+    @model_validator(mode="after")
+    def _known_task(self) -> "TaskSpec":
+        resolve_android_task(self.task_type, self.app_image)
+        return self
+
+
+class TrainingConfig(BaseModel):
+    """Whitelisted training knobs; paths and commands are resolved server-side, never accepted."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    learning_rate: float = Field(default=1e-6, gt=0, le=1e-3)
+    epochs: int = Field(default=1, ge=1, le=10)
+    gradient_accumulation: int = Field(default=1, ge=1, le=64)
+    clip_epsilon: float = Field(default=0.2, gt=0, le=1)
+    group_size: int = Field(default=4, ge=2, le=16)
+    rounds: int = Field(default=1, ge=1, le=20)
+    tasks: list[TaskSpec] = Field(default_factory=list, max_length=8)
+    temperature: float = Field(default=1.0, ge=0, le=2)
+    max_steps: int = Field(default=3, ge=1, le=50)
+    eval_trials: int = Field(default=4, ge=0, le=50)
+    seed: int = 0
+
+
 class TrainingRunRequest(BaseModel):
     algorithm: str = Field(pattern="^(sft|grpo|gigpo)$")
     base_model: str = Field(min_length=1)
-    dataset_version: str = Field(min_length=1)
+    dataset_version: str | None = Field(default=None, min_length=1)
     environment_version: str = Field(min_length=1)
     reward_version: str = Field(min_length=1)
-    config: dict[str, Any] = Field(default_factory=dict)
+    config: TrainingConfig = Field(default_factory=TrainingConfig)
+
+    @model_validator(mode="after")
+    def _data_source(self) -> "TrainingRunRequest":
+        if self.algorithm == "sft" and self.dataset_version is None:
+            raise ValueError("sft requires dataset_version")
+        if self.algorithm == "grpo" and self.dataset_version is None and not self.config.tasks:
+            raise ValueError("grpo requires dataset_version or config.tasks for online rollouts")
+        return self
+
+
+class MetricPoint(BaseModel):
+    name: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_./-]+$")
+    step: int = Field(ge=0)
+    value: float
+
+    @field_validator("value")
+    @classmethod
+    def _finite(cls, value: float) -> float:
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError("metric value must be finite")
+        return value
+
+
+RUN_COLUMNS = """run_id, algorithm, base_model, dataset_version,
+                 environment_version, reward_version, config, status,
+                 checkpoint_uri, metrics, created_at, updated_at"""
+LOG_TAIL_CHARS = 20_000
 
 
 class RegistryStore:
@@ -118,7 +178,7 @@ class RegistryStore:
                 (request.base_model,),
             ).fetchone() is None:
                 raise VersionNotFoundError("model version not found")
-            if self.connection.execute(
+            if request.dataset_version is not None and self.connection.execute(
                 "SELECT 1 FROM datasets WHERE dataset_version = %s",
                 (request.dataset_version,),
             ).fetchone() is None:
@@ -147,7 +207,7 @@ class RegistryStore:
                     request.dataset_version,
                     request.environment_version,
                     request.reward_version,
-                    Json(request.config),
+                    Json(values["config"]),
                     idempotency_key,
                     fingerprint,
                 ),
@@ -230,14 +290,106 @@ class RegistryStore:
     def get_training_run(self, run_id: str) -> dict[str, Any] | None:
         with self.connection.transaction():
             return self.connection.execute(
+                f"SELECT {RUN_COLUMNS}, log_tail FROM training_runs WHERE run_id = %s",
+                (run_id,),
+            ).fetchone()
+
+    def list_training_runs(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self.connection.transaction():
+            return self.connection.execute(
+                f"SELECT {RUN_COLUMNS} FROM training_runs ORDER BY created_at DESC LIMIT %s",
+                (limit,),
+            ).fetchall()
+
+    def cancel_training_run(self, run_id: str) -> str | None:
+        """Cancel a queued or running run; returns the resulting status, or None if unknown."""
+        with self.connection.transaction():
+            row = self.connection.execute(
                 """
-                SELECT run_id, algorithm, base_model, dataset_version,
-                       environment_version, reward_version, config, status,
-                       checkpoint_uri, metrics, created_at, updated_at
-                FROM training_runs WHERE run_id = %s
+                UPDATE training_runs SET status = 'CANCELED', updated_at = CURRENT_TIMESTAMP
+                WHERE run_id = %s AND status IN ('QUEUED', 'RUNNING')
+                RETURNING status
                 """,
                 (run_id,),
             ).fetchone()
+            if row is None:
+                row = self.connection.execute(
+                    "SELECT status FROM training_runs WHERE run_id = %s", (run_id,)
+                ).fetchone()
+            return None if row is None else row["status"]
+
+    def run_status(self, run_id: str) -> str | None:
+        with self.connection.transaction():
+            row = self.connection.execute(
+                "SELECT status FROM training_runs WHERE run_id = %s", (run_id,)
+            ).fetchone()
+            return None if row is None else row["status"]
+
+    def record_metrics(self, run_id: str, points: list[MetricPoint]) -> None:
+        with self.connection.transaction():
+            with self.connection.cursor() as cursor:
+                cursor.executemany(
+                    """
+                    INSERT INTO training_metrics (run_id, name, step, value)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (run_id, name, step) DO UPDATE SET value = EXCLUDED.value
+                    """,
+                    [(run_id, point.name, point.step, point.value) for point in points],
+                )
+
+    def get_metrics(self, run_id: str, since_step: int = -1) -> dict[str, list[list[float]]]:
+        with self.connection.transaction():
+            rows = self.connection.execute(
+                """
+                SELECT name, step, value FROM training_metrics
+                WHERE run_id = %s AND step > %s
+                ORDER BY name, step
+                """,
+                (run_id, since_step),
+            ).fetchall()
+        series: dict[str, list[list[float]]] = {}
+        for row in rows:
+            series.setdefault(row["name"], []).append([row["step"], row["value"]])
+        return series
+
+    def append_log(self, run_id: str, lines: list[str]) -> None:
+        text = "".join(line.rstrip("\n") + "\n" for line in lines)
+        with self.connection.transaction():
+            self.connection.execute(
+                """
+                UPDATE training_runs SET log_tail = right(log_tail || %s, %s)
+                WHERE run_id = %s
+                """,
+                (text, LOG_TAIL_CHARS, run_id),
+            )
+
+    def get_model_version(self, version: str) -> dict[str, Any] | None:
+        with self.connection.transaction():
+            return self.connection.execute(
+                """
+                SELECT version, base_model, checkpoint_uri, status, metrics, created_at
+                FROM model_versions WHERE version = %s
+                """,
+                (version,),
+            ).fetchone()
+
+    def list_model_versions(self) -> list[dict[str, Any]]:
+        with self.connection.transaction():
+            return self.connection.execute(
+                """
+                SELECT version, base_model, checkpoint_uri, status, metrics, created_at
+                FROM model_versions WHERE status != 'RETIRED' ORDER BY created_at
+                """
+            ).fetchall()
+
+    def list_datasets(self) -> list[dict[str, Any]]:
+        with self.connection.transaction():
+            return self.connection.execute(
+                """
+                SELECT dataset_version, source, schema_version, sample_count, created_at
+                FROM datasets ORDER BY created_at
+                """
+            ).fetchall()
 
 
 def _fingerprint(values: dict[str, Any]) -> str:

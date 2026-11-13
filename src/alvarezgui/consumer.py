@@ -208,8 +208,9 @@ class Consumer:
             if context is None or context["status"] != "RUNNING_ENV":
                 return
             observation = self.runtime.observe(sandbox_id)
-            action = self._next_action(context, observation, sandbox_id, lease_id)
+            action, model_output = self._next_action(context, observation, sandbox_id, lease_id)
             result = self.runtime.execute(sandbox_id, action)
+            final_observation = self._final_observation(sandbox_id) if result["done"] else None
             recorded = self._store_call(
                 "record_step",
                 task_id,
@@ -220,6 +221,8 @@ class Consumer:
                 result["reward"],
                 result["done"],
                 lease_id,
+                model_output,
+                final_observation,
             )
             if not recorded or result["done"]:
                 if result["done"]:
@@ -235,9 +238,9 @@ class Consumer:
         observation: dict[str, Any],
         sandbox_id: str,
         lease_id: str,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         if self.model_service is None:
-            return {"type": "terminate", "reason": "fixed_policy"}
+            return {"type": "terminate", "reason": "fixed_policy"}, None
         if not self._store_call(
             "mark_waiting_model", context["task_id"], context["episode_id"], lease_id
         ):
@@ -261,8 +264,16 @@ class Consumer:
                         str(observation.get("image_uri", f"memory://{sandbox_id}"))
                     ),
                     ui_tree_uri=observation.get("ui_tree_uri"),
+                    temperature=context.get("temperature") or 0.0,
+                    timeout_ms=int(self.settings.model_request_timeout_seconds * 1000),
+                    seed=context.get("seed"),
                 )
             )
+            model_output = {
+                "raw_output": response.raw_output,
+                "model_version": response.model_version,
+                "latency_ms": response.latency_ms,
+            }
             action = validate_action(response.action)
             if not self._store_call("heartbeat_lease", lease_id, sandbox_id, self.lease_ttl):
                 raise RuntimeOperationError("sandbox lease expired")
@@ -277,7 +288,14 @@ class Consumer:
                 "mark_running_after_model", context["task_id"], context["episode_id"], lease_id
             ):
                 raise RuntimeOperationError("task could not resume after model inference")
-        return action
+        return action, model_output
+
+    def _final_observation(self, sandbox_id: str) -> dict[str, Any] | None:
+        try:
+            return self.runtime.observe(sandbox_id)
+        except Exception:
+            # The final screenshot is only for display; never fail a finished episode over it.
+            return None
 
     def _destroy_if_lease_owner(self, sandbox_id: str, lease_id: str) -> None:
         if self._store_call("validate_lease", lease_id, sandbox_id) is not None:

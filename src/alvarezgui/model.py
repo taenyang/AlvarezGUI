@@ -16,6 +16,7 @@ class InferenceRequest(BaseModel):
     image_uri: str = Field(min_length=1)
     ui_tree_uri: str | None = None
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    seed: int | None = None
     max_tokens: int = Field(default=128, ge=1, le=4_096)
     timeout_ms: int = Field(default=30_000, ge=1, le=300_000)
 

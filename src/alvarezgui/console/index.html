@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AlvarezGUI 实验平台</title>
+<link rel="stylesheet" href="/console/static/style.css">
+</head>
+<body>
+<header>
+  <h1>AlvarezGUI 实验平台</h1>
+  <nav>
+    <a href="#/resources" data-nav="resources">资源总览</a>
+    <a href="#/runs" data-nav="runs">训练实验</a>
+    <a href="#/evaluations" data-nav="evaluations">模型评测</a>
+  </nav>
+  <form method="post" action="/console/logout"><button type="submit">退出</button></form>
+</header>
+<main id="view"></main>
+<script type="module" src="/console/static/app.js"></script>
+</body>
+</html>
