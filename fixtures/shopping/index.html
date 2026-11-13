@@ -1,0 +1,14 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Alvarez Test Shop</title>
+<style>body{font:18px sans-serif;margin:24px;background:#f5f5f5}h1{font-size:28px}button{font-size:20px;padding:16px 24px}#done{display:none;color:#176b2c;font-size:24px}</style>
+<h1>Alvarez Test Shop</h1>
+<p id="product">Blue Widget — 1 test credit</p>
+<button id="buy" onclick="buy()">Buy test item</button>
+<p id="done">Order complete</p>
+<script>
+const params = new URLSearchParams(location.search);
+const buyButton = document.getElementById("buy");
+if (params.get("variant") === "group") buyButton.style.cssText = "position:absolute;left:20px;top:20px;width:340px;height:200px;font-size:32px";
+function buy(){buyButton.style.display='none';document.getElementById('done').style.display='block';}
+</script>

@@ -1,0 +1,26 @@
+# Local environment
+.venv/
+.env
+
+# Runtime data and artifacts
+var/
+models/
+android-images/
+microvm-snapshots/
+build/
+dist/
+*.egg-info/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Internal project planning
+WORKLOG.md
+IMPLEMENTATION_PLAN.md
+
+# Local tool state
+.DS_Store
