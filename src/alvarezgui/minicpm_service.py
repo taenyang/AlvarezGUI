@@ -5,6 +5,7 @@ import base64
 import gc
 import json
 import os
+import shutil
 import threading
 import time
 from collections import OrderedDict, deque
@@ -130,13 +131,21 @@ def control_plane_resolver(base_url: str, password: str, timeout: float = 5.0) -
 class MiniCPMService:
     """Serves several checkpoints, loading on demand and evicting the least recently used."""
 
-    def __init__(self, resolver: Resolver, max_loaded: int = 2, loader: Loader = load_pretrained) -> None:
+    def __init__(
+        self,
+        resolver: Resolver,
+        max_loaded: int = 2,
+        loader: Loader = load_pretrained,
+        checkpoint_root: Path | None = None,
+    ) -> None:
         if max_loaded < 1:
             raise ValueError("max_loaded must be at least 1")
         self.resolver = resolver
         self.max_loaded = max_loaded
         self.loader = loader
+        self.checkpoint_root = checkpoint_root
         self.models: OrderedDict[str, tuple[Any, Any]] = OrderedDict()
+        self.disabled_versions: set[str] = set()
         self.torch: Any = None
         self.generation_lock = threading.Lock()
         self.waiting = 0
@@ -153,6 +162,8 @@ class MiniCPMService:
 
     def _model(self, version: str) -> tuple[Any, Any]:
         """Caller must hold generation_lock."""
+        if version in self.disabled_versions:
+            raise ModelVersionNotFoundError(f"model version is offline: {version}")
         if version in self.models:
             self.models.move_to_end(version)
             return self.models[version]
@@ -163,11 +174,43 @@ class MiniCPMService:
         self.models[version] = (model, processor)
         return model, processor
 
-    def _evict(self) -> None:
-        self.models.popitem(last=False)
+    def _clear(self, version: str) -> None:
+        self.models.pop(version)
         gc.collect()
         if self.torch is not None and self.torch.cuda.is_available():
             self.torch.cuda.empty_cache()
+
+    def _evict(self) -> None:
+        self._clear(next(iter(self.models)))
+
+    def load(self, version: str) -> None:
+        with self.generation_lock:
+            self.disabled_versions.discard(version)
+            self._model(version)
+
+    def unload(self, version: str) -> bool:
+        with self.generation_lock:
+            self.disabled_versions.add(version)
+            if version not in self.models:
+                return False
+            self._clear(version)
+            return True
+
+    def delete(self, version: str) -> bool:
+        with self.generation_lock:
+            if self.checkpoint_root is None:
+                raise ValueError("checkpoint cleanup root is not configured")
+            self.disabled_versions.add(version)
+            if version in self.models:
+                self._clear(version)
+            path = _managed_checkpoint_path(self.resolver(version), self.checkpoint_root)
+            if not path.exists():
+                return False
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            return True
 
     def unload_all(self) -> list[str]:
         with self.generation_lock:
@@ -180,6 +223,7 @@ class MiniCPMService:
         latencies = sorted(self.latencies)
         return {
             "loaded_versions": list(self.models),
+            "offline_versions": sorted(self.disabled_versions),
             "max_loaded": self.max_loaded,
             "waiting_requests": self.waiting,
             "requests": self.requests,
@@ -255,6 +299,22 @@ class MiniCPMService:
         )[0]
 
 
+def _managed_checkpoint_path(path: str, root: Path) -> Path:
+    target = Path(path).expanduser()
+    cleanup_root = root.expanduser().resolve(strict=False)
+    resolved = target.resolve(strict=False)
+    if resolved == cleanup_root or cleanup_root not in resolved.parents:
+        raise ValueError("checkpoint is outside the cleanup root")
+    current = target
+    while current != current.parent and current != cleanup_root:
+        if current.is_symlink():
+            raise ValueError("checkpoint path contains a symlink")
+        current = current.parent
+    if target.is_symlink():
+        raise ValueError("checkpoint path is a symlink")
+    return target
+
+
 def _static_resolver(paths: dict[str, str]) -> Resolver:
     def resolve(version: str) -> str:
         if version not in paths:
@@ -298,8 +358,40 @@ class _Handler(BaseHTTPRequestHandler):
         self._reply(200, self.server.service.health())
 
     def do_POST(self) -> None:
-        if self.path == "/internal/v1/model/unload":
-            self._reply(200, {"unloaded": self.server.service.unload_all()})
+        if self.path in {
+            "/internal/v1/model/load",
+            "/internal/v1/model/unload",
+            "/internal/v1/model/delete",
+        }:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > 1_048_576:
+                    raise ValueError("invalid request body")
+                body = json.loads(self.rfile.read(length))
+                version = body.get("model_version") if isinstance(body, dict) else None
+                if self.path.endswith("/load"):
+                    if not isinstance(version, str) or not version:
+                        raise ValueError("model_version is required")
+                    self.server.service.load(version)
+                    self._reply(200, {"loaded": version, **self.server.service.health()})
+                elif self.path.endswith("/delete"):
+                    if not isinstance(version, str) or not version:
+                        raise ValueError("model_version is required")
+                    deleted = self.server.service.delete(version)
+                    self._reply(200, {
+                        "deleted": version,
+                        "checkpoint_deleted": deleted,
+                        **self.server.service.health(),
+                    })
+                else:
+                    unloaded = self.server.service.unload(version) if version else self.server.service.unload_all()
+                    self._reply(200, {"unloaded": [version] if unloaded else [], **self.server.service.health()})
+            except ModelVersionNotFoundError:
+                self._reply(404, {"detail": "model version not found"})
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                self._reply(400, {"detail": str(exc)})
+            except Exception as exc:
+                self._reply(503, {"detail": f"model unavailable: {exc}"})
             return
         if self.path != "/internal/v1/model/infer":
             self._reply(404, {"detail": "not found"})
@@ -343,6 +435,7 @@ def main() -> None:
     parser.add_argument("--control-plane-url", help="resolve other versions via the registry; "
                         "password comes from CONSOLE_PASSWORD")
     parser.add_argument("--max-loaded", type=int, default=2)
+    parser.add_argument("--checkpoint-root", type=Path)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18081)
     args = parser.parse_args()
@@ -353,7 +446,15 @@ def main() -> None:
         if not password:
             raise SystemExit("CONSOLE_PASSWORD is required with --control-plane-url")
         resolvers.append(control_plane_resolver(args.control_plane_url, password))
-    serve(MiniCPMService(_chain(*resolvers), max_loaded=args.max_loaded), args.host, args.port)
+    serve(
+        MiniCPMService(
+            _chain(*resolvers),
+            max_loaded=args.max_loaded,
+            checkpoint_root=args.checkpoint_root,
+        ),
+        args.host,
+        args.port,
+    )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,12 @@
+[Unit]
+Description=Collect unreferenced AlvarezGUI screenshots
+After=network-online.target alvarez-platform.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/github/AlvarezGUI
+EnvironmentFile=/home/github/AlvarezGUI/var/platform.env
+ExecStart=/home/github/AlvarezGUI/.venv/bin/python -m alvarezgui.artifact_maintenance gc --apply
+TimeoutStartSec=30min
+UMask=0077

@@ -1,9 +1,13 @@
 import json
+import time
+import uuid
+import zlib
 from collections.abc import Generator
 from datetime import timedelta
 from pathlib import Path
 from urllib.parse import parse_qs
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.request import Request as UrlRequest, urlopen
 
 import psycopg
 import redis
@@ -15,17 +19,25 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from typing import Any, Literal
 
+from alvarezgui.artifacts import get as get_artifact, put_png
 from alvarezgui.auth import SESSION_COOKIE, SESSION_SECONDS, ConsoleAuth
 from alvarezgui.config import Settings
 from alvarezgui.console_store import (
     ConsoleStore,
+    StillActiveError,
     EvaluationRequest,
     NodeHeartbeat,
     RolloutRequest,
+    RuntimeBackendRetiredError,
     screenshot_path,
 )
 from alvarezgui.node_agent.android_tasks import TASK_CATALOG
-from alvarezgui.queue import TASK_CONSUMER_GROUP, TASK_STREAM
+from alvarezgui.queue import (
+    RUNTIME_BACKENDS,
+    TASK_CONSUMER_GROUP,
+    lifecycle_stream_for_node,
+    stream_for_backend,
+)
 from alvarezgui.model import (
     FakeModelService,
     InferenceRequest,
@@ -36,15 +48,18 @@ from alvarezgui.model import (
     ModelVersionNotFoundError,
 )
 from alvarezgui.node_agent.runtime import (
-    FakeRuntime,
     InvalidStateError,
     Runtime,
+    RuntimeOperationError,
     SandboxNotFoundError,
     SnapshotNotFoundError,
 )
 from alvarezgui.registry import (
+    CheckpointCleanupError,
+    CheckpointUnmanagedError,
     DatasetRequest,
     MetricPoint,
+    ModelInUseError,
     ModelVersionRequest,
     RegistryConflictError,
     RegistryStore,
@@ -91,6 +106,36 @@ class FinishRequest(BaseModel):
 
 CONSOLE_DIR = Path(__file__).parent / "console"
 PUBLIC_PATHS = {"/console/login"}
+MAX_SCREENSHOT_BYTES = 10 * 1024 * 1024
+
+
+def _valid_png(payload: bytes | bytearray) -> bool:
+    # Validate framing and checksums without decompressing untrusted image data.
+    if not payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        return False
+    offset = 8
+    has_image = False
+    while offset + 12 <= len(payload):
+        size = int.from_bytes(payload[offset:offset + 4], "big")
+        kind = payload[offset + 4:offset + 8]
+        end = offset + 8 + size
+        if end + 4 > len(payload):
+            return False
+        if zlib.crc32(payload[offset + 4:end]) != int.from_bytes(payload[end:end + 4], "big"):
+            return False
+        if offset == 8:
+            if kind != b"IHDR" or size != 13:
+                return False
+            if not int.from_bytes(payload[offset + 8:offset + 12], "big") or not int.from_bytes(payload[offset + 12:offset + 16], "big"):
+                return False
+        elif kind == b"IHDR":
+            return False
+        if kind == b"IDAT" and size:
+            has_image = True
+        if kind == b"IEND":
+            return has_image and size == 0 and end + 4 == len(payload)
+        offset = end + 4
+    return False
 
 
 def create_app(
@@ -101,8 +146,13 @@ def create_app(
 ) -> FastAPI:
     current_settings = settings or Settings()
     app = FastAPI(title="AlvarezGUI Control Plane")
-    current_runtime = runtime or FakeRuntime()
+    current_runtime = runtime
     current_model_service = model_service or FakeModelService()
+
+    def require_runtime() -> Runtime:
+        if current_runtime is None:
+            raise HTTPException(status_code=409, detail="runtime is owned by a worker node")
+        return current_runtime
     password = current_settings.console_password
     auth = ConsoleAuth(password.get_secret_value()) if password is not None else None
     artifact_roots = [current_settings.microvm_state_dir / "runs", current_settings.data_dir / "runs"]
@@ -131,6 +181,23 @@ def create_app(
         if request.url.path == "/" or request.url.path.startswith("/console"):
             return RedirectResponse("/console/login", status_code=303)
         return JSONResponse(status_code=401, content={"detail": "authentication required"})
+
+    @app.post("/internal/v1/artifacts/screenshots")
+    async def upload_screenshot(request: Request) -> dict[str, str]:
+        content_length = request.headers.get("content-length")
+        if content_length is not None and (not content_length.isdigit() or int(content_length) > MAX_SCREENSHOT_BYTES):
+            raise HTTPException(status_code=413, detail="screenshot exceeds 10 MiB")
+        payload = bytearray()
+        async for chunk in request.stream():
+            payload.extend(chunk)
+            if len(payload) > MAX_SCREENSHOT_BYTES:
+                raise HTTPException(status_code=413, detail="screenshot exceeds 10 MiB")
+        if not _valid_png(payload):
+            raise HTTPException(status_code=422, detail="payload is not a valid PNG")
+        try:
+            return {"image_uri": put_png(current_settings, bytes(payload), sandbox_id="uploaded")}
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="could not store screenshot") from exc
 
     @app.get("/", include_in_schema=False)
     def root() -> RedirectResponse:
@@ -187,6 +254,8 @@ def create_app(
             result, created = TaskStore(connection).create_task(request, idempotency_key.strip())
         except IdempotencyConflictError:
             raise HTTPException(status_code=409, detail="idempotency key conflict") from None
+        except TaskStateConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
         response.status_code = 201 if created else 200
         return result
 
@@ -233,6 +302,8 @@ def create_app(
     ) -> dict:
         try:
             return RegistryStore(connection).register_model(request)
+        except VersionNotFoundError:
+            raise HTTPException(status_code=404, detail="base model version not found") from None
         except RegistryConflictError:
             raise HTTPException(status_code=409, detail="model version already exists") from None
 
@@ -279,43 +350,115 @@ def create_app(
         result["evaluations"] = ConsoleStore(connection).run_evaluations(run_id)
         return result
 
+    def dispatch_lifecycle(lease: dict[str, Any], sandbox_id: str, request: LifecycleRequest) -> dict[str, Any]:
+        if redis_client is None:
+            raise HTTPException(status_code=503, detail="lifecycle queue is unavailable")
+        command_id = uuid.uuid4().hex
+        response_key = f"alvarez:lifecycle:response:{command_id}"
+        command = {
+            "sandbox_id": sandbox_id,
+            "lease_id": request.lease_id,
+            "operation": request.operation,
+            "snapshot_id": request.snapshot_id,
+            "expires_at": time.time() + current_settings.lifecycle_command_ttl_seconds,
+        }
+        stream = lifecycle_stream_for_node(lease["runtime_backend"], lease["node_id"])
+        try:
+            with redis_client.pipeline() as pipeline:
+                pipeline.xadd(stream, {"response_key": response_key, "command": json.dumps(command)})
+                pipeline.expire(stream, current_settings.lifecycle_command_ttl_seconds * 2)
+                pipeline.set(response_key + ":request", json.dumps(command), ex=86400)
+                pipeline.execute()
+            response = redis_client.blpop(response_key, timeout=current_settings.lifecycle_timeout_seconds)
+        except redis.RedisError as exc:
+            raise HTTPException(status_code=503, detail="lifecycle queue is unavailable") from exc
+        if response is None:
+            raise HTTPException(status_code=504, detail={
+                "message": "runtime worker did not complete lifecycle operation; query command status before retrying",
+                "command_id": command_id,
+            })
+        result = json.loads(response[1])
+        if not result.get("ok"):
+            status = {"not_found": 404, "conflict": 409}.get(result.get("error_type"), 503)
+            raise HTTPException(status_code=status, detail=result.get("detail", "lifecycle operation failed"))
+        return {
+            "sandbox_id": sandbox_id,
+            "lease_id": request.lease_id,
+            "state": result["state"],
+            "snapshot_id": result.get("snapshot_id"),
+            "command_id": command_id,
+        }
+
+    @app.get("/internal/v1/sandboxes/{sandbox_id}/lifecycle/{command_id}")
+    def lifecycle_status(sandbox_id: str, command_id: uuid.UUID) -> dict[str, Any]:
+        if redis_client is None:
+            raise HTTPException(status_code=503, detail="lifecycle queue is unavailable")
+        response_key = f"alvarez:lifecycle:response:{command_id.hex}"
+        try:
+            saved = redis_client.get(response_key + ":request")
+            if saved is None or json.loads(saved)["sandbox_id"] != sandbox_id:
+                raise HTTPException(status_code=404, detail="lifecycle command not found")
+            result = redis_client.get(response_key + ":result")
+            if result is not None:
+                return {"command_id": command_id.hex, "status": "COMPLETED", "result": json.loads(result)}
+            started = redis_client.exists(response_key + ":started")
+        except redis.RedisError as exc:
+            raise HTTPException(status_code=503, detail="lifecycle queue is unavailable") from exc
+        status = "PENDING"
+        if started:
+            status = "STARTED"
+        elif json.loads(saved)["expires_at"] <= time.time():
+            status = "EXPIRED"
+        return {"command_id": command_id.hex, "status": status}
+
     @app.post("/internal/v1/sandboxes/{sandbox_id}/lifecycle")
     def lifecycle(
         sandbox_id: str,
         request: LifecycleRequest,
         connection: psycopg.Connection = Depends(database),
     ) -> dict:
+        if request.operation == "restore" and not request.snapshot_id:
+            raise HTTPException(status_code=422, detail="snapshot_id is required")
         store = TaskStore(connection)
         lease = store.validate_lease(request.lease_id, sandbox_id)
         if lease is None:
             raise HTTPException(status_code=409, detail="lease expired or invalid")
+        if current_runtime is None or lease["node_id"] != current_settings.node_id:
+            return dispatch_lifecycle(lease, sandbox_id, request)
+
         snapshot_id = request.snapshot_id
+        runtime_backend = require_runtime()
         try:
             if request.operation == "pause":
-                current_runtime.pause(sandbox_id)
+                result = runtime_backend.pause(sandbox_id)
             elif request.operation == "resume":
-                current_runtime.resume(sandbox_id)
+                result = runtime_backend.resume(sandbox_id)
             elif request.operation == "snapshot_stop":
-                current_runtime.pause(sandbox_id)
-                snapshot_id = current_runtime.snapshot(sandbox_id).snapshot_id
+                if not runtime_backend.capabilities().snapshot:
+                    raise HTTPException(status_code=409, detail="runtime does not support snapshots")
+                runtime_backend.pause(sandbox_id)
+                snapshot = runtime_backend.snapshot(sandbox_id)
+                snapshot_id = snapshot.snapshot_id
+                result = runtime_backend.health(sandbox_id)
             elif request.operation == "restore":
                 if not snapshot_id:
                     raise HTTPException(status_code=422, detail="snapshot_id is required")
-                current_runtime.restore(sandbox_id, snapshot_id)
+                if not runtime_backend.capabilities().restore:
+                    raise HTTPException(status_code=409, detail="runtime does not support snapshot restore")
+                result = runtime_backend.restore(sandbox_id, snapshot_id)
             else:
-                current_runtime.destroy(sandbox_id)
-                store.release_lease(request.lease_id, sandbox_id)
+                result = runtime_backend.destroy(sandbox_id)
+                store.finish_sandbox_destroy(request.lease_id, sandbox_id)
         except SandboxNotFoundError:
             raise HTTPException(status_code=404, detail="sandbox not found") from None
         except SnapshotNotFoundError:
             raise HTTPException(status_code=404, detail="snapshot not found") from None
         except InvalidStateError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from None
-        health = current_runtime.health(sandbox_id)
         return {
             "sandbox_id": sandbox_id,
             "lease_id": request.lease_id,
-            "state": health.state,
+            "state": result.state,
             "snapshot_id": snapshot_id,
         }
 
@@ -340,8 +483,22 @@ def create_app(
         if redis_client is None:
             return {"available": False}
         try:
-            pending = redis_client.xpending(TASK_STREAM, TASK_CONSUMER_GROUP)
-            return {"available": True, "length": redis_client.xlen(TASK_STREAM), "pending": pending["pending"]}
+            by_backend = {}
+            for backend in RUNTIME_BACKENDS:
+                stream = stream_for_backend(backend)
+                try:
+                    pending = redis_client.xpending(stream, TASK_CONSUMER_GROUP)["pending"]
+                except redis.ResponseError as exc:
+                    if not str(exc).startswith("NOGROUP"):
+                        raise
+                    pending = 0
+                by_backend[backend] = {"length": redis_client.xlen(stream), "pending": pending}
+            return {
+                "available": True,
+                "length": sum(stats["length"] for stats in by_backend.values()),
+                "pending": sum(stats["pending"] for stats in by_backend.values()),
+                "by_backend": by_backend,
+            }
         except redis.RedisError as exc:
             return {"available": False, "error": str(exc)[:200]}
 
@@ -357,10 +514,56 @@ def create_app(
             return {"backend": "http", "url": current_settings.model_service_url, "healthy": False,
                     "error": str(exc)[:200]}
 
+    def model_service_command(path: str, version: str) -> dict[str, Any]:
+        request = UrlRequest(
+            current_settings.model_service_url.rstrip("/") + path,
+            data=json.dumps({"model_version": version}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=current_settings.model_request_timeout_seconds) as response:
+                body = json.loads(response.read())
+        except HTTPError as exc:
+            if exc.code == 404:
+                raise HTTPException(status_code=404, detail={
+                    "code": "MODEL_NOT_FOUND", "message": "model version not found in model service",
+                }) from None
+            raise HTTPException(status_code=503, detail={
+                "code": "MODEL_SERVICE_ERROR", "message": f"model service returned HTTP {exc.code}",
+            }) from None
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=503, detail={
+                "code": "MODEL_SERVICE_UNAVAILABLE", "message": str(exc)[:200],
+            }) from None
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=503, detail={
+                "code": "MODEL_SERVICE_ERROR", "message": "model service returned invalid JSON",
+            })
+        return body
+
+    def model_operation(version: str, path: str, online: bool, connection: psycopg.Connection) -> dict[str, Any]:
+        if current_settings.model_backend != "http":
+            raise HTTPException(status_code=409, detail={
+                "code": "MODEL_SERVICE_DISABLED", "message": "model online/offline requires HTTP model service",
+            })
+        model = RegistryStore(connection).get_model_version(version)
+        if model is None or model["status"] == "RETIRED":
+            raise HTTPException(status_code=404, detail={
+                "code": "MODEL_NOT_FOUND", "message": "model version not found",
+            })
+        result = model_service_command(path, version)
+        return {"version": version, "online": online, "loaded_versions": result.get("loaded_versions", [])}
+
     def sandboxes_with_health(store: ConsoleStore) -> list[dict[str, Any]]:
         rows = store.list_sandboxes()
         for row in rows:
+            if row["node_id"] != current_settings.node_id:
+                row["state"], row["healthy"] = "REMOTE", None
+                continue
             try:
+                if current_runtime is None:
+                    continue
                 health = current_runtime.health(row["sandbox_id"])
                 row["state"], row["healthy"] = str(health.state), health.healthy
             except Exception:
@@ -390,7 +593,8 @@ def create_app(
         # Destroy goes through task cancellation so the lease owner (the consumer) tears the VM down.
         with connection.transaction():
             row = connection.execute(
-                "SELECT task_id FROM tasks WHERE sandbox_id = %s", (sandbox_id,)
+                "SELECT task_id FROM tasks WHERE sandbox_id = %s AND runtime_backend IN ('firecracker', 'docker')",
+                (sandbox_id,),
             ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="sandbox not found")
@@ -399,7 +603,13 @@ def create_app(
         except TaskStateConflictError:
             raise HTTPException(status_code=409, detail="sandbox task already finished") from None
 
-    def image_response(uri: str | None) -> FileResponse:
+    def image_response(uri: str | None) -> Response:
+        if isinstance(uri, str) and uri.startswith("s3://"):
+            try:
+                payload = get_artifact(current_settings, uri)
+            except RuntimeOperationError:
+                raise HTTPException(status_code=404, detail="screenshot not found") from None
+            return Response(content=payload, media_type="image/png", headers={"Cache-Control": "private, max-age=3600"})
         path = screenshot_path(uri, artifact_roots)
         if path is None:
             raise HTTPException(status_code=404, detail="screenshot not found")
@@ -418,6 +628,9 @@ def create_app(
             "tasks": list(TASK_CATALOG),
             "model_versions": store.list_model_versions(),
             "datasets": store.list_datasets(),
+            "runtime_backend": current_settings.runtime_backend,
+            "runtime_backends": list(current_settings.scheduler_backend_list),
+            "runtime_capabilities": current_runtime.capabilities() if current_runtime else None,
         }
 
     @app.get("/internal/v1/model-versions/{version}")
@@ -426,6 +639,74 @@ def create_app(
         if row is None:
             raise HTTPException(status_code=404, detail="model version not found")
         return row
+
+    @app.post("/api/v1/model-versions/{version}/online")
+    def online_model_version(version: str, connection: psycopg.Connection = Depends(database)) -> dict[str, Any]:
+        return model_operation(version, "/internal/v1/model/load", True, connection)
+
+    @app.post("/api/v1/model-versions/{version}/offline")
+    def offline_model_version(version: str, connection: psycopg.Connection = Depends(database)) -> dict[str, Any]:
+        return model_operation(version, "/internal/v1/model/unload", False, connection)
+
+    @app.delete("/api/v1/model-versions/{version}")
+    def delete_model_version(
+        version: str,
+        cascade_training_runs: bool = Query(default=False),
+        connection: psycopg.Connection = Depends(database),
+    ) -> dict:
+        remote_checkpoint_cleanup = None
+        if current_settings.model_backend == "http":
+            stats = model_service_stats()
+            if not stats.get("healthy"):
+                raise HTTPException(status_code=503, detail={
+                    "code": "MODEL_SERVICE_UNAVAILABLE",
+                    "message": "model service health could not be confirmed",
+                })
+            if version in stats.get("loaded_versions", []):
+                raise HTTPException(status_code=409, detail={
+                    "code": "MODEL_LOADED",
+                    "message": "model version is currently loaded",
+                })
+            model = RegistryStore(connection).get_model_version(version)
+            if model is not None and model["checkpoint_uri"]:
+                def remote_checkpoint_cleanup(target: str) -> bool:
+                    try:
+                        result = model_service_command("/internal/v1/model/delete", target)
+                    except HTTPException as exc:
+                        detail = exc.detail
+                        message = detail.get("message", str(detail)) if isinstance(detail, dict) else str(detail)
+                        raise CheckpointCleanupError(message) from exc
+                    return bool(result.get("checkpoint_deleted"))
+        try:
+            return RegistryStore(connection).delete_model_version(
+                version,
+                current_settings.checkpoint_cleanup_root,
+                cascade_training_runs=cascade_training_runs,
+                checkpoint_cleanup=remote_checkpoint_cleanup,
+            )
+        except VersionNotFoundError:
+            raise HTTPException(status_code=404, detail={
+                "code": "MODEL_NOT_FOUND",
+                "message": "model version not found",
+            }) from None
+        except ModelInUseError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": "MODEL_IN_USE",
+                "message": "model version is referenced",
+                "references": exc.references,
+                "training_run_ids": exc.training_run_ids,
+                "evaluation_ids": exc.evaluation_ids,
+            }) from None
+        except CheckpointUnmanagedError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": "CHECKPOINT_UNMANAGED",
+                "message": str(exc),
+            }) from None
+        except CheckpointCleanupError as exc:
+            raise HTTPException(status_code=503, detail={
+                "code": "CHECKPOINT_CLEANUP_FAILED",
+                "message": str(exc),
+            }) from None
 
     @app.get("/api/v1/episodes/{episode_id}")
     def get_episode(episode_id: str, connection: psycopg.Connection = Depends(database)) -> dict:
@@ -464,12 +745,28 @@ def create_app(
                 " AND status IN ('QUEUED','ALLOCATING','RUNNING_ENV','WAITING_MODEL')",
                 (run_id,),
             ).fetchall()
-        for row in active:
-            try:
-                TaskStore(connection).cancel_task(row["task_id"], "training_run_canceled")
-            except TaskStateConflictError:
-                pass
+        cancel_tasks(connection, [row["task_id"] for row in active], "training_run_canceled")
         return {"run_id": run_id, "status": status}
+
+    def cancel_tasks(connection: psycopg.Connection, task_ids: list[str], reason: str) -> int:
+        canceled = 0
+        for task_id in task_ids:
+            try:
+                TaskStore(connection).cancel_task(task_id, reason)
+                canceled += 1
+            except TaskStateConflictError:
+                pass  # Finished between listing and canceling.
+        return canceled
+
+    @app.delete("/api/v1/training/runs/{run_id}")
+    def delete_training_run(run_id: str, connection: psycopg.Connection = Depends(database)) -> dict:
+        try:
+            deleted = ConsoleStore(connection).delete_training_run(run_id)
+        except StillActiveError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        if not deleted:
+            raise HTTPException(status_code=404, detail="training run not found")
+        return {"run_id": run_id, "deleted": True}
 
     @app.get("/api/v1/training/runs/{run_id}/metrics")
     def training_metrics(
@@ -495,12 +792,20 @@ def create_app(
             raise HTTPException(status_code=404, detail="training run not found")
         return status
 
+    def require_live_run(store: RegistryStore, run_id: str) -> str:
+        run = store.get_training_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="training run not found")
+        if run["runtime_backend"] == "fake":
+            raise HTTPException(status_code=409, detail="historical runtime is read-only")
+        return run["status"]
+
     @app.post("/internal/v1/training/runs/{run_id}/metrics")
     def post_training_metrics(
         run_id: str, request: MetricsRequest, connection: psycopg.Connection = Depends(database)
     ) -> dict[str, str]:
         store = RegistryStore(connection)
-        status = require_run(store, run_id)
+        status = require_live_run(store, run_id)
         store.record_metrics(run_id, request.points)
         return {"run_id": run_id, "status": status}
 
@@ -509,7 +814,7 @@ def create_app(
         run_id: str, request: LogsRequest, connection: psycopg.Connection = Depends(database)
     ) -> dict[str, str]:
         store = RegistryStore(connection)
-        status = require_run(store, run_id)
+        status = require_live_run(store, run_id)
         store.append_log(run_id, request.lines)
         return {"run_id": run_id, "status": status}
 
@@ -517,12 +822,14 @@ def create_app(
     def post_training_rollouts(
         run_id: str, request: RolloutRequest, connection: psycopg.Connection = Depends(database)
     ) -> dict[str, Any]:
-        if require_run(RegistryStore(connection), run_id) != "RUNNING":
+        if require_live_run(RegistryStore(connection), run_id) != "RUNNING":
             raise HTTPException(status_code=409, detail="training run is not running")
         try:
             return {"tasks": ConsoleStore(connection).create_rollouts(run_id, request)}
         except VersionNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from None
+        except RuntimeBackendRetiredError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
 
     @app.get("/internal/v1/training/runs/{run_id}/rollouts")
     def get_training_rollouts(
@@ -538,7 +845,7 @@ def create_app(
         run_id: str, request: FinishRequest, connection: psycopg.Connection = Depends(database)
     ) -> dict[str, Any]:
         store = RegistryStore(connection)
-        require_run(store, run_id)
+        require_live_run(store, run_id)
         updated = store.finish_training_run(
             run_id, succeeded=request.succeeded, metrics=request.metrics, checkpoint_uri=request.checkpoint_uri
         )
@@ -559,8 +866,29 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from None
         except IdempotencyConflictError:
             raise HTTPException(status_code=409, detail="idempotency key conflict") from None
+        except RuntimeBackendRetiredError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
         response.status_code = 201 if created else 200
         return result
+
+    @app.post("/api/v1/evaluations/{eval_id}/cancel")
+    def cancel_evaluation(eval_id: str, connection: psycopg.Connection = Depends(database)) -> dict:
+        task_ids = ConsoleStore(connection).evaluation_task_ids(eval_id)
+        if task_ids is None:
+            raise HTTPException(status_code=404, detail="evaluation not found")
+        if not task_ids:
+            raise HTTPException(status_code=409, detail="evaluation already finished")
+        return {"eval_id": eval_id, "canceled_trials": cancel_tasks(connection, task_ids, "evaluation_canceled")}
+
+    @app.delete("/api/v1/evaluations/{eval_id}")
+    def delete_evaluation(eval_id: str, connection: psycopg.Connection = Depends(database)) -> dict:
+        try:
+            deleted = ConsoleStore(connection).delete_evaluation(eval_id)
+        except StillActiveError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        if not deleted:
+            raise HTTPException(status_code=404, detail="evaluation not found")
+        return {"eval_id": eval_id, "deleted": True}
 
     @app.get("/api/v1/evaluations")
     def list_evaluations(connection: psycopg.Connection = Depends(database)) -> list[dict]:

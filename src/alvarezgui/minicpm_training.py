@@ -11,6 +11,8 @@ from typing import Any, Callable, Iterable
 from alvarezgui.action import validate_action
 from alvarezgui.minicpm_service import _read_image
 
+POLICY_ALGORITHMS = {"grpo", "gigpo"}
+
 
 class DatasetValidationError(ValueError):
     pass
@@ -168,14 +170,14 @@ def _validate_grpo_rows(rows: list[dict[str, Any]], group_size: int, require_old
         if "old_logprob" not in row:
             if not require_old_logprob:
                 continue
-            raise DatasetValidationError("GRPO rows require old_logprob from rollout collection")
+            raise DatasetValidationError("policy rows require old_logprob from rollout collection")
         try:
             float(row["old_logprob"])
         except (TypeError, ValueError) as exc:
-            raise DatasetValidationError("GRPO old_logprob must be numeric") from exc
+            raise DatasetValidationError("policy old_logprob must be numeric") from exc
     # Precomputed episode-level advantages already encode the group baseline.
     if not all("advantage" in row for row in rows) and any(count < group_size for count in group_counts.values()):
-        raise DatasetValidationError("each GRPO group must contain group_size rollouts")
+        raise DatasetValidationError("each policy group must contain group_size rollouts")
 
 
 def train(
@@ -194,14 +196,16 @@ def train(
 ) -> dict[str, Any]:
     """Train and save a checkpoint.
 
-    ``compute_old_logprob`` fills missing GRPO ``old_logprob`` values with the loaded base policy
+    ``compute_old_logprob`` fills missing policy ``old_logprob`` values with the loaded base policy
     before any update, which matches on-policy rollouts sampled from that same checkpoint.
+    GIGPO currently uses this same GRPO-compatible clipped policy objective.
     """
-    if algorithm not in {"sft", "grpo"}:
-        raise ValueError("algorithm must be sft or grpo")
-    if algorithm == "grpo":
+    # ponytail: GIGPO is a GRPO alias; paper GiGPO needs step-level state grouping.
+    if algorithm != "sft" and algorithm not in POLICY_ALGORITHMS:
+        raise ValueError("algorithm must be sft, grpo or gigpo")
+    if algorithm in POLICY_ALGORITHMS:
         if group_size < 2:
-            raise ValueError("GRPO requires group_size >= 2")
+            raise ValueError(f"{algorithm.upper()} requires group_size >= 2")
         _validate_grpo_rows(rows, group_size, require_old_logprob=not compute_old_logprob)
     torch, Accelerator, AutoModelForImageTextToText, AutoProcessor = _imports()
     accelerator = Accelerator(gradient_accumulation_steps=gradient_accumulation, mixed_precision="bf16")
@@ -216,13 +220,13 @@ def train(
     losses: list[float] = []
     updates = 0
     advantages: list[float] = []
-    if algorithm == "grpo":
+    if algorithm in POLICY_ALGORITHMS:
         # Multi-step rollouts carry an episode-level advantage; single-step rows are grouped here.
         if all("advantage" in row for row in rows):
             advantages = [float(row["advantage"]) for row in rows]
         else:
             advantages = group_advantages(rows)
-    if algorithm == "grpo" and compute_old_logprob:
+    if algorithm in POLICY_ALGORITHMS and compute_old_logprob:
         model.eval()
         with torch.no_grad():
             for row in rows:
@@ -270,7 +274,7 @@ def train(
                 step_metrics = {"train/loss": losses[-1], "train/learning_rate": learning_rate}
                 if grad_norm is not None and math.isfinite(grad_norm):
                     step_metrics["train/grad_norm"] = grad_norm
-                if algorithm == "grpo":
+                if algorithm in POLICY_ALGORITHMS:
                     ratio_value = float(ratio.detach().cpu())
                     step_metrics["train/ratio"] = ratio_value
                     step_metrics["train/advantage"] = advantages[index]
@@ -287,7 +291,12 @@ def train(
         "invalid_action_rate": 0.0,
         "elapsed_seconds": time.monotonic() - started,
         "base_model": base_model,
-        "group_size": group_size if algorithm == "grpo" else 0,
+        "group_size": group_size if algorithm in POLICY_ALGORITHMS else 0,
+        "implementation": (
+            "sft-cross-entropy"
+            if algorithm == "sft"
+            else "grpo-compatible-clipped-policy"
+        ),
     }
     if accelerator.is_main_process:
         Path(output_dir, "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
@@ -304,7 +313,7 @@ def _sequence_logprob(torch: Any, logits: Any, labels: Any) -> Any:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--algorithm", choices=("sft", "grpo"), required=True)
+    parser.add_argument("--algorithm", choices=("sft", "grpo", "gigpo"), required=True)
     parser.add_argument("--base-model", required=True)
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--output-dir", required=True)

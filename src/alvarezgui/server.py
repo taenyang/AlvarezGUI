@@ -1,4 +1,4 @@
-"""Single-node AlvarezGUI platform: control plane API + console, scheduler, consumer and node heartbeat."""
+"""AlvarezGUI control plane and runtime worker entrypoint."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from datetime import timedelta
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import redis
 import uvicorn
 
 from alvarezgui.app import create_app
@@ -20,6 +21,7 @@ from alvarezgui.config import Settings
 from alvarezgui.console_store import ConsoleStore, NodeHeartbeat
 from alvarezgui.consumer import Consumer
 from alvarezgui.db import connect
+from alvarezgui.model import ModelService
 from alvarezgui.model_http import HttpModelService
 from alvarezgui.node_agent.factory import runtime_from_settings
 from alvarezgui.node_agent.runtime import Runtime
@@ -27,21 +29,26 @@ from alvarezgui.queue import client
 from alvarezgui.scheduler import Scheduler
 
 log = logging.getLogger("alvarezgui.server")
-FIXTURE_DIR = Path(__file__).resolve().parents[2] / "fixtures" / "shopping"
+FIXTURE_DIR = Path(__file__).resolve().parents[2] / "fixtures"
 HEARTBEAT_SECONDS = 10
-# ponytail: one static guest IP per node, so one sandbox at a time; raise with a TAP/IP allocator.
-SANDBOX_CAPACITY = 1
 
 
 def node_resources(settings: Settings) -> dict[str, object]:
     meminfo = {}
-    for line in Path("/proc/meminfo").read_text().splitlines():
-        name, value = line.split(":", 1)
-        meminfo[name] = int(value.split()[0]) * 1024
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            name, value = line.split(":", 1)
+            meminfo[name] = int(value.split()[0]) * 1024
+    except OSError:
+        pass
+    try:
+        load_1m = os.getloadavg()[0]
+    except (AttributeError, OSError):
+        load_1m = None
     disk = shutil.disk_usage(settings.data_dir)
     return {
         "cpu_count": os.cpu_count(),
-        "load_1m": os.getloadavg()[0],
+        "load_1m": load_1m,
         "memory_total_bytes": meminfo.get("MemTotal"),
         "memory_available_bytes": meminfo.get("MemAvailable"),
         "disk_total_bytes": disk.total,
@@ -56,9 +63,9 @@ def heartbeat(settings: Settings) -> None:
         ConsoleStore(connection).heartbeat_node(
             settings.node_id,
             NodeHeartbeat(
-                role="microvm",
+                role="docker" if settings.runtime_backend == "docker" else "microvm",
                 address=settings.node_address,
-                capacity={"sandboxes": SANDBOX_CAPACITY},
+                capacity={"sandboxes": settings.sandbox_capacity},
                 resources=node_resources(settings),
                 heartbeat_interval_seconds=HEARTBEAT_SECONDS,
             ),
@@ -92,44 +99,71 @@ def destroy_active_sandboxes(settings: Settings, runtime: Runtime) -> None:
     with connect(settings) as connection:
         rows = ConsoleStore(connection).list_sandboxes()
     for row in rows:
+        if row["runtime_backend"] != settings.runtime_backend or row["node_id"] != settings.node_id:
+            continue
         try:
             runtime.destroy(row["sandbox_id"])
         except Exception:
             log.exception("failed to destroy %s on shutdown", row["sandbox_id"])
 
 
+def consumer_for_settings(
+    settings: Settings,
+    redis_client: redis.Redis,
+    model_service: ModelService | None,
+) -> Consumer:
+    return Consumer(
+        settings,
+        runtime_from_settings(settings),
+        redis_client,
+        node_id=settings.node_id,
+        model_service=model_service,
+        # Inference may include loading a new checkpoint; the lease must outlive the slowest request.
+        lease_ttl=timedelta(seconds=settings.model_request_timeout_seconds + 120),
+        worker_count=settings.sandbox_capacity,
+    )
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings = Settings()
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
     if settings.console_password is None:
         raise SystemExit("CONSOLE_PASSWORD must be set before exposing the console")
-    runtime = runtime_from_settings(settings)
     model_service = (
         HttpModelService(settings.model_service_url, settings.model_request_timeout_seconds)
         if settings.model_backend == "http"
         else None
     )
     redis_client = client(settings)
-    consumer = Consumer(
-        settings,
-        runtime,
-        redis_client,
-        node_id=settings.node_id,
-        model_service=model_service,
-        # Inference may include loading a new checkpoint; the lease must outlive the slowest request.
-        lease_ttl=timedelta(seconds=settings.model_request_timeout_seconds + 120),
-    )
-    scheduler = Scheduler(settings, redis_client, max_active=SANDBOX_CAPACITY)
-    forever("heartbeat", lambda: heartbeat(settings), HEARTBEAT_SECONDS)
-    forever("scheduler", scheduler.run_once, 1.0)
-    forever("consumer", consumer.run_once, 0.5)
-    fixture = serve_fixture(settings.fixture_port)
-    app = create_app(settings, runtime, model_service, redis_client)
+    consumer = None
+    if settings.server_mode != "control_plane":
+        consumer = consumer_for_settings(settings, redis_client, model_service)
+        forever("heartbeat", lambda: heartbeat(settings), HEARTBEAT_SECONDS)
+        forever(f"consumer-{settings.runtime_backend}", consumer.run_once, 0.5)
+        forever(f"lifecycle-{settings.runtime_backend}", consumer.run_lifecycle_once, 0.1)
+    if settings.server_mode != "worker":
+        scheduler = Scheduler(
+            settings,
+            redis_client,
+            runtime_backends=settings.scheduler_backend_list,
+            use_node_capacity=True,
+        )
+        forever("scheduler", scheduler.run_once, 1.0)
+    fixture = serve_fixture(settings.fixture_port) if consumer else None
     try:
-        uvicorn.run(app, host=settings.console_host, port=settings.console_port, log_level="info")
+        uvicorn.run(
+            create_app(settings, consumer.runtime if consumer else None, model_service, redis_client),
+            host=settings.console_host,
+            port=settings.console_port,
+            log_level="info",
+        )
     finally:
-        fixture.shutdown()
-        destroy_active_sandboxes(settings, runtime)
+        if fixture is not None:
+            fixture.shutdown()
+        if consumer is not None:
+            consumer.close()
+            destroy_active_sandboxes(settings, consumer.runtime)
 
 
 if __name__ == "__main__":

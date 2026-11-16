@@ -9,6 +9,7 @@ from typing import Any
 import psycopg
 from psycopg.types.json import Json
 from pydantic import BaseModel, Field
+from typing import Literal
 
 CANCELLABLE_STATUSES = ("QUEUED", "ALLOCATING", "RUNNING_ENV", "WAITING_MODEL")
 
@@ -22,6 +23,7 @@ class TaskCreateRequest(BaseModel):
     priority: int = 5
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     seed: int | None = None
+    runtime_backend: Literal["firecracker", "docker"] = "firecracker"
 
 
 TASK_LINK_FIELDS = ("run_id", "round", "group_id", "eval_id")
@@ -58,19 +60,32 @@ class TaskStore:
         if set(links) - set(TASK_LINK_FIELDS):
             raise ValueError("unknown task link field")
         values = request.model_dump(mode="json")
-        fingerprint = self._fingerprint({**values, **links})
+        fingerprint_values = {**values, **links}
+        fingerprint = self._fingerprint(fingerprint_values)
+        legacy_fingerprint_values = {
+            key: value for key, value in fingerprint_values.items() if key != "runtime_backend"
+        }
+        accepted_fingerprints = {fingerprint}
+        if request.runtime_backend == "firecracker":
+            accepted_fingerprints.add(self._fingerprint(legacy_fingerprint_values))
         task_id = f"task_{uuid.uuid4().hex}"
 
         with self.connection.transaction():
+            policy = self.connection.execute(
+                "SELECT status FROM model_versions WHERE version = %s FOR UPDATE",
+                (values["policy_version"],),
+            ).fetchone()
+            if policy is not None and policy["status"] == "RETIRED":
+                raise TaskStateConflictError("model version is retired")
             inserted = self.connection.execute(
                 """
                 INSERT INTO tasks (
                     task_id, task_type, instruction, app_image, policy_version,
                     max_steps, priority, status, sandbox_id, current_step,
                     idempotency_key, request_fingerprint, temperature, seed,
-                    run_id, round, group_id, eval_id
+                    runtime_backend, run_id, round, group_id, eval_id
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'QUEUED', NULL, 0, %s, %s,
-                          %s, %s, %s, %s, %s, %s)
+                          %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (idempotency_key) DO NOTHING
                 RETURNING task_id
                 """,
@@ -86,6 +101,7 @@ class TaskStore:
                     fingerprint,
                     values["temperature"],
                     values["seed"],
+                    values["runtime_backend"],
                     *(links.get(name) for name in TASK_LINK_FIELDS),
                 ),
             ).fetchone()
@@ -96,7 +112,7 @@ class TaskStore:
                 ).fetchone()
                 if existing is None:
                     raise RuntimeError("idempotency key insert was not observable")
-                if existing["request_fingerprint"] != fingerprint:
+                if existing["request_fingerprint"] not in accepted_fingerprints:
                     raise IdempotencyConflictError
                 task_id = existing["task_id"]
                 return self._create_response(task_id), False
@@ -150,19 +166,25 @@ class TaskStore:
                 raise RuntimeError("task episode is missing")
             return {"task_id": row["task_id"], "status": "CANCELED"}
 
-    def claim_next_queued(self) -> dict[str, Any] | None:
+    def claim_next_queued(self, runtime_backend: str | None = None) -> dict[str, Any] | None:
+        query = """
+            SELECT t.task_id, e.episode_id, t.runtime_backend
+            FROM tasks AS t
+            JOIN episodes AS e ON e.task_id = t.task_id
+            WHERE t.status = 'QUEUED' AND e.status = 'QUEUED'
+              AND t.runtime_backend IN ('firecracker', 'docker')
+        """
+        params: tuple[Any, ...] = ()
+        if runtime_backend is not None:
+            query += " AND t.runtime_backend = %s"
+            params = (runtime_backend,)
+        query += """
+            ORDER BY t.priority DESC, t.created_at, t.task_id
+            FOR UPDATE OF t, e SKIP LOCKED
+            LIMIT 1
+        """
         with self.connection.transaction():
-            row = self.connection.execute(
-                """
-                SELECT t.task_id, e.episode_id
-                FROM tasks AS t
-                JOIN episodes AS e ON e.task_id = t.task_id
-                WHERE t.status = 'QUEUED' AND e.status = 'QUEUED'
-                ORDER BY t.priority DESC, t.created_at, t.task_id
-                FOR UPDATE OF t, e SKIP LOCKED
-                LIMIT 1
-                """
-            ).fetchone()
+            row = self.connection.execute(query, params).fetchone()
             if row is None:
                 return None
 
@@ -186,11 +208,18 @@ class TaskStore:
                 raise RuntimeError("queued task changed while claiming")
             return row
 
-    def count_active(self) -> int:
+    def count_active(self, runtime_backend: str | None = None) -> int:
+        query = (
+            "SELECT count(*) AS count FROM tasks "
+            "WHERE runtime_backend IN ('firecracker', 'docker') "
+            "AND status IN ('ALLOCATING', 'RUNNING_ENV', 'WAITING_MODEL')"
+        )
+        params: tuple[Any, ...] = ()
+        if runtime_backend is not None:
+            query += " AND runtime_backend = %s"
+            params = (runtime_backend,)
         with self.connection.transaction():
-            return self.connection.execute(
-                "SELECT count(*) AS count FROM tasks WHERE status IN ('ALLOCATING', 'RUNNING_ENV', 'WAITING_MODEL')"
-            ).fetchone()["count"]
+            return self.connection.execute(query, params).fetchone()["count"]
 
     def requeue_stale_allocating(self, stale_after: timedelta = timedelta(minutes=5)) -> int:
         with self.connection.transaction():
@@ -202,6 +231,7 @@ class TaskStore:
                     JOIN episodes AS e ON e.task_id = t.task_id
                     WHERE t.status = 'ALLOCATING'
                       AND e.status = 'ALLOCATING'
+                      AND t.runtime_backend IN ('firecracker', 'docker')
                       AND t.sandbox_id IS NULL
                       AND t.updated_at < CURRENT_TIMESTAMP - (%s * INTERVAL '1 second')
                     FOR UPDATE OF t, e
@@ -225,7 +255,7 @@ class TaskStore:
     def get_dispatch(self, task_id: str, episode_id: str | None = None) -> dict[str, Any] | None:
         query = """
             SELECT t.task_id, e.episode_id, t.status, e.status AS episode_status,
-                   t.sandbox_id
+                   t.sandbox_id, t.runtime_backend
             FROM tasks AS t
             JOIN episodes AS e ON e.task_id = t.task_id
             WHERE t.task_id = %s
@@ -237,7 +267,9 @@ class TaskStore:
         with self.connection.transaction():
             return self.connection.execute(query, params).fetchone()
 
-    def mark_running_env(self, task_id: str, episode_id: str, sandbox_id: str) -> bool:
+    def mark_running_env(
+        self, task_id: str, episode_id: str, sandbox_id: str, actual_runtime_backend: str = "firecracker"
+    ) -> bool:
         with self.connection.transaction():
             updated = self.connection.execute(
                 """
@@ -249,19 +281,21 @@ class TaskStore:
                   AND e.episode_id = %s
                   AND t.status = 'ALLOCATING' AND e.status = 'ALLOCATING'
                   AND t.sandbox_id IS NULL
+                  AND t.runtime_backend = %s
                 RETURNING t.task_id
                 """,
-                (sandbox_id, task_id, episode_id),
+                (sandbox_id, task_id, episode_id, actual_runtime_backend),
             ).fetchone()
             if updated is None:
                 return False
             episode_updated = self.connection.execute(
                 """
                 UPDATE episodes
-                SET status = 'RUNNING_ENV', updated_at = CURRENT_TIMESTAMP
+                SET status = 'RUNNING_ENV', actual_runtime_backend = %s,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE task_id = %s AND episode_id = %s AND status = 'ALLOCATING'
                 """,
-                (task_id, episode_id),
+                (actual_runtime_backend, task_id, episode_id),
             )
             if episode_updated.rowcount != 1:
                 raise RuntimeError("allocated task episode is missing")
@@ -302,7 +336,8 @@ class TaskStore:
                 """
                 SELECT t.task_id, t.task_type, t.instruction, t.app_image, t.policy_version,
                        t.max_steps, t.current_step, t.status, t.temperature, t.seed,
-                       e.episode_id, e.status AS episode_status
+                       t.runtime_backend, e.episode_id, e.status AS episode_status,
+                       e.actual_runtime_backend
                 FROM tasks AS t
                 JOIN episodes AS e ON e.task_id = t.task_id
                 WHERE t.task_id = %s AND e.episode_id = %s
@@ -340,7 +375,7 @@ class TaskStore:
                 """,
                 (task_id, sandbox_id),
             )
-            return self.connection.execute(
+            inserted = self.connection.execute(
                 """
                 INSERT INTO sandbox_leases (
                     lease_id, sandbox_id, task_id, episode_id, node_id,
@@ -353,6 +388,7 @@ class TaskStore:
                     FROM tasks AS t
                     JOIN episodes AS e ON e.task_id = t.task_id
                     WHERE t.task_id = %s AND e.episode_id = %s
+                      AND t.runtime_backend IN ('firecracker', 'docker')
                       AND t.status = 'RUNNING_ENV'
                       AND e.status = 'RUNNING_ENV'
                 )
@@ -378,10 +414,12 @@ class TaskStore:
         with self.connection.transaction():
             return self.connection.execute(
                 """
-                SELECT lease_id, sandbox_id, task_id, episode_id, node_id,
-                       expires_at, last_heartbeat_at
-                FROM sandbox_leases
-                WHERE lease_id = %s AND sandbox_id = %s
+                SELECT l.lease_id, l.sandbox_id, l.task_id, l.episode_id, l.node_id,
+                       l.expires_at, l.last_heartbeat_at, t.runtime_backend
+                FROM sandbox_leases AS l
+                JOIN tasks AS t ON t.task_id = l.task_id
+                WHERE l.lease_id = %s AND l.sandbox_id = %s
+                  AND t.runtime_backend IN ('firecracker', 'docker')
                   AND expires_at > CURRENT_TIMESTAMP
                 """,
                 (lease_id, sandbox_id),
@@ -391,26 +429,35 @@ class TaskStore:
         with self.connection.transaction():
             updated = self.connection.execute(
                 """
-                UPDATE sandbox_leases
+                UPDATE sandbox_leases AS l
                 SET expires_at = CURRENT_TIMESTAMP + (%s * INTERVAL '1 second'),
                     last_heartbeat_at = CURRENT_TIMESTAMP
-                WHERE lease_id = %s AND sandbox_id = %s
-                  AND expires_at > CURRENT_TIMESTAMP
+                FROM tasks AS t
+                WHERE l.task_id = t.task_id
+                  AND l.lease_id = %s AND l.sandbox_id = %s
+                  AND t.runtime_backend IN ('firecracker', 'docker')
+                  AND l.expires_at > CURRENT_TIMESTAMP
                 """,
                 (ttl.total_seconds(), lease_id, sandbox_id),
             )
             return updated.rowcount == 1
 
-    def release_lease(self, lease_id: str, sandbox_id: str) -> bool:
+    def finish_sandbox_destroy(self, lease_id: str, sandbox_id: str) -> bool:
         with self.connection.transaction():
-            deleted = self.connection.execute(
+            task = self.connection.execute(
                 """
-                DELETE FROM sandbox_leases
-                WHERE lease_id = %s AND sandbox_id = %s
+                SELECT t.task_id, t.status
+                FROM tasks AS t JOIN sandbox_leases AS l ON l.task_id = t.task_id
+                WHERE l.lease_id = %s AND l.sandbox_id = %s AND t.sandbox_id = l.sandbox_id
+                FOR UPDATE OF t
                 """,
                 (lease_id, sandbox_id),
-            )
-            return deleted.rowcount == 1
+            ).fetchone()
+            if task is None:
+                return False
+            if task["status"] in CANCELLABLE_STATUSES:
+                self.cancel_task(task["task_id"], "sandbox destroyed by lifecycle request")
+            return self.clear_sandbox_if_terminal(task["task_id"], sandbox_id)
 
     def requeue_expired_leases(self) -> int:
         with self.connection.transaction():
@@ -428,16 +475,19 @@ class TaskStore:
                     SET status = 'QUEUED', sandbox_id = NULL,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE task_id = %s
+                      AND runtime_backend IN ('firecracker', 'docker')
                       AND status IN ('ALLOCATING', 'RUNNING_ENV', 'WAITING_MODEL')
                     """,
                     (row["task_id"],),
                 )
                 self.connection.execute(
                     """
-                    UPDATE episodes
+                    UPDATE episodes AS e
                     SET status = 'QUEUED', updated_at = CURRENT_TIMESTAMP
-                    WHERE task_id = %s AND episode_id = %s
-                      AND status IN ('ALLOCATING', 'RUNNING_ENV', 'WAITING_MODEL')
+                    FROM tasks AS t
+                    WHERE e.task_id = t.task_id AND e.task_id = %s AND e.episode_id = %s
+                      AND t.runtime_backend IN ('firecracker', 'docker')
+                      AND e.status IN ('ALLOCATING', 'RUNNING_ENV', 'WAITING_MODEL')
                     """,
                     (row["task_id"], row["episode_id"]),
                 )
@@ -651,14 +701,16 @@ class TaskStore:
             (lease_id, task_id, episode_id),
         ).fetchone() is not None
 
-    def list_canceled_sandboxes(self) -> list[dict[str, str]]:
+    def list_canceled_sandboxes(self, runtime_backend: str) -> list[dict[str, str]]:
         with self.connection.transaction():
             return self.connection.execute(
                 """
                 SELECT task_id, sandbox_id
                 FROM tasks
                 WHERE status = 'CANCELED' AND sandbox_id IS NOT NULL
-                """
+                  AND runtime_backend = %s
+                """,
+                (runtime_backend,),
             ).fetchall()
 
     def clear_sandbox_if_canceled(self, task_id: str, sandbox_id: str) -> bool:
@@ -716,10 +768,10 @@ class TaskStore:
             SELECT
                 t.task_id, t.task_type, t.instruction, t.app_image,
                 t.policy_version, t.max_steps, t.priority, t.status,
-                t.sandbox_id, t.current_step, t.started_at,
+                t.sandbox_id, t.current_step, t.started_at, t.runtime_backend,
                 t.created_at, t.updated_at,
                 e.episode_id, e.status AS episode_status,
-                e.environment_version, e.seed, e.result,
+                e.environment_version, e.seed, e.result, e.actual_runtime_backend,
                 e.cancel_reason, e.created_at AS episode_created_at,
                 e.updated_at AS episode_updated_at
             FROM tasks AS t
@@ -747,6 +799,7 @@ class TaskStore:
             "instruction": row["instruction"],
             "app_image": row["app_image"],
             "policy_version": row["policy_version"],
+            "runtime_backend": row["runtime_backend"],
             "max_steps": row["max_steps"],
             "priority": row["priority"],
             "status": row["status"],
@@ -761,6 +814,8 @@ class TaskStore:
                 "task_id": row["task_id"],
                 "status": row["episode_status"],
                 "environment_version": row["environment_version"],
+                "runtime_backend": row["actual_runtime_backend"],
+                "actual_runtime_backend": row["actual_runtime_backend"],
                 "seed": row["seed"],
                 "result": row["result"],
                 "cancel_reason": row["cancel_reason"],

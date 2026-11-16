@@ -5,30 +5,34 @@ import http.client
 import ipaddress
 import json
 import os
-import re
 import shutil
 import socket
 import subprocess
+import threading
 import time
-import xml.etree.ElementTree as ET
-from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
-from alvarezgui.action import validate_action
-from alvarezgui.node_agent.android_tasks import AndroidTask, resolve_android_task
+from alvarezgui.node_agent.android import AndroidRuntime, _now, _validate_id
 from alvarezgui.node_agent.runtime import (
     Capabilities,
     Health,
     InvalidStateError,
     RuntimeOperationError,
     Sandbox,
-    SandboxNotFoundError,
     SandboxState,
     Snapshot,
     SnapshotNotFoundError,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _NetworkEndpoint:
+    host_ip: str
+    guest_ip: str
+    prefix_len: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,17 +51,18 @@ class FirecrackerConfig:
     )
     network_enabled: bool = False
     network_iface_id: str = "eth0"
-    # ponytail: one static /24 endpoint per runtime; add an IP allocator before multi-VM concurrency.
     network_host_ip: str = "192.168.100.1"
     network_guest_ip: str = "192.168.100.2"
     network_prefix_len: int = 24
+    network_sandbox_prefix_len: int = 30
     ip_binary: str = "ip"
     guest_adb_port: int = 5555
     guest_screen_bridge_port: int = 8080
     api_timeout: float = 10.0
     guest_ready_timeout: float = 120.0
     snapshot_timeout: float = 120.0
-    shopping_fixture_url: str = "http://192.168.100.1:18090/"
+    shopping_fixture_url: str = "http://192.168.100.1:18090/shopping/"
+    sokoban_fixture_url: str = "http://192.168.100.1:18090/sokoban/"
 
 
 class _UnixHttp:
@@ -93,17 +98,17 @@ class _UnixHttp:
             sock.close()
 
 
-class FirecrackerAndroidRuntime:
+class FirecrackerAndroidRuntime(AndroidRuntime):
     """Firecracker plus ADB adapter for a prepared Android guest image."""
 
     def __init__(self, config: FirecrackerConfig) -> None:
-        self.config = config
-        self._sandboxes: dict[str, Sandbox] = {}
+        super().__init__(config)
         self._snapshots: dict[str, Snapshot] = {}
         self._processes: dict[str, subprocess.Popen[bytes]] = {}
         self._latest_snapshot: dict[str, str] = {}
         self._tap_names: dict[str, str] = {}
-        self._tasks: dict[str, AndroidTask] = {}
+        self._network_endpoints: dict[str, _NetworkEndpoint] = {}
+        self._network_lock = threading.Lock()
         self._snapshot_number = 0
 
     def create(self, sandbox_id: str) -> Sandbox:
@@ -113,9 +118,10 @@ class FirecrackerAndroidRuntime:
         self._check_assets()
         self.config.state_dir.mkdir(parents=True, exist_ok=True)
         (self.config.state_dir / "runs").mkdir(parents=True, exist_ok=True)
-        if self.config.network_enabled:
-            self._setup_network(sandbox_id)
         try:
+            self._prepare_rootfs(sandbox_id)
+            if self.config.network_enabled:
+                self._setup_network(sandbox_id)
             self._start_process(sandbox_id)
             self._wait_for_socket(self._socket_path(sandbox_id), sandbox_id)
             api = self._api(sandbox_id)
@@ -128,14 +134,14 @@ class FirecrackerAndroidRuntime:
             api.request(
                 "PUT",
                 "/boot-source",
-                {"kernel_image_path": str(self.config.kernel_image), "boot_args": self._boot_args()},
+                {"kernel_image_path": str(self.config.kernel_image), "boot_args": self._boot_args(sandbox_id)},
             )
             api.request(
                 "PUT",
                 "/drives/rootfs",
                 {
                     "drive_id": "rootfs",
-                    "path_on_host": str(self.config.rootfs_image),
+                    "path_on_host": str(self._rootfs_path(sandbox_id)),
                     "is_root_device": True,
                     "is_read_only": False,
                 },
@@ -155,53 +161,12 @@ class FirecrackerAndroidRuntime:
             self._stop_process(sandbox_id)
             if self.config.network_enabled:
                 self._cleanup_network(sandbox_id)
+            self._remove_rootfs(sandbox_id)
             raise
         sandbox = Sandbox(sandbox_id, SandboxState.READY, _now())
         self._sandboxes[sandbox_id] = sandbox
         return sandbox
 
-    def initialize_task(
-        self, sandbox_id: str, task_type: str, app_image: str, instruction: str
-    ) -> dict[str, Any]:
-        sandbox = self._get(sandbox_id)
-        if sandbox.state not in {SandboxState.READY, SandboxState.RUNNING}:
-            raise InvalidStateError(f"cannot initialize task in {sandbox.state}")
-        task = resolve_android_task(task_type, app_image)
-        try:
-            self._adb(sandbox_id, "shell", "am", "force-stop", task.target_package)
-            if task.task_kind == "shopping_fixture":
-                self._adb(
-                    sandbox_id,
-                    "shell",
-                    "am",
-                    "start",
-                    "-n",
-                    "org.chromium.webview_shell/.WebViewBrowserActivity",
-                    "-d",
-                    self.config.shopping_fixture_url,
-                )
-                self._wait_for_ui_text(sandbox_id, "Alvarez Test Shop")
-            else:
-                self._adb(
-                    sandbox_id,
-                    "shell",
-                    "am",
-                    "start",
-                    "-a",
-                    "android.intent.action.MAIN",
-                    "-c",
-                    "android.intent.category.HOME",
-                )
-            self._tasks[sandbox_id] = task
-            foreground_package = self._foreground_package(sandbox_id)
-        except Exception:
-            self._tasks.pop(sandbox_id, None)
-            raise
-        return {
-            "task_kind": task.task_kind,
-            "target_package": task.target_package,
-            "foreground_package": foreground_package,
-        }
 
     def destroy(self, sandbox_id: str) -> Sandbox:
         sandbox = self._get(sandbox_id)
@@ -217,6 +182,7 @@ class FirecrackerAndroidRuntime:
             for path in snapshot_dir.glob("*"):
                 path.unlink(missing_ok=True)
             snapshot_dir.rmdir()
+        self._remove_rootfs(sandbox_id)
         self._tasks.pop(sandbox_id, None)
         return self._set_state(sandbox, SandboxState.STOPPED)
 
@@ -305,108 +271,6 @@ class FirecrackerAndroidRuntime:
             raise
         return self._set_state(sandbox, SandboxState.RUNNING)
 
-    def observe(self, sandbox_id: str) -> dict[str, Any]:
-        sandbox = self._get(sandbox_id)
-        if sandbox.state not in {SandboxState.READY, SandboxState.RUNNING}:
-            raise InvalidStateError(f"cannot observe sandbox in {sandbox.state}")
-        output_dir = self.config.state_dir / "runs" / sandbox_id
-        output_dir.mkdir(parents=True, exist_ok=True)
-        screenshot = (output_dir / f"screen-{time.time_ns()}.png").resolve()
-        if self.config.network_enabled:
-            image = self._screen_bridge_request("GET", "/screen")
-            if not image.startswith(b"\x89PNG\r\n\x1a\n"):
-                raise RuntimeOperationError("screen bridge returned a non-PNG screenshot")
-            screenshot.write_bytes(image)
-        else:
-            self._adb(sandbox_id, "exec-out", "screencap", "-p", output=screenshot)
-        digest = hashlib.sha256(screenshot.read_bytes()).hexdigest()
-        observation = {
-            "sandbox_id": sandbox_id,
-            "state": sandbox.state,
-            "image_uri": screenshot.as_uri(),
-            "screen_hash": digest,
-        }
-        if sandbox_id in self._tasks:
-            observation["foreground_package"] = self._foreground_package(sandbox_id)
-            if self._tasks[sandbox_id].target_text is not None:
-                observation["ui_text"] = sorted(self._ui_text(sandbox_id))
-        return observation
-
-    def execute(self, sandbox_id: str, action: dict[str, Any]) -> dict[str, Any]:
-        sandbox = self._get(sandbox_id)
-        if sandbox.state not in {SandboxState.READY, SandboxState.RUNNING}:
-            raise InvalidStateError(f"cannot execute action in {sandbox.state}")
-        action = validate_action(action)
-        action_type = action["type"]
-        if action_type in {"tap", "swipe", "text", "back"} and self.config.network_enabled:
-            bridge_action: dict[str, Any]
-            if action_type == "tap":
-                bridge_action = {"action": "tap", "x": action["x"], "y": action["y"]}
-            elif action_type == "swipe":
-                bridge_action = {
-                    "action": "swipe",
-                    "x1": action["x1"],
-                    "y1": action["y1"],
-                    "x2": action["x2"],
-                    "y2": action["y2"],
-                    "duration": action["duration_ms"],
-                }
-            elif action_type == "text":
-                bridge_action = {"action": "text", "text": action["text"]}
-            else:
-                bridge_action = {"action": "key", "key": "BACK"}
-            self._screen_bridge_request("POST", "/input", bridge_action)
-        elif action_type == "tap":
-            self._adb(sandbox_id, "shell", "input", "tap", str(action["x"]), str(action["y"]))
-        elif action_type == "swipe":
-            self._adb(
-                sandbox_id,
-                "shell",
-                "input",
-                "swipe",
-                str(action["x1"]),
-                str(action["y1"]),
-                str(action["x2"]),
-                str(action["y2"]),
-                str(action["duration_ms"]),
-            )
-        elif action_type == "text":
-            self._adb(sandbox_id, "shell", "input", "text", action["text"])
-        elif action_type == "back":
-            self._adb(sandbox_id, "shell", "input", "keyevent", "4")
-        elif action_type == "wait":
-            time.sleep(action["duration_ms"] / 1000)
-        if sandbox_id in self._tasks:
-            task = self._tasks[sandbox_id]
-            foreground_package, ui_text = self._task_state(sandbox_id, task)
-            if not task.succeeded(foreground_package, ui_text) and action_type != "terminate":
-                deadline = time.monotonic() + min(self.config.api_timeout, 2.0)
-                while time.monotonic() < deadline:
-                    time.sleep(0.05)
-                    foreground_package, ui_text = self._task_state(sandbox_id, task)
-                    if task.succeeded(foreground_package, ui_text):
-                        break
-            succeeded = task.succeeded(foreground_package, ui_text)
-            if succeeded or action_type == "terminate":
-                return {
-                    "done": True,
-                    "reward": task.reward(
-                        foreground_package,
-                        terminated=action_type == "terminate",
-                        ui_text=ui_text,
-                    ),
-                }
-            return {
-                "done": False,
-                "reward": task.reward(
-                    foreground_package,
-                    terminated=False,
-                    ui_text=ui_text,
-                ),
-            }
-        if action_type == "terminate":
-            raise RuntimeOperationError("Android task was not initialized")
-        return {"done": False, "reward": _reward(0.0, False)}
 
     def health(self, sandbox_id: str) -> Health:
         sandbox = self._get(sandbox_id)
@@ -429,15 +293,21 @@ class FirecrackerAndroidRuntime:
 
     def _adb_target(self, sandbox_id: str) -> str:
         if self.config.network_enabled:
-            return f"{self.config.network_guest_ip}:{self.config.guest_adb_port}"
+            return f"{self._network_endpoint(sandbox_id).guest_ip}:{self.config.guest_adb_port}"
         return f"{self.config.adb_serial_prefix}{sandbox_id}"
 
     def _screen_bridge_request(
-        self, method: str, path: str, body: dict[str, Any] | None = None
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        sandbox_id: str | None = None,
     ) -> bytes:
         payload = None if body is None else json.dumps(body).encode()
+        endpoint = self._network_endpoint(sandbox_id) if sandbox_id is not None else self._default_endpoint()
         connection = http.client.HTTPConnection(
-            self.config.network_guest_ip,
+            endpoint.guest_ip,
             self.config.guest_screen_bridge_port,
             timeout=self.config.api_timeout,
         )
@@ -458,8 +328,9 @@ class FirecrackerAndroidRuntime:
         finally:
             connection.close()
 
-    def _adb_connect(self) -> bool:
-        endpoint = f"{self.config.network_guest_ip}:{self.config.guest_adb_port}"
+    def _adb_connect(self, sandbox_id: str | None = None) -> bool:
+        network = self._network_endpoint(sandbox_id) if sandbox_id is not None else self._default_endpoint()
+        endpoint = f"{network.guest_ip}:{self.config.guest_adb_port}"
         try:
             completed = subprocess.run(
                 [self.config.adb_binary, "connect", endpoint],
@@ -474,10 +345,11 @@ class FirecrackerAndroidRuntime:
             b"connected" in output or b"already connected" in output
         )
 
-    def _screen_bridge_is_ready(self) -> bool:
+    def _screen_bridge_is_ready(self, sandbox_id: str | None = None) -> bool:
+        network = self._network_endpoint(sandbox_id) if sandbox_id is not None else self._default_endpoint()
         try:
             with socket.create_connection(
-                (self.config.network_guest_ip, self.config.guest_screen_bridge_port),
+                (network.guest_ip, self.config.guest_screen_bridge_port),
                 timeout=self.config.api_timeout,
             ) as sock:
                 request = (
@@ -493,78 +365,6 @@ class FirecrackerAndroidRuntime:
         except (OSError, http.client.HTTPException):
             return False
 
-    def _task_state(
-        self, sandbox_id: str, task: AndroidTask
-    ) -> tuple[str | None, set[str] | None]:
-        return self._foreground_package(sandbox_id), (
-            self._ui_text(sandbox_id) if task.target_text is not None else None
-        )
-
-    def _ui_text(self, sandbox_id: str) -> set[str]:
-        self._adb(sandbox_id, "shell", "uiautomator", "dump", "/sdcard/window.xml")
-        payload = self._adb(sandbox_id, "shell", "cat", "/sdcard/window.xml")
-        root = ET.fromstring(payload)
-        return {
-            value
-            for node in root.iter("node")
-            if (value := node.attrib.get("text"))
-        }
-
-    def _wait_for_ui_text(self, sandbox_id: str, target: str) -> None:
-        deadline = time.monotonic() + min(self.config.api_timeout, 5.0)
-        while time.monotonic() < deadline:
-            if target in self._ui_text(sandbox_id):
-                return
-            time.sleep(0.1)
-        raise RuntimeOperationError(f"Android fixture did not load: {target}")
-
-    def _foreground_package(self, sandbox_id: str) -> str | None:
-        output = self._adb(sandbox_id, "shell", "dumpsys", "activity", "activities")
-        text = output.decode(errors="replace")
-        for pattern in (
-            r"mResumedActivity:.*?\b([A-Za-z_][\w.]*)/",
-            r"mCurrentFocus=.*?\b([A-Za-z_][\w.]*)/",
-        ):
-            match = re.search(pattern, text)
-            if match:
-                return match.group(1)
-        return None
-
-    def _adb(
-        self,
-        sandbox_id: str,
-        *args: str,
-        output: Path | None = None,
-        timeout: float | None = None,
-    ) -> bytes:
-        command = [self.config.adb_binary, "-s", self._adb_target(sandbox_id), *args]
-        call_timeout = self.config.api_timeout if timeout is None else min(self.config.api_timeout, timeout)
-        if call_timeout <= 0:
-            raise RuntimeOperationError("ADB call exceeded readiness timeout")
-        try:
-            if output is None:
-                completed = subprocess.run(
-                    command,
-                    check=False,
-                    capture_output=True,
-                    timeout=call_timeout,
-                )
-            else:
-                with output.open("wb") as stream:
-                    completed = subprocess.run(
-                        command,
-                        check=False,
-                        stdout=stream,
-                        stderr=subprocess.PIPE,
-                        timeout=call_timeout,
-                    )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeOperationError("ADB action timed out") from exc
-        except OSError as exc:
-            raise RuntimeOperationError("ADB executable is unavailable") from exc
-        if completed.returncode != 0:
-            raise RuntimeOperationError(f"ADB action failed: {args[0]}")
-        return b"" if output is not None else completed.stdout
 
     def _wait_for_guest_ready(self, sandbox_id: str) -> None:
         deadline = time.monotonic() + self.config.guest_ready_timeout
@@ -584,7 +384,7 @@ class FirecrackerAndroidRuntime:
 
     def _guest_is_ready(self, sandbox_id: str, deadline: float | None = None) -> bool:
         self._require_process_alive(sandbox_id)
-        if self.config.network_enabled and not self._adb_connect():
+        if self.config.network_enabled and not self._adb_connect(sandbox_id):
             return False
         state = self._adb(sandbox_id, "get-state", timeout=self._adb_timeout(deadline)).strip()
         self._require_process_alive(sandbox_id)
@@ -600,17 +400,10 @@ class FirecrackerAndroidRuntime:
         self._require_process_alive(sandbox_id)
         if boot_completed != b"1":
             return False
-        return not self.config.network_enabled or self._screen_bridge_is_ready()
-
-    def _adb_timeout(self, deadline: float | None) -> float:
-        if deadline is None:
-            return self.config.api_timeout
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise RuntimeOperationError("ADB call exceeded readiness timeout")
-        return min(self.config.api_timeout, remaining)
+        return not self.config.network_enabled or self._screen_bridge_is_ready(sandbox_id)
 
     def _setup_network(self, sandbox_id: str) -> None:
+        endpoint = self._allocate_network_endpoint(sandbox_id)
         tap_name = self._tap_name(sandbox_id)
         self._tap_names[sandbox_id] = tap_name
         try:
@@ -618,17 +411,26 @@ class FirecrackerAndroidRuntime:
             self._run_ip(
                 "addr",
                 "add",
-                f"{self.config.network_host_ip}/{self.config.network_prefix_len}",
+                f"{endpoint.host_ip}/{endpoint.prefix_len}",
                 "dev",
                 tap_name,
             )
             self._run_ip("link", "set", "dev", tap_name, "up")
+            self._run_ip(
+                "route",
+                "replace",
+                f"{endpoint.guest_ip}/32",
+                "dev",
+                tap_name,
+            )
         except Exception:
             self._cleanup_network(sandbox_id)
             raise
 
     def _cleanup_network(self, sandbox_id: str) -> None:
         tap_name = self._tap_names.pop(sandbox_id, None)
+        with self._network_lock:
+            self._network_endpoints.pop(sandbox_id, None)
         if tap_name is None:
             return
         try:
@@ -655,13 +457,61 @@ class FirecrackerAndroidRuntime:
     def _tap_name(self, sandbox_id: str) -> str:
         return f"alv-{hashlib.sha256(sandbox_id.encode()).hexdigest()[:8]}"
 
-    def _boot_args(self) -> str:
+    def _default_endpoint(self) -> _NetworkEndpoint:
+        return _NetworkEndpoint(
+            self.config.network_host_ip,
+            self.config.network_guest_ip,
+            self.config.network_prefix_len,
+        )
+
+    def _network_endpoint(self, sandbox_id: str | None) -> _NetworkEndpoint:
+        if sandbox_id is None:
+            return self._default_endpoint()
+        with self._network_lock:
+            endpoint = self._network_endpoints.get(sandbox_id)
+        if endpoint is None:
+            return self._default_endpoint()
+        return endpoint
+
+    def _allocate_network_endpoint(self, sandbox_id: str) -> _NetworkEndpoint:
+        pool = ipaddress.ip_network(
+            f"{self.config.network_host_ip}/{self.config.network_prefix_len}",
+            strict=False,
+        )
+        subnet_prefix = self.config.network_sandbox_prefix_len
+        if pool.prefixlen > subnet_prefix:
+            raise RuntimeOperationError(
+                f"network pool /{pool.prefixlen} is too small for /{subnet_prefix} sandboxes"
+            )
+        with self._network_lock:
+            used = set(self._network_endpoints.values())
+            for subnet in pool.subnets(new_prefix=subnet_prefix):
+                hosts = list(subnet.hosts())
+                if len(hosts) < 2:
+                    continue
+                endpoint = _NetworkEndpoint(str(hosts[0]), str(hosts[1]), subnet_prefix)
+                if endpoint not in used:
+                    self._network_endpoints[sandbox_id] = endpoint
+                    return endpoint
+        raise RuntimeOperationError(f"no network endpoint available for sandbox: {sandbox_id}")
+
+    def _fixture_url(self, sandbox_id: str, url: str) -> str:
+        endpoint = self._network_endpoint(sandbox_id)
+        parsed = urlsplit(url)
+        host = endpoint.host_ip
+        netloc = host
+        if parsed.port is not None:
+            netloc += f":{parsed.port}"
+        return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+    def _boot_args(self, sandbox_id: str | None = None) -> str:
         if not self.config.network_enabled:
             return self.config.boot_args
-        network = ipaddress.ip_network(f"0.0.0.0/{self.config.network_prefix_len}")
+        endpoint = self._network_endpoint(sandbox_id)
+        network = ipaddress.ip_network(f"{endpoint.host_ip}/{endpoint.prefix_len}", strict=False)
         return (
-            f"{self.config.boot_args} ip={self.config.network_guest_ip}::"
-            f"{self.config.network_host_ip}:{network.netmask}::"
+            f"{self.config.boot_args} ip={endpoint.guest_ip}::"
+            f"{endpoint.host_ip}:{network.netmask}::"
             f"{self.config.network_iface_id}:off"
         )
 
@@ -672,6 +522,25 @@ class FirecrackerAndroidRuntime:
     def _require_process_alive(self, sandbox_id: str) -> None:
         if not self._process_alive(sandbox_id):
             raise RuntimeOperationError("firecracker exited while waiting for Android guest")
+
+    def _rootfs_path(self, sandbox_id: str) -> Path:
+        return self.config.state_dir / "rootfs" / f"{sandbox_id}.ext4"
+
+    def _prepare_rootfs(self, sandbox_id: str) -> None:
+        target = self._rootfs_path(sandbox_id)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            subprocess.run(
+                ["cp", "--reflink=auto", "--sparse=always", str(self.config.rootfs_image), str(target)],
+                check=True,
+                capture_output=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            target.unlink(missing_ok=True)
+            raise RuntimeOperationError("failed to prepare sandbox rootfs") from exc
+
+    def _remove_rootfs(self, sandbox_id: str) -> None:
+        self._rootfs_path(sandbox_id).unlink(missing_ok=True)
 
     def _start_process(self, sandbox_id: str) -> None:
         socket_path = self._socket_path(sandbox_id)
@@ -704,17 +573,6 @@ class FirecrackerAndroidRuntime:
     def _socket_path(self, sandbox_id: str) -> Path:
         return self.config.state_dir / "runs" / f"{sandbox_id}.sock"
 
-    def _get(self, sandbox_id: str) -> Sandbox:
-        _validate_id(sandbox_id)
-        try:
-            return self._sandboxes[sandbox_id]
-        except KeyError as exc:
-            raise SandboxNotFoundError(sandbox_id) from exc
-
-    def _set_state(self, sandbox: Sandbox, state: SandboxState) -> Sandbox:
-        updated = replace(sandbox, state=state)
-        self._sandboxes[sandbox.sandbox_id] = updated
-        return updated
 
     def _wait_for_socket(self, socket_path: Path, sandbox_id: str) -> None:
         deadline = time.monotonic() + self.config.api_timeout
@@ -757,23 +615,3 @@ class FirecrackerAndroidRuntime:
                 ip_binary.is_file() and os.access(ip_binary, os.X_OK)
             ):
                 raise RuntimeOperationError(f"ip executable is unavailable: {self.config.ip_binary}")
-
-
-def _validate_id(value: str) -> None:
-    if not isinstance(value, str) or not value.strip() or "/" in value or ".." in value:
-        raise ValueError("ID must be a non-empty path-safe string")
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _reward(total: float, success: bool) -> dict[str, Any]:
-    return {
-        "total": total,
-        "progress": total,
-        "success": success,
-        "invalid_action": False,
-        "safety_penalty": 0.0,
-        "reward_version": "android-v1",
-    }

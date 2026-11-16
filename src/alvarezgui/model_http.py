@@ -40,7 +40,16 @@ class HttpModelService(ModelService):
                 raise InferenceTimeoutError(request.request_id) from exc
             if exc.code >= 500:
                 raise ModelUnavailableError(request.model_version) from exc
-            raise InvalidActionOutputError(f"model service returned HTTP {exc.code}") from exc
+            detail = exc.read().decode("utf-8", errors="replace").strip()
+            if detail:
+                try:
+                    body = json.loads(detail)
+                    if isinstance(body, dict):
+                        detail = str(body.get("detail", detail))
+                except json.JSONDecodeError:
+                    pass
+            suffix = f": {detail[:300]}" if detail else ""
+            raise InvalidActionOutputError(f"model service returned HTTP {exc.code}{suffix}") from exc
         except TimeoutError as exc:
             raise InferenceTimeoutError(request.request_id) from exc
         except (OSError, URLError, json.JSONDecodeError) as exc:

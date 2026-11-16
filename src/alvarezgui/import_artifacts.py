@@ -53,9 +53,9 @@ def import_history(settings: Settings, runs_dir: Path) -> dict[str, int]:
         connection.execute(
             """
             INSERT INTO training_runs (run_id, algorithm, base_model, dataset_version, environment_version,
-                                       reward_version, config, status, checkpoint_uri, metrics, log_tail,
+                                       reward_version, runtime_backend, config, status, checkpoint_uri, metrics, log_tail,
                                        idempotency_key, request_fingerprint, created_at, updated_at)
-            VALUES (%s, 'grpo', 'minicpm-v-4.7-1b', NULL, 'android-firecracker-v1', 'android-task-v1', %s,
+            VALUES (%s, 'grpo', 'minicpm-v-4.7-1b', NULL, 'android-firecracker-v1', 'android-task-v1', 'firecracker', %s,
                     'SUCCEEDED', %s, %s, %s, %s, %s, to_timestamp(%s), to_timestamp(%s))
             ON CONFLICT (run_id) DO NOTHING
             """,
@@ -97,8 +97,8 @@ def _import_rollout(connection: Any, group: dict[str, Any], row: dict[str, Any],
         """
         INSERT INTO tasks (task_id, task_type, instruction, app_image, policy_version, max_steps, priority,
                            status, current_step, idempotency_key, request_fingerprint, temperature, seed,
-                           run_id, round, group_id, started_at, created_at, updated_at)
-        VALUES (%s, 'shopping', %s, 'android-shop-v1', %s, 1, 5, %s, 1, %s, %s, %s, %s, %s, 0, %s,
+                           runtime_backend, run_id, round, group_id, started_at, created_at, updated_at)
+        VALUES (%s, 'shopping', %s, 'android-shop-v1', %s, 1, 5, %s, 1, %s, %s, %s, %s, 'firecracker', %s, 0, %s,
                 to_timestamp(%s), to_timestamp(%s), to_timestamp(%s))
         ON CONFLICT (task_id) DO NOTHING
         """,
@@ -112,8 +112,8 @@ def _import_rollout(connection: Any, group: dict[str, Any], row: dict[str, Any],
         return 0
     connection.execute(
         """
-        INSERT INTO episodes (episode_id, task_id, environment_version, seed, status, result)
-        VALUES (%s, %s, 'android-firecracker-v1', %s, %s, %s)
+        INSERT INTO episodes (episode_id, task_id, environment_version, seed, status, actual_runtime_backend, result)
+        VALUES (%s, %s, 'android-firecracker-v1', %s, %s, 'firecracker', %s)
         """,
         (episode_id, task_id, index, status, Json({"final_reward": reward, "final_observation": row["after"]})),
     )

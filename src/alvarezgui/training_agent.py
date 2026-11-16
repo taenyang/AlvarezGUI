@@ -234,14 +234,20 @@ class TrainingAgent:
         config = run["config"]
         base_path = _local_path(run.get("base_model_checkpoint_uri"), "base model")
         run_dir = self.checkpoint_root / run["run_id"]
-        if run["algorithm"] == "sft" or (run["algorithm"] == "grpo" and run.get("dataset_version")):
+        if run["algorithm"] == "gigpo":
+            self.log(run["run_id"], "GIGPO compatibility mode: GRPO episode advantages and clipped policy loss; "
+                     "no step-level state grouping")
+        if run["algorithm"] == "sft" or (run["algorithm"] in {"grpo", "gigpo"} and run.get("dataset_version")):
             rows = load_dataset(_local_path(run.get("dataset_source"), "dataset"))
             self.log(run["run_id"], f"offline {run['algorithm']} on {len(rows)} rows")
             output_dir = run_dir / "final"
             self.unload_serving()
-            metrics = self.train(run, base_path, rows, output_dir, step_offset=0)
+            try:
+                metrics = self.train(run, base_path, rows, output_dir, step_offset=0)
+            finally:
+                self.release_training_memory()
             version = self.register(run, output_dir, metrics, "final")
-        elif run["algorithm"] == "grpo":
+        elif run["algorithm"] in {"grpo", "gigpo"}:
             version, output_dir, metrics = self.online_grpo(run, base_path, run_dir)
         else:
             raise RuntimeError(f"algorithm {run['algorithm']} is not supported by this agent")
@@ -270,7 +276,7 @@ class TrainingAgent:
         metrics: dict[str, Any] = {}
         output_dir = Path(policy_path)
         for round_number in range(config["rounds"]):
-            self.log(run["run_id"], f"round {round_number}: sampling with {policy_version}")
+            self.log(run["run_id"], f"round {round_number}: {run['algorithm']} sampling with {policy_version}")
             rollouts = self.collect(run, round_number, policy_version)
             summary = rollout_metrics(rollouts)
             self.metrics(run["run_id"], round_number, summary)
@@ -281,7 +287,11 @@ class TrainingAgent:
                 continue
             self.unload_serving()
             output_dir = run_dir / f"round-{round_number}"
-            metrics = {**summary, **self.train(run, policy_path, rows, output_dir, step_offset)}
+            try:
+                trained_metrics = self.train(run, policy_path, rows, output_dir, step_offset)
+            finally:
+                self.release_training_memory()
+            metrics = {**summary, **trained_metrics}
             step_offset += metrics["update_count"]
             policy_version = self.register(run, output_dir, metrics, f"r{round_number}")
             policy_path = str(output_dir)
@@ -373,7 +383,8 @@ class TrainingAgent:
     def register(self, run: dict[str, Any], output_dir: Path, metrics: dict[str, Any], suffix: str) -> str:
         if not (output_dir / "config.json").is_file():
             raise RuntimeError(f"training did not produce a reloadable checkpoint in {output_dir}")
-        version = f"{run['run_id']}-{suffix}"
+        model_name = run.get("config", {}).get("model_name") or run["run_id"]
+        version = f"{model_name}-{suffix}"
         try:
             self.cp.call("POST", "/internal/v1/model-versions", {
                 "version": version,
@@ -387,6 +398,14 @@ class TrainingAgent:
                 raise
         self.log(run["run_id"], f"registered {version} -> {output_dir}")
         return version
+
+    def release_training_memory(self) -> None:
+        try:
+            import torch
+        except ImportError:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def unload_serving(self) -> None:
         """Free GPU memory held by the co-located model service before a full-parameter update."""

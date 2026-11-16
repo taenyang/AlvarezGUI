@@ -79,6 +79,7 @@ class FirecrackerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             runtime = self.runtime(Path(directory))
             runtime._check_assets = Mock()
+            runtime._prepare_rootfs = Mock()
             runtime._start_process = Mock(
                 side_effect=lambda sandbox_id: runtime._processes.__setitem__(
                     sandbox_id, _AliveProcess()
@@ -101,7 +102,25 @@ class FirecrackerTest(unittest.TestCase):
             )
             self.assertEqual(calls[0][2], {})
             self.assertEqual(calls[-1][2], {"action_type": "InstanceStart"})
+            self.assertEqual(
+                calls[3][2]["path_on_host"],
+                str(runtime._rootfs_path("sandbox-1")),
+            )
             runtime._wait_for_guest_ready.assert_called_once_with("sandbox-1")
+
+    def test_prepare_rootfs_copies_isolated_image_and_removes_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "rootfs"
+            source.write_bytes(b"rootfs")
+            runtime = self.runtime(root)
+
+            runtime._prepare_rootfs("sandbox-1")
+            target = runtime._rootfs_path("sandbox-1")
+            self.assertEqual(target.read_bytes(), b"rootfs")
+
+            runtime._remove_rootfs("sandbox-1")
+            self.assertFalse(target.exists())
 
     def test_guest_readiness_requires_device_and_boot_completed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -129,6 +148,7 @@ class FirecrackerTest(unittest.TestCase):
             root = Path(directory)
             runtime = self.runtime(root)
             runtime._check_assets = Mock()
+            runtime._prepare_rootfs = Mock()
             runtime._start_process = Mock(
                 side_effect=lambda sandbox_id: runtime._processes.__setitem__(
                     sandbox_id, _AliveProcess()
@@ -140,6 +160,7 @@ class FirecrackerTest(unittest.TestCase):
                 side_effect=RuntimeOperationError("guest not ready")
             )
             runtime._stop_process = Mock()
+            runtime._remove_rootfs = Mock()
 
             with self.assertRaises(RuntimeOperationError):
                 runtime.create("sandbox-1")
@@ -238,6 +259,7 @@ class FirecrackerTest(unittest.TestCase):
             root = Path(directory)
             runtime = self.runtime(root, network_enabled=True)
             runtime._check_assets = Mock()
+            runtime._prepare_rootfs = Mock()
             runtime._start_process = Mock(
                 side_effect=lambda sandbox_id: runtime._processes.__setitem__(
                     sandbox_id, _AliveProcess()
@@ -270,11 +292,40 @@ class FirecrackerTest(unittest.TestCase):
                 ],
             )
             self.assertEqual(calls[4][2]["host_dev_name"], runtime._tap_name("sandbox-1"))
-            self.assertEqual([call.args[0][1] for call in run.call_args_list[:3]], ["tuntap", "addr", "link"])
+            self.assertEqual(
+                [call.args[0][1] for call in run.call_args_list[:4]],
+                ["tuntap", "addr", "link", "route"],
+            )
+            self.assertEqual(
+                run.call_args_list[3].args[0][1:],
+                ["route", "replace", "192.168.100.2/32", "dev", runtime._tap_name("sandbox-1")],
+            )
             self.assertEqual(
                 run.call_args_list[-1].args[0][1:],
                 ["link", "del", "dev", runtime._tap_name("sandbox-1")],
             )
+
+    def test_network_allocates_independent_endpoints_per_sandbox(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = self.runtime(Path(directory), network_enabled=True)
+            runtime._run_ip = Mock()
+
+            runtime._setup_network("sandbox-1")
+            runtime._setup_network("sandbox-2")
+
+            first = runtime._network_endpoint("sandbox-1")
+            second = runtime._network_endpoint("sandbox-2")
+            self.assertEqual((first.host_ip, first.guest_ip), ("192.168.100.1", "192.168.100.2"))
+            self.assertEqual((second.host_ip, second.guest_ip), ("192.168.100.5", "192.168.100.6"))
+            self.assertIn("ip=192.168.100.6::192.168.100.5:255.255.255.252", runtime._boot_args("sandbox-2"))
+            self.assertEqual(
+                runtime._fixture_url("sandbox-2", "http://192.168.100.1:18090/shopping/?variant=group"),
+                "http://192.168.100.5:18090/shopping/?variant=group",
+            )
+
+            runtime._cleanup_network("sandbox-1")
+            runtime._cleanup_network("sandbox-2")
+            self.assertEqual(runtime._network_endpoints, {})
 
     def test_network_setup_failure_cleans_tap_and_does_not_start_vm(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -305,8 +356,8 @@ class FirecrackerTest(unittest.TestCase):
 
             self.assertTrue(runtime._guest_is_ready("sandbox-1"))
             self.assertEqual(runtime._adb_target("sandbox-1"), "192.168.100.2:5555")
-            runtime._adb_connect.assert_called_once_with()
-            runtime._screen_bridge_is_ready.assert_called_once_with()
+            runtime._adb_connect.assert_called_once_with("sandbox-1")
+            runtime._screen_bridge_is_ready.assert_called_once_with("sandbox-1")
 
     def test_screen_bridge_readiness_sends_valid_http(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -375,8 +426,8 @@ class FirecrackerTest(unittest.TestCase):
             self.assertEqual(
                 runtime._screen_bridge_request.call_args_list,
                 [
-                    call("GET", "/screen"),
-                    call("POST", "/input", {"action": "tap", "x": 1, "y": 2}),
+                    call("GET", "/screen", sandbox_id="sandbox-1"),
+                    call("POST", "/input", {"action": "tap", "x": 1, "y": 2}, sandbox_id="sandbox-1"),
                 ],
             )
 
@@ -415,6 +466,33 @@ class FirecrackerTest(unittest.TestCase):
                     "android.intent.category.HOME",
                 ),
             )
+
+    def test_drawer_variant_swipes_up_and_waits_for_settings_icon(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = self.runtime(Path(directory))
+            runtime._sandboxes["sandbox-1"] = Sandbox(
+                "sandbox-1", SandboxState.READY, datetime.now(timezone.utc)
+            )
+            runtime._adb = Mock(
+                side_effect=[
+                    b"",
+                    b"",
+                    b"",
+                    b"",
+                    b'<hierarchy><node text="Settings" /></hierarchy>',
+                    b"mResumedActivity: ActivityRecord{ com.android.launcher3/.Launcher }",
+                ]
+            )
+
+            runtime.initialize_task(
+                "sandbox-1", "android_launch_smoke_drawer", "android-settings-v1", "open settings"
+            )
+
+            self.assertEqual(
+                runtime._adb.call_args_list[2].args[1:],
+                ("shell", "input", "swipe", "360", "1180", "360", "300", "500"),
+            )
+            self.assertEqual(runtime._tasks["sandbox-1"].target_package, "com.android.settings")
 
     def test_task_reward_waits_for_foreground_transition(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -470,7 +548,42 @@ class FirecrackerTest(unittest.TestCase):
                     "-n",
                     "org.chromium.webview_shell/.WebViewBrowserActivity",
                     "-d",
-                    "http://192.168.100.1:18090/",
+                    "http://192.168.100.1:18090/shopping/",
+                ),
+            )
+
+    def test_sokoban_fixture_initializes_webview_and_waits_for_board(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = self.runtime(Path(directory))
+            runtime._sandboxes["sandbox-1"] = Sandbox(
+                "sandbox-1", SandboxState.READY, datetime.now(timezone.utc)
+            )
+            ui = b'<hierarchy><node text="Sokoban" /></hierarchy>'
+            runtime._adb = Mock(
+                side_effect=[
+                    b"",
+                    b"",
+                    b"",
+                    ui,
+                    b"mResumedActivity: ActivityRecord{ org.chromium.webview_shell/.WebViewBrowserActivity }",
+                ]
+            )
+
+            result = runtime.initialize_task(
+                "sandbox-1", "sokoban", "android-sokoban-v1", "solve the board"
+            )
+
+            self.assertEqual(result["task_kind"], "sokoban_fixture")
+            self.assertEqual(
+                runtime._adb.call_args_list[1].args[1:],
+                (
+                    "shell",
+                    "am",
+                    "start",
+                    "-n",
+                    "org.chromium.webview_shell/.WebViewBrowserActivity",
+                    "-d",
+                    "http://192.168.100.1:18090/sokoban/",
                 ),
             )
 

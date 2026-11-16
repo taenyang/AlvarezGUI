@@ -4,17 +4,45 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>登录 · AlvarezGUI 实验平台</title>
+<script>
+  (() => {
+    const saved = localStorage.getItem("alvarezgui-theme");
+    const theme = saved || (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+    document.documentElement.dataset.theme = theme;
+  })();
+</script>
 <link rel="stylesheet" href="/console/static/style.css">
 </head>
-<body>
-<div class="login card">
-  <h2>AlvarezGUI 实验平台</h2>
-  <form method="post" action="/console/login">
-    <label class="secondary" for="password">访问密码</label>
-    <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
-    <p id="error" class="error-text" role="alert" hidden></p>
-    <button class="primary" type="submit">登录</button>
-  </form>
+<body class="login-page">
+<div class="login-layout">
+  <section class="login-intro">
+    <a class="brand" href="/console/login" aria-label="AlvarezGUI 实验平台">
+      <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+      <span class="brand-copy"><strong>ALVAREZ<span>GUI</span></strong><small>EXPERIMENT CONTROL PLANE</small></span>
+    </a>
+    <div class="login-intro-copy">
+      <span class="eyebrow">CONTROL YOUR EXPERIMENTS</span>
+      <h1>让每一次实验<br><span>都可观察、可复现。</span></h1>
+      <p>统一管理模型训练、Android sandbox 与评测结果，让实验过程清晰可追踪。</p>
+    </div>
+    <div class="login-signal"><span class="live-dot"></span><span>Firecracker Android Runtime</span><span class="signal-line"></span><span class="muted">READY</span></div>
+  </section>
+  <section class="login card">
+    <div class="login-heading row">
+      <div><span class="eyebrow">WELCOME BACK</span><h2>进入实验平台</h2></div>
+      <button class="theme-toggle" type="button" data-theme-toggle>
+        <span class="theme-icon" data-theme-icon aria-hidden="true"></span><span data-theme-label></span>
+      </button>
+    </div>
+    <p class="login-copy">使用访问密码继续你的实验工作。</p>
+    <form method="post" action="/console/login">
+      <label for="password">访问密码</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" placeholder="输入访问密码" required autofocus>
+      <p id="error" class="error-text" role="alert" hidden></p>
+      <button class="primary login-submit" type="submit">登录控制台 <span aria-hidden="true">→</span></button>
+    </form>
+    <p class="login-note">你的会话将在一段时间无操作后自动失效。</p>
+  </section>
 </div>
 <script>
   const error = new URLSearchParams(location.search).get("error");
@@ -24,5 +52,6 @@
     node.hidden = false;
   }
 </script>
+<script src="/console/static/theme.js"></script>
 </body>
 </html>

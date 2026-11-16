@@ -4,19 +4,37 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AlvarezGUI 实验平台</title>
+<script>
+  (() => {
+    const saved = localStorage.getItem("alvarezgui-theme");
+    const theme = saved || (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+    document.documentElement.dataset.theme = theme;
+  })();
+</script>
 <link rel="stylesheet" href="/console/static/style.css">
 </head>
 <body>
-<header>
-  <h1>AlvarezGUI 实验平台</h1>
-  <nav>
-    <a href="#/resources" data-nav="resources">资源总览</a>
-    <a href="#/runs" data-nav="runs">训练实验</a>
-    <a href="#/evaluations" data-nav="evaluations">模型评测</a>
+<header class="topbar">
+  <a class="brand" href="#/resources" aria-label="返回资源总览">
+    <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+    <span class="brand-copy"><strong>ALVAREZ<span>GUI</span></strong><small>EXPERIMENT CONTROL PLANE</small></span>
+  </a>
+  <nav aria-label="主导航">
+    <a href="#/resources" data-nav="resources"><span class="nav-index">01</span>资源总览</a>
+    <a href="#/runs" data-nav="runs"><span class="nav-index">02</span>训练实验</a>
+    <a href="#/evaluations" data-nav="evaluations"><span class="nav-index">03</span>模型评测</a>
+    <a href="#/guide" data-nav="guide"><span class="nav-index">04</span>使用教程</a>
   </nav>
-  <form method="post" action="/console/logout"><button type="submit">退出</button></form>
+  <div class="header-actions">
+    <button class="theme-toggle" type="button" data-theme-toggle>
+      <span class="theme-icon" data-theme-icon aria-hidden="true"></span><span data-theme-label></span>
+    </button>
+    <div class="header-status"><span class="live-dot"></span> CONTROL PLANE ONLINE</div>
+    <form method="post" action="/console/logout"><button type="submit">退出</button></form>
+  </div>
 </header>
 <main id="view"></main>
-<script type="module" src="/console/static/app.js"></script>
+<script src="/console/static/theme.js"></script>
+<script type="module" src="/console/static/app.js?v=2"></script>
 </body>
 </html>

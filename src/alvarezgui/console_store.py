@@ -5,8 +5,9 @@ import json
 import statistics
 import uuid
 from pathlib import Path
-from typing import Any
-from urllib.parse import unquote, urlparse
+from typing import Any, Literal
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 import psycopg
 from psycopg.types.json import Json
@@ -17,12 +18,22 @@ from alvarezgui.registry import TaskSpec, VersionNotFoundError
 from alvarezgui.task_store import IdempotencyConflictError, TaskCreateRequest, TaskStore
 
 ACTIVE_STATUSES = ("QUEUED", "ALLOCATING", "RUNNING_ENV", "WAITING_MODEL")
+
+
+class StillActiveError(Exception):
+    """Deleting would race a sandbox or training agent that still owns the work."""
+
+
+class RuntimeBackendRetiredError(Exception):
+    """A historical runtime cannot be used to create new work."""
+
+
 EVAL_PRIORITY = 8
 ROLLOUT_PRIORITY = 5
 
 
 class NodeHeartbeat(BaseModel):
-    role: str = Field(pattern="^(microvm|gpu)$")
+    role: str = Field(pattern="^(microvm|docker|gpu)$")
     address: str = Field(default="", max_length=200)
     capacity: dict[str, Any] = Field(default_factory=dict)
     resources: dict[str, Any] = Field(default_factory=dict)
@@ -30,12 +41,14 @@ class NodeHeartbeat(BaseModel):
 
 
 class EvaluationRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100, pattern=r"(?s).*\S.*")
     model_versions: list[str] = Field(min_length=1, max_length=6)
     tasks: list[TaskSpec] = Field(min_length=1, max_length=8)
     trials_per_task: int = Field(default=1, ge=1, le=50)
     max_steps: int = Field(default=5, ge=1, le=50)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     seed: int = 0
+    runtime_backend: Literal["firecracker", "docker"] = "firecracker"
     run_id: str | None = None
 
 
@@ -107,9 +120,9 @@ def screenshot_path(image_uri: str | None, roots: list[Path]) -> Path | None:
     if not image_uri:
         return None
     parsed = urlparse(image_uri)
-    if parsed.scheme != "file":
+    if parsed.scheme != "file" or parsed.netloc:
         return None
-    path = Path(unquote(parsed.path)).resolve()
+    path = Path(url2pathname(parsed.path)).resolve()
     if not any(path.is_relative_to(root.resolve()) for root in roots):
         return None
     return path if path.is_file() else None
@@ -154,7 +167,10 @@ class ConsoleStore:
                                  < CURRENT_TIMESTAMP - 3 * n.heartbeat_interval_seconds * INTERVAL '1 second'
                             THEN 'UNREACHABLE' ELSE 'READY' END AS status,
                        (SELECT count(*) FROM sandbox_leases l
-                        WHERE l.node_id = n.node_id AND l.expires_at > CURRENT_TIMESTAMP) AS active_sandboxes
+                        JOIN tasks t ON t.task_id = l.task_id
+                        WHERE l.node_id = n.node_id
+                          AND t.runtime_backend IN ('firecracker', 'docker')
+                          AND l.expires_at > CURRENT_TIMESTAMP) AS active_sandboxes
                 FROM nodes AS n ORDER BY n.role DESC, n.node_id
                 """
             ).fetchall()
@@ -165,7 +181,7 @@ class ConsoleStore:
                 """
                 SELECT t.sandbox_id, t.task_id, t.status AS task_status, t.task_type,
                        t.policy_version, t.current_step, t.max_steps, t.run_id, t.eval_id,
-                       e.episode_id, l.node_id, l.lease_id,
+                       t.runtime_backend, e.episode_id, l.node_id, l.lease_id,
                        GREATEST(0, EXTRACT(EPOCH FROM l.expires_at - CURRENT_TIMESTAMP))::int
                            AS lease_remaining_seconds,
                        (SELECT max(s.step_id) FROM steps s WHERE s.episode_id = e.episode_id) AS latest_step
@@ -173,6 +189,7 @@ class ConsoleStore:
                 JOIN episodes AS e ON e.task_id = t.task_id
                 LEFT JOIN sandbox_leases AS l ON l.task_id = t.task_id
                 WHERE t.sandbox_id IS NOT NULL
+                  AND t.runtime_backend IN ('firecracker', 'docker')
                 ORDER BY t.started_at NULLS LAST
                 """
             ).fetchall()
@@ -193,6 +210,7 @@ class ConsoleStore:
                 SELECT e.episode_id, e.status, e.result, e.created_at, e.updated_at,
                        t.task_id, t.task_type, t.app_image, t.instruction, t.policy_version,
                        t.max_steps, t.current_step, t.temperature, t.seed, t.sandbox_id,
+                       t.runtime_backend, e.actual_runtime_backend,
                        t.run_id, t.round, t.group_id, t.eval_id, t.status AS task_status
                 FROM episodes AS e JOIN tasks AS t ON t.task_id = e.task_id
                 WHERE e.episode_id = %s
@@ -250,36 +268,76 @@ class ConsoleStore:
 
     def create_evaluation(self, request: EvaluationRequest, idempotency_key: str) -> tuple[dict[str, Any], bool]:
         values = request.model_dump(mode="json")
-        fingerprint = hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
+        fingerprint_values = dict(values)
+        fingerprint = hashlib.sha256(json.dumps(fingerprint_values, sort_keys=True).encode()).hexdigest()
+        accepted_fingerprints = {fingerprint}
+        if request.runtime_backend == "firecracker":
+            legacy_fingerprint_values = {
+                key: value for key, value in fingerprint_values.items() if key != "runtime_backend"
+            }
+            accepted_fingerprints.add(
+                hashlib.sha256(json.dumps(legacy_fingerprint_values, sort_keys=True).encode()).hexdigest()
+            )
+            if request.name is None:
+                accepted_fingerprints.add(
+                    hashlib.sha256(
+                        json.dumps(
+                            {key: value for key, value in legacy_fingerprint_values.items() if key != "name"},
+                            sort_keys=True,
+                        ).encode()
+                    ).hexdigest()
+                )
         eval_id = f"eval_{uuid.uuid4().hex}"
+        evaluation_name = request.name or f"评测 {eval_id}"
         seeds = [request.seed + index for index in range(request.trials_per_task)]
         with self.connection.transaction():
             existing = self.connection.execute(
-                "SELECT eval_id, request_fingerprint FROM evaluations WHERE idempotency_key = %s",
+                """
+                SELECT ev.eval_id, ev.name,
+                       (SELECT min(runtime_backend) FROM tasks WHERE eval_id = ev.eval_id) AS runtime_backend,
+                       ev.request_fingerprint
+                FROM evaluations AS ev WHERE ev.idempotency_key = %s
+                """,
                 (idempotency_key,),
             ).fetchone()
             if existing is not None:
-                if existing["request_fingerprint"] != fingerprint:
+                if existing["request_fingerprint"] not in accepted_fingerprints:
                     raise IdempotencyConflictError
-                return {"eval_id": existing["eval_id"]}, False
+                return {
+                    "eval_id": existing["eval_id"],
+                    "name": existing["name"],
+                    "runtime_backend": existing["runtime_backend"],
+                }, False
             known = {
                 row["version"]
                 for row in self.connection.execute(
-                    "SELECT version FROM model_versions WHERE version = ANY(%s) AND status != 'RETIRED'",
+                    "SELECT version FROM model_versions WHERE version = ANY(%s) AND status != 'RETIRED' FOR UPDATE",
                     (request.model_versions,),
                 ).fetchall()
             }
             missing = sorted(set(request.model_versions) - known)
             if missing:
                 raise VersionNotFoundError(f"model version not found: {', '.join(missing)}")
+            runtime_backend = request.runtime_backend
+            if request.run_id is not None:
+                run = self.connection.execute(
+                    "SELECT runtime_backend FROM training_runs WHERE run_id = %s",
+                    (request.run_id,),
+                ).fetchone()
+                if run is None:
+                    raise VersionNotFoundError(f"training run not found: {request.run_id}")
+                runtime_backend = run["runtime_backend"]
+                if runtime_backend == "fake":
+                    raise RuntimeBackendRetiredError("historical fake runtime is read-only")
             self.connection.execute(
                 """
-                INSERT INTO evaluations (eval_id, run_id, model_versions, task_set, trials_per_task,
+                INSERT INTO evaluations (eval_id, name, run_id, model_versions, task_set, trials_per_task,
                                          max_steps, temperature, seeds, idempotency_key, request_fingerprint)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     eval_id,
+                    evaluation_name,
                     request.run_id,
                     Json(request.model_versions),
                     Json(values["tasks"]),
@@ -305,38 +363,42 @@ class ConsoleStore:
                                 priority=EVAL_PRIORITY,
                                 temperature=request.temperature,
                                 seed=seed,
+                                runtime_backend=runtime_backend,
                             ),
                             f"{eval_id}:{model_version}:{task_index}:{seed}",
                             {"eval_id": eval_id},
                         )
-        return {"eval_id": eval_id}, True
+        return {"eval_id": eval_id, "name": evaluation_name, "runtime_backend": runtime_backend}, True
 
     def list_evaluations(self, limit: int = 50) -> list[dict[str, Any]]:
         with self.connection.transaction():
             rows = self.connection.execute(
                 """
-                SELECT ev.eval_id, ev.run_id, ev.model_versions, ev.task_set, ev.trials_per_task,
+                SELECT ev.eval_id, ev.name, ev.run_id, ev.model_versions, ev.task_set, ev.trials_per_task,
                        ev.temperature, ev.created_at,
+                       min(t.runtime_backend) AS runtime_backend,
                        count(t.task_id) AS trials,
                        count(t.task_id) FILTER (WHERE t.status IN ('QUEUED','ALLOCATING','RUNNING_ENV','WAITING_MODEL'))
                            AS active,
-                       count(t.task_id) FILTER (WHERE t.status = 'SUCCEEDED') AS successes
+                       count(t.task_id) FILTER (WHERE t.status = 'SUCCEEDED') AS successes,
+                       count(t.task_id) FILTER (WHERE t.status = 'CANCELED') AS canceled
                 FROM evaluations AS ev LEFT JOIN tasks AS t ON t.eval_id = ev.eval_id
                 GROUP BY ev.eval_id ORDER BY ev.created_at DESC LIMIT %s
                 """,
                 (limit,),
             ).fetchall()
         for row in rows:
-            row["status"] = "RUNNING" if row["active"] else "FINISHED"
+            row["status"] = _evaluation_status(row["active"], row["canceled"])
         return rows
 
     def get_evaluation(self, eval_id: str) -> dict[str, Any] | None:
         with self.connection.transaction():
             evaluation = self.connection.execute(
                 """
-                SELECT eval_id, run_id, model_versions, task_set, trials_per_task, max_steps,
-                       temperature, seeds, created_at
-                FROM evaluations WHERE eval_id = %s
+                SELECT ev.eval_id, ev.name, ev.run_id, ev.model_versions, ev.task_set, ev.trials_per_task, ev.max_steps,
+                       ev.temperature, ev.seeds, ev.created_at,
+                       (SELECT min(runtime_backend) FROM tasks WHERE eval_id = ev.eval_id) AS runtime_backend
+                FROM evaluations AS ev WHERE ev.eval_id = %s
                 """,
                 (eval_id,),
             ).fetchone()
@@ -355,22 +417,84 @@ class ConsoleStore:
                 per_task.append({"task_type": spec["task_type"], "app_image": spec["app_image"],
                                  **summarize_trials(task_trials)})
             summary.append({"model_version": model_version, **summarize_trials(model_trials), "tasks": per_task})
-        evaluation["status"] = (
-            "RUNNING" if any(t["outcome"] in {"queued", "running"} for t in trials) else "FINISHED"
+        evaluation["status"] = _evaluation_status(
+            sum(t["outcome"] in {"queued", "running"} for t in trials),
+            sum(t["outcome"] == "canceled" for t in trials),
         )
         evaluation["summary"] = summary
         evaluation["trials"] = trials
         return evaluation
+
+    def evaluation_task_ids(self, eval_id: str) -> list[str] | None:
+        """Active trial ids, or None if the evaluation does not exist."""
+        with self.connection.transaction():
+            if self.connection.execute("SELECT 1 FROM evaluations WHERE eval_id = %s", (eval_id,)).fetchone() is None:
+                return None
+            return [
+                row["task_id"]
+                for row in self.connection.execute(
+                    "SELECT task_id FROM tasks WHERE eval_id = %s AND status = ANY(%s)",
+                    (eval_id, list(ACTIVE_STATUSES)),
+                ).fetchall()
+            ]
+
+    def delete_evaluation(self, eval_id: str) -> bool:
+        with self.connection.transaction():
+            if self.connection.execute(
+                "SELECT 1 FROM evaluations WHERE eval_id = %s FOR UPDATE", (eval_id,)
+            ).fetchone() is None:
+                return False
+            self._delete_tasks("eval_id", eval_id)
+            self.connection.execute("DELETE FROM evaluations WHERE eval_id = %s", (eval_id,))
+            return True
+
+    def delete_training_run(self, run_id: str) -> bool:
+        """Delete a finished run with its rollouts and metrics; registered checkpoints and evaluations stay."""
+        with self.connection.transaction():
+            run = self.connection.execute(
+                "SELECT status FROM training_runs WHERE run_id = %s FOR UPDATE", (run_id,)
+            ).fetchone()
+            if run is None:
+                return False
+            if run["status"] in {"QUEUED", "RUNNING"}:
+                raise StillActiveError("cancel the training run before deleting it")
+            self._delete_tasks("run_id", run_id)
+            self.connection.execute("DELETE FROM training_runs WHERE run_id = %s", (run_id,))
+            return True
+
+    def _delete_tasks(self, column: str, value: str) -> None:
+        # Episodes, steps and leases cascade; refuse while a consumer may still be writing to a sandbox.
+        busy = self.connection.execute(
+            f"""
+            SELECT 1 FROM tasks
+            WHERE {column} = %s AND (status = ANY(%s) OR sandbox_id IS NOT NULL)
+            LIMIT 1 FOR UPDATE
+            """,
+            (value, list(ACTIVE_STATUSES)),
+        ).fetchone()
+        if busy is not None:
+            raise StillActiveError("trials are still running or their sandbox is being cleaned up")
+        self.connection.execute(f"DELETE FROM tasks WHERE {column} = %s", (value,))
 
     # --- training rollouts ---------------------------------------------------
 
     def create_rollouts(self, run_id: str, request: RolloutRequest) -> list[dict[str, Any]]:
         created = []
         with self.connection.transaction():
-            if self.connection.execute(
-                "SELECT 1 FROM model_versions WHERE version = %s", (request.policy_version,)
-            ).fetchone() is None:
+            policy = self.connection.execute(
+                "SELECT status FROM model_versions WHERE version = %s FOR UPDATE", (request.policy_version,)
+            ).fetchone()
+            if policy is None or policy["status"] == "RETIRED":
                 raise VersionNotFoundError(f"model version not found: {request.policy_version}")
+            run = self.connection.execute(
+                "SELECT runtime_backend FROM training_runs WHERE run_id = %s",
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                raise VersionNotFoundError(f"training run not found: {run_id}")
+            runtime_backend = run["runtime_backend"]
+            if runtime_backend == "fake":
+                raise RuntimeBackendRetiredError("historical fake runtime is read-only")
             tasks = TaskStore(self.connection)
             for group in request.groups:
                 spec = group.task
@@ -385,6 +509,7 @@ class ConsoleStore:
                             priority=ROLLOUT_PRIORITY,
                             temperature=request.temperature,
                             seed=request.seed + index,
+                            runtime_backend=runtime_backend,
                         ),
                         f"{run_id}:round-{request.round}:{group.group_id}:{index}",
                         {"run_id": run_id, "round": request.round, "group_id": group.group_id},
@@ -410,8 +535,8 @@ class ConsoleStore:
         rows = self.connection.execute(
             f"""
             SELECT t.task_id, t.policy_version, t.task_type, t.app_image, t.instruction, t.seed, t.status,
-                   t.current_step, t.round, t.group_id, t.created_at, t.updated_at,
-                   e.episode_id, e.result
+                   t.current_step, t.round, t.group_id, t.runtime_backend,
+                   e.episode_id, e.actual_runtime_backend, e.result
             FROM tasks AS t JOIN episodes AS e ON e.task_id = t.task_id
             WHERE {where}
             ORDER BY t.round NULLS FIRST, t.group_id NULLS FIRST, t.policy_version, t.task_type, t.seed, t.created_at
@@ -436,6 +561,8 @@ class ConsoleStore:
             trial = {
                 **row,
                 "outcome": trial_outcome(row["status"], result),
+                "requested_runtime_backend": row["runtime_backend"],
+                "actual_runtime_backend": row["actual_runtime_backend"],
                 "error": result.get("error"),
                 "reward_total": float(final_reward.get("total", 0.0)),
                 "steps": len(steps),
@@ -450,6 +577,12 @@ class ConsoleStore:
                 trial["step_records"] = steps
             trials.append(trial)
         return trials
+
+
+def _evaluation_status(active: int, canceled: int) -> str:
+    if active:
+        return "RUNNING"
+    return "CANCELED" if canceled else "FINISHED"
 
 
 def _public_observation(observation: dict[str, Any] | None) -> dict[str, Any] | None:

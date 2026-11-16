@@ -7,6 +7,7 @@ from alvarezgui.config import Settings
 from testdb import test_settings
 from alvarezgui.db import connect
 from alvarezgui.app import create_app
+from alvarezgui.task_store import TaskCreateRequest, TaskStore
 
 
 async def _asgi_request(app: Any, method: str, path: str, body: dict | None = None, headers: dict[str, str] | None = None) -> tuple[int, dict]:
@@ -83,6 +84,41 @@ class TasksApiTest(unittest.TestCase):
         with connect(self.settings) as connection:
             self.assertEqual(connection.execute("SELECT count(*) AS count FROM tasks").fetchone()["count"], 1)
             self.assertEqual(connection.execute("SELECT count(*) AS count FROM episodes").fetchone()["count"], 1)
+
+    def test_fake_runtime_request_is_rejected(self) -> None:
+        status, body = self.create("fake-runtime", runtime_backend="fake")
+        self.assertEqual(status, 422)
+        self.assertIn("runtime_backend", json.dumps(body))
+
+    def test_legacy_fingerprint_replays_after_runtime_field_addition(self) -> None:
+        first_status, first = self.create("legacy-key")
+        values = TaskCreateRequest(
+            task_type="shopping",
+            instruction="在测试商城中购买指定商品",
+            app_image="android-shop-v1",
+            policy_version="minicpm-sft-v1",
+            max_steps=100,
+            priority=5,
+        ).model_dump(mode="json")
+        values.pop("runtime_backend")
+        with connect(self.settings) as connection:
+            connection.execute(
+                "UPDATE tasks SET request_fingerprint = %s WHERE task_id = %s",
+                (TaskStore._fingerprint(values), first["task_id"]),
+            )
+        replay_status, replay = self.create("legacy-key")
+        self.assertEqual((first_status, replay_status), (201, 200))
+        self.assertEqual(replay["task_id"], first["task_id"])
+        self.assertEqual(self.create("legacy-key", runtime_backend="docker")[0], 409)
+
+    def test_docker_task_persistence_and_backend_conflict(self) -> None:
+        status, created = self.create("docker-key", runtime_backend="docker")
+        self.assertEqual(status, 201)
+        self.assertEqual(self.create("docker-key", runtime_backend="docker")[0], 200)
+        self.assertEqual(self.create("docker-key", runtime_backend="firecracker")[0], 409)
+        _, task = request(self.app, "GET", f"/api/v1/tasks/{created['task_id']}")
+        self.assertEqual(task["runtime_backend"], "docker")
+        request(self.app, "POST", f"/api/v1/tasks/{created['task_id']}/cancel", {"reason": "test_cleanup"})
 
     def test_idempotent_replay_and_conflict(self) -> None:
         first_status, first = self.create("same-key")

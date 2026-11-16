@@ -15,6 +15,8 @@ class AndroidTask:
     task_kind: str
     target_package: str
     target_text: str | None = None
+    # Start from the launcher's app list instead of the home screen.
+    open_app_drawer: bool = False
 
     def succeeded(
         self, foreground_package: str | None, ui_text: set[str] | None = None
@@ -56,11 +58,23 @@ def resolve_android_task(task_type: str, app_image: str) -> AndroidTask:
             task_kind="builtin_app_launch_smoke",
             target_package="com.android.settings",
         )
+    if task_type == "android_launch_smoke_drawer" and app_image == "android-settings-v1":
+        return AndroidTask(
+            task_kind="builtin_app_launch_from_drawer",
+            target_package="com.android.settings",
+            open_app_drawer=True,
+        )
     if task_type == "shopping" and app_image in {"android-shop-v1", "builtin:test-shop"}:
         return AndroidTask(
             task_kind="shopping_fixture",
             target_package="org.chromium.webview_shell",
             target_text="Order complete",
+        )
+    if task_type == "sokoban" and app_image == "android-sokoban-v1":
+        return AndroidTask(
+            task_kind="sokoban_fixture",
+            target_package="org.chromium.webview_shell",
+            target_text="Sokoban complete",
         )
     raise UnsupportedAndroidTask(
         f"no offline Android task oracle for task_type={task_type!r}, "
@@ -74,6 +88,17 @@ SHOPPING_INSTRUCTION = (
     "not normalized 0..1000 or cropped-WebView coordinates."
 )
 
+SOKOBAN_INSTRUCTION = (
+    "Solve the Sokoban board by moving the player onto the goal after pushing the box there. "
+    "Use only the four direction buttons at the bottom of the 720x1280 screenshot. "
+    "Tap these full-screen button centers exactly: Up (360,1016), Left (176,1160), "
+    "Down (360,1160), Right (544,1160). "
+    "Never swipe, type, press Back, tap the board, tap the status bar, or tap Android navigation. "
+    "Finish only after Sokoban complete is visible.\n"
+    "The board starts with the player below and to the right of the box. "
+    "The shortest solution is Left (176,1160), Left (176,1160), Up (360,1016)."
+)
+
 # Tasks the console offers; each entry must resolve through resolve_android_task.
 TASK_CATALOG: tuple[dict[str, str], ...] = (
     {
@@ -83,13 +108,35 @@ TASK_CATALOG: tuple[dict[str, str], ...] = (
         "instruction": SHOPPING_INSTRUCTION,
     },
     {
-        "task_type": "android_launch_smoke",
+        "task_type": "sokoban",
+        "app_image": "android-sokoban-v1",
+        "label": "推箱子小游戏",
+        "instruction": SOKOBAN_INSTRUCTION,
+    },
+    {
+        "task_type": "android_launch_smoke_drawer",
         "app_image": "android-settings-v1",
-        "label": "打开系统设置",
-        "instruction": "Open the Android Settings app.\n"
+        "label": "从应用列表打开设置",
+        "instruction": "Open the Android Settings app. The app list is already open: tap the Settings icon.\n"
         "Screenshot is 720x1280; tap/swipe coordinates are absolute screenshot pixels.",
     },
 )
+
+
+def sokoban_action_allowed(action: dict[str, Any]) -> bool:
+    """Keep model actions inside the fixture controls and away from Android chrome."""
+    action_type = action["type"]
+    if action_type in {"wait", "terminate"}:
+        return True
+    if action_type != "tap":
+        return False
+    x, y = action["x"], action["y"]
+    return (
+        (276 <= x <= 443 and 952 <= y <= 1080)
+        or (92 <= x <= 259 and 1097 <= y <= 1183)
+        or (276 <= x <= 443 and 1097 <= y <= 1183)
+        or (460 <= x <= 627 and 1097 <= y <= 1183)
+    )
 
 
 def default_instruction(task_type: str, app_image: str) -> str:

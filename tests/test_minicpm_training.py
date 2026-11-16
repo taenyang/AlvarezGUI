@@ -54,14 +54,15 @@ class MiniCPMTrainingTest(unittest.TestCase):
             rows[1]["id"] = "episode-1/step-1"
         self.assertEqual(group_advantages(rows), [-1.0, 1.0])
 
-    def test_grpo_rejects_incomplete_group_before_loading_model(self) -> None:
+    def test_policy_algorithms_reject_incomplete_group_before_loading_model(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / "screen.png"
             image.write_bytes(b"png")
-            row = self._row(image)
-            row["old_logprob"] = -1.0
-            with self.assertRaises(DatasetValidationError):
-                train("grpo", "missing-model", [row], Path(directory) / "checkpoint")
+            for algorithm in ("grpo", "gigpo"):
+                row = self._row(image)
+                row["old_logprob"] = -1.0
+                with self.assertRaises(DatasetValidationError):
+                    train(algorithm, "missing-model", [row], Path(directory) / algorithm)
 
 
 if __name__ == "__main__":

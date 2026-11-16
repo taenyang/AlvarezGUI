@@ -1,0 +1,5 @@
+on init
+    # Redroid's software gralloc rejects the shader warm-up output buffer.
+    setprop service.sf.prime_shader_cache 0
+    # TCG is orders of magnitude slower than hardware virtualization.
+    setprop ro.hw_timeout_multiplier 10
