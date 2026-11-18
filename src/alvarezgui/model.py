@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
@@ -17,7 +17,7 @@ class InferenceRequest(BaseModel):
     ui_tree_uri: str | None = None
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     seed: int | None = None
-    max_tokens: int = Field(default=128, ge=1, le=4_096)
+    max_tokens: int | None = Field(default=None, ge=1, le=4_096)
     timeout_ms: int = Field(default=30_000, ge=1, le=300_000)
 
 
@@ -27,6 +27,7 @@ class InferenceResponse(BaseModel):
     raw_output: str
     model_version: str
     latency_ms: int = Field(ge=0)
+    output_format: Literal["action-v1", "sokoban-plan-v1"] = "action-v1"
 
 
 class ModelError(Exception):
@@ -46,7 +47,11 @@ class InferenceTimeoutError(ModelError):
 
 
 class InvalidActionOutputError(ModelError):
-    pass
+    def __init__(self, message: str, *, raw_output: str | None = None,
+                 output_format: str | None = None) -> None:
+        super().__init__(message)
+        self.raw_output = raw_output
+        self.output_format = output_format
 
 
 class ModelService(Protocol):

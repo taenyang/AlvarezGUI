@@ -5,6 +5,10 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
+MODEL_SCREEN_WIDTH = 720
+MODEL_SCREEN_HEIGHT = 1280
+
+
 class Action(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -66,6 +70,30 @@ def validate_action(value: Any) -> dict[str, Any]:
         return model.model_validate(value).model_dump(mode="json")
     except ValidationError as exc:
         raise ValueError(f"invalid {action_type} action: {exc.errors()[0]['msg']}") from exc
+
+
+def scale_action_to_screen(
+    action: dict[str, Any], width: int, height: int
+) -> dict[str, Any]:
+    if width <= 0 or height <= 0:
+        raise ValueError("screen dimensions must be positive")
+    scaled = dict(action)
+    x_scale = width / MODEL_SCREEN_WIDTH
+    y_scale = height / MODEL_SCREEN_HEIGHT
+    coordinates = {
+        key: action[key]
+        for key in ("x", "y", "x1", "y1", "x2", "y2")
+        if key in action
+    }
+    for key, value in coordinates.items():
+        limit = MODEL_SCREEN_WIDTH if key.startswith("x") else MODEL_SCREEN_HEIGHT
+        if value >= limit:
+            raise ValueError(f"{key} is outside the model screen")
+    for key, value in coordinates.items():
+        scale = x_scale if key.startswith("x") else y_scale
+        limit = width if key.startswith("x") else height
+        scaled[key] = min(limit - 1, round(value * scale))
+    return scaled
 
 
 def is_terminal(action: dict[str, Any]) -> bool:

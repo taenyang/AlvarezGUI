@@ -293,11 +293,11 @@ class FirecrackerTest(unittest.TestCase):
             )
             self.assertEqual(calls[4][2]["host_dev_name"], runtime._tap_name("sandbox-1"))
             self.assertEqual(
-                [call.args[0][1] for call in run.call_args_list[:4]],
-                ["tuntap", "addr", "link", "route"],
+                [call.args[0][1] for call in run.call_args_list[:5]],
+                ["disconnect", "tuntap", "addr", "link", "route"],
             )
             self.assertEqual(
-                run.call_args_list[3].args[0][1:],
+                run.call_args_list[4].args[0][1:],
                 ["route", "replace", "192.168.100.2/32", "dev", runtime._tap_name("sandbox-1")],
             )
             self.assertEqual(
@@ -310,8 +310,13 @@ class FirecrackerTest(unittest.TestCase):
             runtime = self.runtime(Path(directory), network_enabled=True)
             runtime._run_ip = Mock()
 
-            runtime._setup_network("sandbox-1")
-            runtime._setup_network("sandbox-2")
+            with patch("alvarezgui.node_agent.firecracker.subprocess.run") as run:
+                runtime._setup_network("sandbox-1")
+                runtime._setup_network("sandbox-2")
+            self.assertEqual([call.args[0][1:] for call in run.call_args_list], [
+                ["disconnect", "192.168.100.2:5555"],
+                ["disconnect", "192.168.100.6:5555"],
+            ])
 
             first = runtime._network_endpoint("sandbox-1")
             second = runtime._network_endpoint("sandbox-2")
@@ -336,7 +341,7 @@ class FirecrackerTest(unittest.TestCase):
             failure = subprocess.CalledProcessError(1, ["ip"])
             with patch(
                 "alvarezgui.node_agent.firecracker.subprocess.run",
-                side_effect=[completed, failure, completed],
+                side_effect=[completed, completed, failure, completed],
             ):
                 with self.assertRaises(RuntimeOperationError):
                     runtime.create("sandbox-1")
@@ -558,7 +563,7 @@ class FirecrackerTest(unittest.TestCase):
             runtime._sandboxes["sandbox-1"] = Sandbox(
                 "sandbox-1", SandboxState.READY, datetime.now(timezone.utc)
             )
-            ui = b'<hierarchy><node text="Sokoban" /></hierarchy>'
+            ui = b'<hierarchy><node text="Sokoban" /><node text="Push the box onto the goal." /></hierarchy>'
             runtime._adb = Mock(
                 side_effect=[
                     b"",

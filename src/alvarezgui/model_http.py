@@ -41,15 +41,22 @@ class HttpModelService(ModelService):
             if exc.code >= 500:
                 raise ModelUnavailableError(request.model_version) from exc
             detail = exc.read().decode("utf-8", errors="replace").strip()
+            raw_output = output_format = None
             if detail:
                 try:
                     body = json.loads(detail)
                     if isinstance(body, dict):
                         detail = str(body.get("detail", detail))
+                        raw_output = body.get("raw_output")
+                        output_format = body.get("output_format")
                 except json.JSONDecodeError:
                     pass
             suffix = f": {detail[:300]}" if detail else ""
-            raise InvalidActionOutputError(f"model service returned HTTP {exc.code}{suffix}") from exc
+            raise InvalidActionOutputError(
+                f"model service returned HTTP {exc.code}{suffix}",
+                raw_output=raw_output[:16000] if isinstance(raw_output, str) else None,
+                output_format=output_format if isinstance(output_format, str) else None,
+            ) from exc
         except TimeoutError as exc:
             raise InferenceTimeoutError(request.request_id) from exc
         except (OSError, URLError, json.JSONDecodeError) as exc:

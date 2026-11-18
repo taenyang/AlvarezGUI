@@ -456,6 +456,7 @@ class Consumer:
                 "raw_output": response.raw_output,
                 "model_version": response.model_version,
                 "latency_ms": response.latency_ms,
+                "output_format": response.output_format,
             }
             action = validate_action(response.action)
             if not self._store_call("heartbeat_lease", lease_id, sandbox_id, self.lease_ttl):

@@ -448,6 +448,8 @@ function runForm(catalog) {
       h("option", { value: "grpo" }, "GRPO（在线 rollout）"),
       h("option", { value: "gigpo" }, "GIGPO（GRPO 兼容版）"),
       h("option", { value: "sft" }, "SFT（离线数据集）")),
+    finetuning_method: h("select", {}, h("option", { value: "full" }, "全参数"), h("option", { value: "lora" }, "LoRA（仅 SFT，FP32 adapter）")),
+    output_format: h("select", {}, h("option", { value: "action-v1" }, "动作 JSON"), h("option", { value: "sokoban-plan-v1" }, "推箱子：棋盘 / 决策 / 动作")),
     runtime_backend: h("select", {}, runtimeBackends.map((backend) => h(
       "option", { value: backend, selected: backend === defaultBackend }, runtimeLabel(backend)))),
     base_model: h("select", {}, models.map((m) => h("option", { value: m.version }, m.version))),
@@ -482,6 +484,7 @@ function runForm(catalog) {
       runtime_backend: backend,
       config: {
         model_name: inputs.model_name.value.trim() || null,
+        finetuning_method: inputs.finetuning_method.value, output_format: inputs.output_format.value,
         rounds: num("rounds"), group_size: num("group_size"), temperature: num("temperature"), max_steps: num("max_steps"),
         learning_rate: num("learning_rate"), epochs: num("epochs"), gradient_accumulation: num("gradient_accumulation"),
         clip_epsilon: num("clip_epsilon"), eval_trials: num("eval_trials"), seed: num("seed"), tasks,
@@ -500,6 +503,8 @@ function runForm(catalog) {
   field("基础模型 / checkpoint", inputs.base_model, models.length ? "可以选择已有 checkpoint 继续训练" : "尚未注册模型，请先运行 import_artifacts"),
   field("模型产物名称", inputs.model_name, "可选；只允许字母、数字、点、下划线和短横线，round 会自动追加版本后缀"),
   field("数据集", inputs.dataset_version, "SFT 必选；GRPO / GIGPO 不选时在线采样"),
+  field("微调方式", inputs.finetuning_method, "LoRA 仅支持 SFT；rank=16 / alpha=32，语言侧注意力层"),
+  field("输出协议", inputs.output_format, "必须与数据集一致；结构化协议仅支持 SFT，执行器仍只执行 action"),
   field("训练任务", taskSelect, "GRPO / GIGPO 在线采样与训练后自动评测；单选"),
   field("轮数", inputs.rounds), field("每组 rollout 数 (group size)", inputs.group_size),
   field("采样 temperature", inputs.temperature, "组内需要 reward 差异，建议 ≥ 0.7"), field("每条 rollout 最大步数", inputs.max_steps),
@@ -707,6 +712,17 @@ async function evaluationDetailPage(evalId) {
 
 // ---------------------------------------------------------------- episodes
 
+function modelOutput(raw) {
+  if (!raw) return "（固定策略）";
+  try {
+    const output = JSON.parse(raw);
+    if (output.board && output.action) return h("details", {},
+      h("summary", {}, "查看棋盘、决策和动作预测"),
+      h("pre", { style: "white-space:pre-wrap" }, JSON.stringify(output, null, 2)));
+  } catch (_) { /* Keep malformed model output visible. */ }
+  return raw;
+}
+
 async function episodeView(episodeId) {
   const ep = await api(`/api/v1/episodes/${episodeId}`);
   const base = `/api/v1/episodes/${encodeURIComponent(episodeId)}`;
@@ -728,7 +744,7 @@ async function episodeView(episodeId) {
         h("dl", { class: "kv" },
           h("dt", {}, "步骤"), h("dd", {}, String(s.step_id)),
           h("dt", {}, "动作"), h("dd", {}, describeAction(s.action)),
-          h("dt", {}, "模型输出"), h("dd", { class: "mono" }, s.model_output?.raw_output ?? "（固定策略）"),
+          h("dt", {}, "模型输出"), h("dd", { class: "mono" }, modelOutput(s.model_output?.raw_output)),
           h("dt", {}, "延迟"), h("dd", {}, fmt.ms(s.model_output?.latency_ms)),
           h("dt", {}, "reward"), h("dd", {}, `${fmt.num(s.reward.total)}${s.reward.success ? " · 成功" : ""}${s.done ? " · 结束" : ""}`),
           h("dt", {}, "前台应用"), h("dd", {}, s.reward.foreground_package || s.observation?.foreground_package || "–")))),

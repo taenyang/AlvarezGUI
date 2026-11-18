@@ -933,6 +933,54 @@ class ConsolePureTest(unittest.TestCase):
             self.assertEqual(result["metrics"]["algorithm"], "gigpo")
             self.assertEqual(result["metrics"]["implementation"], "grpo-compatible-clipped-policy")
 
+    def test_sft_automatic_evaluation_preserves_runtime_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "data.jsonl"
+            dataset.write_text("{}\n")
+            for backend in ("docker", "firecracker", None):
+                with self.subTest(backend=backend):
+                    cp = MagicMock()
+                    cp.call.return_value = {"eval_id": "eval-test"}
+                    agent = TrainingAgent(cp, node_id="gpu-test", checkpoint_root=root,
+                                          work_root=root, model_service_url=None)
+                    run = {
+                        "run_id": "run-sft", "algorithm": "sft", "base_model": "base-v1",
+                        "base_model_checkpoint_uri": root.as_uri(), "dataset_source": dataset.as_uri(),
+                        "config": {"eval_trials": 2, "max_steps": 10, "tasks": [
+                            {"task_type": "sokoban", "app_image": "android-sokoban-v1:validation-007"},
+                        ]},
+                    }
+                    if backend is not None:
+                        run["runtime_backend"] = backend
+                    with patch("alvarezgui.minicpm_training.load_dataset", return_value=[]), patch.object(
+                        agent, "train", return_value={"update_count": 84, "step_count": 333}
+                    ), patch.object(agent, "register", return_value="sft-final"), patch.object(
+                        agent, "unload_serving"
+                    ), patch.object(agent, "release_training_memory"):
+                        agent.execute(run)
+                    evaluation = next(call for call in cp.call.call_args_list if call.args[1] == "/api/v1/evaluations")
+                    self.assertEqual(evaluation.args[2]["runtime_backend"], backend or "firecracker")
+                    self.assertEqual(evaluation.args[2]["model_versions"], ["base-v1", "sft-final"])
+                    self.assertEqual(evaluation.args[2]["tasks"], run["config"]["tasks"])
+
+    def test_online_training_offsets_callbacks_by_sample_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = TrainingAgent(MagicMock(), node_id="gpu-test", checkpoint_root=root,
+                                  work_root=root, model_service_url=None)
+            run = {"run_id": "run-grpo", "algorithm": "grpo", "base_model": "base-v1",
+                   "config": {"rounds": 3}}
+            with patch.object(agent, "collect", return_value=[]), patch.object(
+                agent, "rows", return_value=[{"id": "row"}]
+            ), patch.object(agent, "unload_serving"), patch.object(agent, "release_training_memory"), patch.object(
+                agent, "register", side_effect=["r0", "r1", "r2"]
+            ), patch.object(agent, "train", return_value={"update_count": 4, "step_count": 10}) as train:
+                version, _, metrics = agent.online_grpo(run, str(root), root)
+            self.assertEqual([call.args[-1] for call in train.call_args_list], [0, 10, 20])
+            self.assertEqual(version, "r2")
+            self.assertEqual((metrics["update_count"], metrics["step_count"]), (4, 10))
+
     def test_named_training_artifact_version(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
@@ -980,6 +1028,29 @@ class ConsolePureTest(unittest.TestCase):
             self.assertIsNone(screenshot_path(f"file://{root}/../secret.png", [root]))
             self.assertIsNone(screenshot_path((root / "link.png").as_uri(), [root]))
             self.assertIsNone(screenshot_path("http://example.com/a.png", [root]))
+
+    def test_lora_configuration_and_agent_forwarding(self) -> None:
+        config = TrainingConfig(finetuning_method="lora", output_format="sokoban-plan-v1", seed=42)
+        request = dict(algorithm="sft", base_model="base", dataset_version="data",
+                       environment_version="env", reward_version="reward", config=config)
+        self.assertEqual(TrainingRunRequest(**request).config.output_format, "sokoban-plan-v1")
+        for algorithm in ("grpo", "gigpo"):
+            with self.assertRaises(ValidationError):
+                TrainingRunRequest(**{**request, "algorithm": algorithm})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = TrainingAgent(MagicMock(), node_id="test", checkpoint_root=root,
+                                  work_root=root, model_service_url=None)
+            with patch("alvarezgui.minicpm_training.train", return_value={}) as train:
+                agent.train({"run_id": "r", "algorithm": "sft", "config": config.model_dump()},
+                            str(root), [], root, 0)
+            self.assertEqual(train.call_args.kwargs["finetuning_method"], "lora")
+            self.assertEqual(train.call_args.kwargs["output_format"], "sokoban-plan-v1")
+            self.assertEqual(train.call_args.kwargs["seed"], 42)
+            (root / "adapter_config.json").write_text("{}")
+            self.assertEqual(agent.register({"run_id": "r", "base_model": "base"}, root, {}, "final"), "r-final")
+            with self.assertRaisesRegex(ValueError, "currently require SFT"):
+                agent.execute({"run_id": "r", "algorithm": "grpo", "base_model_checkpoint_uri": root.as_uri(), "config": {}})
 
     def test_training_config_whitelist(self) -> None:
         with self.assertRaises(ValidationError):

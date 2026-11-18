@@ -3,38 +3,52 @@
 <title>Sokoban</title>
 <style>
   :root { color-scheme: light; }
-  body { font: 18px sans-serif; margin: 18px; text-align: center; background: #f5f5f5; color: #18212b; }
-  h1 { margin: 8px 0; font-size: 30px; }
-  #board { display: inline-block; padding: 12px; margin: 8px 0; background: #d9e2ec; border-radius: 8px; font: 36px/1.1 monospace; letter-spacing: 2px; white-space: pre; }
+  body { font: 18px sans-serif; margin: 12px; text-align: center; background: #f5f5f5; color: #18212b; }
+  h1 { margin: 4px 0; font-size: 26px; }
+  #board { display: inline-block; padding: 8px; margin: 4px 0; background: #d9e2ec; border-radius: 8px; font: 22px/1.1 monospace; letter-spacing: 2px; white-space: pre; }
   #status { min-height: 28px; margin: 6px; font-weight: bold; }
-  #controls { display: grid; grid-template-columns: repeat(3, 84px); gap: 8px; justify-content: center; }
+  #legend { margin: 6px; font-size: 14px; }
+  #controls { position: fixed; left: 50%; bottom: 70px; transform: translateX(-50%); display: grid; grid-template-columns: repeat(3, 84px); gap: 8px; justify-content: center; }
   button { font-size: 24px; min-height: 64px; touch-action: manipulation; }
-  #reset { margin-top: 12px; font-size: 18px; min-height: 48px; }
+  #reset { display: none; }
   .complete { color: #176b2c; }
 </style>
 <h1>Sokoban</h1>
 <pre id="board" aria-label="Sokoban board"></pre>
-<p id="status">Push the box onto the goal.</p>
+<p id="status">Loading…</p>
+<p id="legend">@ player · $ box · . goal · * box+goal · + player+goal · # wall</p>
 <div id="controls">
   <span></span><button aria-label="Up" onclick="move(-1, 0)">▲</button><span></span>
   <button aria-label="Left" onclick="move(0, -1)">◀</button><button aria-label="Down" onclick="move(1, 0)">▼</button><button aria-label="Right" onclick="move(0, 1)">▶</button>
 </div>
 <button id="reset" onclick="reset()">Reset</button>
 <script>
-const level = [
+let level = [
   "########",
   "# .    #",
   "# $    #",
-  "#      #",
+  "#   @  #",
   "#      #",
   "########",
 ];
 const board = document.getElementById("board");
 const status = document.getElementById("status");
-let player, box, complete;
-function reset() { player = { row: 3, col: 4 }; box = { row: 2, col: 2 }; complete = false; status.className = ""; status.textContent = "Push the box onto the goal."; render(); }
+let player, box, goal, complete;
+function reset() {
+  player = box = goal = null;
+  level.forEach((line, row) => [...line].forEach((cell, col) => {
+    if ("@+".includes(cell)) player = { row, col };
+    if ("$*".includes(cell)) box = { row, col };
+    if (".*+".includes(cell)) goal = { row, col };
+  }));
+  if (!player || !box || !goal) throw new Error("Invalid Sokoban level");
+  complete = false;
+  status.className = "";
+  status.textContent = "Push the box onto the goal.";
+  render();
+}
 function move(rowDelta, colDelta) {
-  if (complete) return;
+  if (!player || complete) return;
   const next = { row: player.row + rowDelta, col: player.col + colDelta };
   if (level[next.row][next.col] === "#") return;
   if (next.row === box.row && next.col === box.col) {
@@ -43,7 +57,7 @@ function move(rowDelta, colDelta) {
     box = boxNext;
   }
   player = next;
-  if (box.row === 1 && box.col === 2) {
+  if (box.row === goal.row && box.col === goal.col) {
     complete = true;
     status.className = "complete";
     status.textContent = "Sokoban complete";
@@ -52,14 +66,28 @@ function move(rowDelta, colDelta) {
 }
 function render() {
   board.textContent = level.map((line, row) => [...line].map((cell, col) => {
-    if (row === box.row && col === box.col) return row === 1 && col === 2 ? "*" : "$";
-    if (row === player.row && col === player.col) return "@";
-    return row === 1 && col === 2 ? "." : cell;
+    const onGoal = row === goal.row && col === goal.col;
+    if (row === box.row && col === box.col) return onGoal ? "*" : "$";
+    if (row === player.row && col === player.col) return onGoal ? "+" : "@";
+    return cell === "#" ? "#" : onGoal ? "." : " ";
   }).join("")).join("\n");
+  board.setAttribute("aria-label", "Sokoban board: " + board.textContent.replace(/ /g, "_").replace(/\n/g, "|"));
 }
 document.addEventListener("keydown", (event) => {
   const moves = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1] };
   if (moves[event.key]) { event.preventDefault(); move(...moves[event.key]); }
 });
-reset();
+async function loadLevel() {
+  const id = new URLSearchParams(location.search).get("level");
+  if (id) {
+    const response = await fetch("levels.json");
+    if (!response.ok) throw new Error("Could not load Sokoban levels");
+    const catalog = await response.json();
+    const selected = catalog.levels.find((entry) => entry.id === id);
+    if (!selected) throw new Error("Unknown Sokoban level");
+    level = selected.board;
+  }
+  reset();
+}
+loadLevel().catch((error) => { status.textContent = error.message; });
 </script>

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from alvarezgui.sokoban import LEVEL_COUNTS
+
 
 class UnsupportedAndroidTask(ValueError):
     """The local Android lab has no safe implementation for this task."""
@@ -17,6 +19,7 @@ class AndroidTask:
     target_text: str | None = None
     # Start from the launcher's app list instead of the home screen.
     open_app_drawer: bool = False
+    sokoban_level: str | None = None
 
     def succeeded(
         self, foreground_package: str | None, ui_text: set[str] | None = None
@@ -70,12 +73,18 @@ def resolve_android_task(task_type: str, app_image: str) -> AndroidTask:
             target_package="org.chromium.webview_shell",
             target_text="Order complete",
         )
-    if task_type == "sokoban" and app_image == "android-sokoban-v1":
-        return AndroidTask(
-            task_kind="sokoban_fixture",
-            target_package="org.chromium.webview_shell",
-            target_text="Sokoban complete",
-        )
+    if task_type == "sokoban":
+        base, separator, level = app_image.partition(":")
+        known_levels = {
+            f"{split}-{index:03d}" for split, count in LEVEL_COUNTS.items() for index in range(count)
+        }
+        if base == "android-sokoban-v1" and (not separator or level in known_levels):
+            return AndroidTask(
+                task_kind="sokoban_fixture",
+                target_package="org.chromium.webview_shell",
+                target_text="Sokoban complete",
+                sokoban_level=level or None,
+            )
     raise UnsupportedAndroidTask(
         f"no offline Android task oracle for task_type={task_type!r}, "
         f"app_image={app_image!r}"
@@ -84,19 +93,21 @@ def resolve_android_task(task_type: str, app_image: str) -> AndroidTask:
 
 SHOPPING_INSTRUCTION = (
     "Buy the Blue Widget test item. Tap Buy test item and finish only after Order complete is visible.\n"
-    "Screenshot is 720x1280; tap/swipe coordinates are absolute screenshot pixels, "
+    "The model canvas is 720x1280; tap/swipe coordinates use that canvas, "
     "not normalized 0..1000 or cropped-WebView coordinates."
 )
 
 SOKOBAN_INSTRUCTION = (
-    "Solve the Sokoban board by moving the player onto the goal after pushing the box there. "
-    "Use only the four direction buttons at the bottom of the 720x1280 screenshot. "
-    "Tap these full-screen button centers exactly: Up (360,1016), Left (176,1160), "
-    "Down (360,1160), Right (544,1160). "
+    "Push the box onto the goal to solve Sokoban. The player does not need to stand on the goal. "
+    "Board legend: # is a wall, @ is the player, $ is the box, . is the goal, "
+    "* is the box on the goal, and + is the player on the goal. "
+    "Inspect the current board after every action and choose the next direction from the current positions. "
+    "Coordinates use the entire 720x1280 image, with (0,0) at its top-left including Android chrome. "
+    "Use only the four direction buttons above the Android navigation bar. "
+    "Tap these full-screen button centers exactly: Up (360,836), Left (176,980), "
+    "Down (360,980), Right (544,980). "
     "Never swipe, type, press Back, tap the board, tap the status bar, or tap Android navigation. "
-    "Finish only after Sokoban complete is visible.\n"
-    "The board starts with the player below and to the right of the box. "
-    "The shortest solution is Left (176,1160), Left (176,1160), Up (360,1016)."
+    "Finish only after Sokoban complete is visible."
 )
 
 # Tasks the console offers; each entry must resolve through resolve_android_task.
@@ -132,14 +143,17 @@ def sokoban_action_allowed(action: dict[str, Any]) -> bool:
         return False
     x, y = action["x"], action["y"]
     return (
-        (276 <= x <= 443 and 952 <= y <= 1080)
-        or (92 <= x <= 259 and 1097 <= y <= 1183)
-        or (276 <= x <= 443 and 1097 <= y <= 1183)
-        or (460 <= x <= 627 and 1097 <= y <= 1183)
+        (276 <= x <= 443 and 773 <= y <= 900)
+        or (92 <= x <= 259 and 917 <= y <= 1044)
+        or (276 <= x <= 443 and 917 <= y <= 1044)
+        or (460 <= x <= 627 and 917 <= y <= 1044)
     )
 
 
 def default_instruction(task_type: str, app_image: str) -> str:
+    if task_type == "sokoban":
+        resolve_android_task(task_type, app_image)
+        return SOKOBAN_INSTRUCTION
     for entry in TASK_CATALOG:
         if entry["task_type"] == task_type and entry["app_image"] == app_image:
             return entry["instruction"]

@@ -51,10 +51,14 @@ class TrainingWorker:
                     learning_rate=float(config.get("learning_rate", 1e-5)),
                     epochs=int(config.get("epochs", 1)),
                     gradient_accumulation=int(config.get("gradient_accumulation", 1)),
+                    finetuning_method=config.get("finetuning_method", "full"),
+                    train_merger_mlp=bool(config.get("train_merger_mlp", False)),
+                    output_format=config.get("output_format", "action-v1"),
+                    seed=int(config.get("seed", 0)),
                     group_size=int(config.get("group_size", 2)),
                 )
                 checkpoint_dir = Path(str(output_dir))
-                if not (checkpoint_dir / "config.json").is_file():
+                if not any((checkpoint_dir / name).is_file() for name in ("config.json", "adapter_config.json")):
                     raise RuntimeError("real training did not produce a reloadable checkpoint")
                 succeeded = True
                 checkpoint_uri = checkpoint_dir.as_uri()

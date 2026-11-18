@@ -88,6 +88,8 @@ class TrainingConfig(BaseModel):
         max_length=100,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
     )
+    finetuning_method: Literal["full", "lora"] = "full"
+    output_format: Literal["action-v1", "sokoban-plan-v1"] = "action-v1"
     learning_rate: float = Field(default=1e-6, gt=0, le=1e-3)
     epochs: int = Field(default=1, ge=1, le=10)
     gradient_accumulation: int = Field(default=1, ge=1, le=64)
@@ -112,6 +114,10 @@ class TrainingRunRequest(BaseModel):
 
     @model_validator(mode="after")
     def _data_source(self) -> "TrainingRunRequest":
+        if self.algorithm != "sft" and (
+            self.config.finetuning_method != "full" or self.config.output_format != "action-v1"
+        ):
+            raise ValueError("LoRA and structured output currently require SFT")
         if self.algorithm == "sft" and self.dataset_version is None:
             raise ValueError("sft requires dataset_version")
         if self.algorithm in {"grpo", "gigpo"} and self.dataset_version is None and not self.config.tasks:

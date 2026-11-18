@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import struct
 import subprocess
 import time
 import xml.etree.ElementTree as ET
@@ -9,8 +10,14 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from alvarezgui.action import validate_action
+from alvarezgui.action import (
+    MODEL_SCREEN_HEIGHT,
+    MODEL_SCREEN_WIDTH,
+    scale_action_to_screen,
+    validate_action,
+)
 from alvarezgui.node_agent.android_tasks import AndroidTask, resolve_android_task, sokoban_action_allowed
 from alvarezgui.node_agent.runtime import (
     Capabilities,
@@ -30,6 +37,7 @@ class AndroidRuntime:
         self.config = config
         self._sandboxes: dict[str, Sandbox] = {}
         self._tasks: dict[str, AndroidTask] = {}
+        self._screen_sizes: dict[str, tuple[int, int]] = {}
 
     def initialize_task(
         self, sandbox_id: str, task_type: str, app_image: str, instruction: str
@@ -48,6 +56,12 @@ class AndroidRuntime:
                     else self.config.sokoban_fixture_url
                 )
                 fixture_url = self._fixture_url(sandbox_id, fixture_url)
+                if task.task_kind == "sokoban_fixture":
+                    parts = urlsplit(fixture_url)
+                    query = [(key, value) for key, value in parse_qsl(parts.query) if key != "level"]
+                    if task.sokoban_level is not None:
+                        query.append(("level", task.sokoban_level))
+                    fixture_url = urlunsplit(parts._replace(query=urlencode(query)))
                 self._adb(
                     sandbox_id,
                     "shell",
@@ -60,7 +74,7 @@ class AndroidRuntime:
                 )
                 self._wait_for_ui_text(
                     sandbox_id,
-                    "Alvarez Test Shop" if task.task_kind == "shopping_fixture" else "Sokoban",
+                    "Alvarez Test Shop" if task.task_kind == "shopping_fixture" else "Push the box onto the goal.",
                 )
             else:
                 self._adb(
@@ -105,12 +119,16 @@ class AndroidRuntime:
             screenshot.write_bytes(image)
         else:
             self._adb(sandbox_id, "exec-out", "screencap", "-p", output=screenshot)
-        digest = hashlib.sha256(screenshot.read_bytes()).hexdigest()
+        payload = screenshot.read_bytes()
+        width, height = _png_dimensions(payload)
+        self._screen_sizes[sandbox_id] = (width, height)
         observation = {
             "sandbox_id": sandbox_id,
             "state": sandbox.state,
             "image_uri": screenshot.as_uri(),
-            "screen_hash": digest,
+            "screen_hash": hashlib.sha256(payload).hexdigest(),
+            "screen_width": width,
+            "screen_height": height,
         }
         if sandbox_id in self._tasks:
             observation["foreground_package"] = self._foreground_package(sandbox_id)
@@ -134,6 +152,9 @@ class AndroidRuntime:
             reward = task.reward(foreground_package, terminated=False, ui_text=ui_text)
             reward["invalid_action"] = True
             return {"done": False, "reward": reward}
+        action = scale_action_to_screen(
+            action, *self._screen_sizes.get(sandbox_id, (MODEL_SCREEN_WIDTH, MODEL_SCREEN_HEIGHT))
+        )
         if action_type in {"tap", "swipe", "text", "back"} and self.config.network_enabled:
             bridge_action: dict[str, Any]
             if action_type == "tap":
@@ -217,7 +238,8 @@ class AndroidRuntime:
         return {
             value
             for node in root.iter("node")
-            if (value := node.attrib.get("text"))
+            for attribute in ("text", "content-desc")
+            if (value := node.attrib.get(attribute))
         }
 
     def _wait_for_ui_text(self, sandbox_id: str, target: str) -> None:
@@ -292,7 +314,13 @@ class AndroidRuntime:
         except OSError as exc:
             raise RuntimeOperationError("ADB executable is unavailable") from exc
         if completed.returncode != 0:
-            raise RuntimeOperationError(f"ADB action failed: {args[0]}")
+            operation = " ".join(args[:3])
+            detail = (completed.stderr or completed.stdout or b"").decode(errors="replace").strip()
+            if args[:3] == ("shell", "input", "text"):
+                detail = "text input omitted"
+            raise RuntimeOperationError(
+                f"ADB action failed: {operation} (exit {completed.returncode}): {detail[:240]}"
+            )
         return b"" if output is not None else completed.stdout
 
     def _get(self, sandbox_id: str) -> Sandbox:
@@ -305,7 +333,17 @@ class AndroidRuntime:
     def _set_state(self, sandbox: Sandbox, state: SandboxState) -> Sandbox:
         updated = replace(sandbox, state=state)
         self._sandboxes[sandbox.sandbox_id] = updated
+        if state is SandboxState.STOPPED:
+            self._screen_sizes.pop(sandbox.sandbox_id, None)
         return updated
+
+
+def _png_dimensions(payload: bytes) -> tuple[int, int]:
+    if len(payload) >= 24 and payload[:8] == b"\x89PNG\r\n\x1a\n" and payload[12:16] == b"IHDR":
+        width, height = struct.unpack(">II", payload[16:24])
+        if width and height:
+            return width, height
+    return MODEL_SCREEN_WIDTH, MODEL_SCREEN_HEIGHT
 
 
 def _validate_id(value: str) -> None:

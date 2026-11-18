@@ -18,7 +18,9 @@ from urllib.error import HTTPError
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
-from alvarezgui.action import validate_action
+from alvarezgui.action import MODEL_SCREEN_HEIGHT, MODEL_SCREEN_WIDTH, validate_action
+from alvarezgui.sokoban import ACTIONS
+from alvarezgui.policy_output import OUTPUT_FORMATS, parse_policy_output, policy_instruction
 from alvarezgui.model import (
     InferenceRequest,
     InferenceResponse,
@@ -48,20 +50,15 @@ def _read_image(uri: str, timeout: float) -> Any:
         raise ValueError("image_uri must use file, http, https, or data scheme")
     from PIL import Image
 
-    return Image.open(BytesIO(payload)).convert("RGB")
+    image = Image.open(BytesIO(payload)).convert("RGB")
+    if image.size != (MODEL_SCREEN_WIDTH, MODEL_SCREEN_HEIGHT):
+        image = image.resize((MODEL_SCREEN_WIDTH, MODEL_SCREEN_HEIGHT))
+    return image
 
 
 def service_instruction(instruction: str) -> str:
     """The exact user prompt the policy sees; training rows must reuse it verbatim."""
-    return (
-        f"{instruction}\n"
-        "Return exactly one JSON object and nothing else. Use exactly one of these schemas: "
-        '{"type":"tap","x":integer,"y":integer}, '
-        '{"type":"swipe","x1":integer,"y1":integer,"x2":integer,"y2":integer,"duration_ms":integer}, '
-        '{"type":"text","text":"..."}, {"type":"back"}, '
-        '{"type":"wait","duration_ms":integer}, or {"type":"terminate","reason":"..."}. '
-        "Never output a key named action, an action list, parentheses, Markdown, or explanation."
-    )
+    return policy_instruction(instruction)
 
 
 def _parse_action(raw_output: str) -> dict[str, Any]:
@@ -80,11 +77,19 @@ def _parse_action(raw_output: str) -> dict[str, Any]:
             return validate_action(value)
         except (json.JSONDecodeError, TypeError, ValueError):
             continue
-    raise InvalidActionOutputError("MiniCPM output did not contain a valid Android action")
+    raise InvalidActionOutputError(
+        "MiniCPM output did not contain a valid Android action; "
+        f"raw_output_preview={raw_output[:160]!r}"
+    )
 
 
 Resolver = Callable[[str], str]
 Loader = Callable[[str], tuple[Any, Any, Any]]
+
+
+def _has_routed_direction_head(config: dict[str, Any]) -> bool:
+    return bool(config.get("direction") and config.get("visual_views") == "task-routed"
+                and config.get("head_views", {}).get("direction") == "board-crop")
 
 
 def load_pretrained(model_path: str) -> tuple[Any, Any, Any]:
@@ -95,12 +100,43 @@ def load_pretrained(model_path: str) -> tuple[Any, Any, Any]:
         raise MiniCPMDependencyError(
             "real MiniCPM serving requires torch, torchvision and transformers>=5.18"
         ) from exc
-    processor = AutoProcessor.from_pretrained(model_path)
+    checkpoint = Path(model_path)
+    policy_path = checkpoint / "policy_config.json"
+    policy = json.loads(policy_path.read_text(encoding="utf-8")) if policy_path.is_file() else {}
+    perception_config_path = checkpoint / "perception_config.json"
+    perception_config = (
+        json.loads(perception_config_path.read_text(encoding="utf-8"))
+        if perception_config_path.is_file() else {}
+    )
+    perception = policy.get("inference_mode") == "perception_direction" or (
+        not policy and _has_routed_direction_head(perception_config)
+    )
+    adapter = checkpoint / "adapter_config.json"
+    base_path = model_path
+    if perception:
+        base_path = policy.get("base_model") or perception_config.get("base_model")
+        if not isinstance(base_path, str) or not Path(base_path).is_dir():
+            raise ValueError("perception checkpoint requires its existing local base model")
+    elif adapter.is_file():
+        from peft import PeftConfig, PeftModel
+
+        base_path = PeftConfig.from_pretrained(model_path).base_model_name_or_path
+        if not base_path or not Path(base_path).is_dir():
+            raise ValueError("adapter requires its existing local base model")
+    processor = AutoProcessor.from_pretrained(base_path if perception else model_path)
     model = AutoModelForImageTextToText.from_pretrained(
-        model_path,
+        base_path,
         torch_dtype="auto",
         device_map="auto",
     )
+    if adapter.is_file():
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, model_path, is_trainable=False,
+                                          autocast_adapter_dtype=True)
+        # BF16 merging can change outputs: opt in only checkpoints validated for serving.
+        if str(Path(model_path).resolve()) in os.environ.get("ALVAREZ_MERGE_ADAPTER_PATHS", "").split(os.pathsep):
+            model = model.merge_and_unload(safe_merge=True)
     model.eval()
     return model, processor, torch
 
@@ -145,6 +181,8 @@ class MiniCPMService:
         self.loader = loader
         self.checkpoint_root = checkpoint_root
         self.models: OrderedDict[str, tuple[Any, Any]] = OrderedDict()
+        self.policy_configs: dict[str, dict[str, Any]] = {}
+        self.perception_heads: dict[str, Any] = {}
         self.disabled_versions: set[str] = set()
         self.torch: Any = None
         self.generation_lock = threading.Lock()
@@ -154,7 +192,7 @@ class MiniCPMService:
         self.latencies: deque[int] = deque(maxlen=200)
 
     @classmethod
-    def load(cls, model_path: str | Path, model_version: str) -> "MiniCPMService":
+    def load_checkpoint(cls, model_path: str | Path, model_version: str) -> "MiniCPMService":
         service = cls(_static_resolver({model_version: str(model_path)}), max_loaded=1)
         with service.generation_lock:
             service._model(model_version)
@@ -168,14 +206,62 @@ class MiniCPMService:
             self.models.move_to_end(version)
             return self.models[version]
         path = self.resolver(version)
+        checkpoint = Path(path)
+        policy_path = checkpoint / "policy_config.json"
+        policy = json.loads(policy_path.read_text()) if policy_path.is_file() else {}
+        output_format = policy.get("output_format", "action-v1")
+        if output_format not in OUTPUT_FORMATS:
+            raise ValueError("unsupported checkpoint output format")
+        perception_config_path = checkpoint / "perception_config.json"
+        perception_config = (
+            json.loads(perception_config_path.read_text(encoding="utf-8"))
+            if perception_config_path.is_file() else {}
+        )
+        inference_mode = policy.get("inference_mode")
+        if inference_mode is None and not policy and _has_routed_direction_head(perception_config):
+            inference_mode = "perception_direction"
+        if inference_mode not in (None, "perception_direction"):
+            raise ValueError("unsupported checkpoint inference mode")
+        if inference_mode == "perception_direction" and output_format != "action-v1":
+            raise ValueError("perception direction checkpoints must use action-v1")
+        visual_views = policy.get("visual_views", "full")
+        if visual_views not in ("full", "full+board-crop"):
+            raise ValueError("unsupported checkpoint visual views")
+        max_tokens = policy.get("max_tokens", 512 if output_format == "sokoban-plan-v1" else 128)
+        if type(max_tokens) is not int or not 1 <= max_tokens <= 4096:
+            raise ValueError("invalid checkpoint token budget")
         while len(self.models) >= self.max_loaded:
             self._evict()
         model, processor, self.torch = self.loader(path)
+        if inference_mode == "perception_direction":
+            perception_config_path = Path(path) / "perception_config.json"
+            perception_config = json.loads(perception_config_path.read_text(encoding="utf-8"))
+            if not _has_routed_direction_head(perception_config):
+                raise ValueError("perception checkpoint must contain a task-routed direction head")
+            heads = self._load_perception_heads(path, self.torch)
+            if "direction" not in heads:
+                raise ValueError("perception checkpoint has no direction head")
+            heads.to(model.device)
+            self.perception_heads[version] = heads
         self.models[version] = (model, processor)
+        self.policy_configs[version] = {
+            "output_format": output_format,
+            "max_tokens": max_tokens,
+            "inference_mode": inference_mode,
+            "visual_views": visual_views,
+        }
         return model, processor
+
+    @staticmethod
+    def _load_perception_heads(path: str, torch: Any) -> Any:
+        from alvarezgui.minicpm_training import load_perception_head
+
+        return load_perception_head(path, torch)
 
     def _clear(self, version: str) -> None:
         self.models.pop(version)
+        self.policy_configs.pop(version, None)
+        self.perception_heads.pop(version, None)
         gc.collect()
         if self.torch is not None and self.torch.cuda.is_available():
             self.torch.cuda.empty_cache()
@@ -235,27 +321,37 @@ class MiniCPMService:
     def infer(self, request: InferenceRequest) -> InferenceResponse:
         started = time.monotonic()
         image = _read_image(request.image_uri, request.timeout_ms / 1000)
-        instruction = service_instruction(request.instruction)
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": instruction},
-                ],
-            }
-        ]
         self.waiting += 1
         with self.generation_lock:
             self.waiting -= 1
             model, processor = self._model(request.model_version)
-            raw_output = self._generate(model, processor, messages, request)
+            policy = self.policy_configs[request.model_version]
+            output_format = policy["output_format"]
+            if policy["inference_mode"] == "perception_direction":
+                direction = self._predict_direction(request.model_version, model, processor, image, request)
+                raw_output = json.dumps(ACTIONS[direction], separators=(",", ":"))
+            else:
+                images = [image]
+                if policy["visual_views"] == "full+board-crop":
+                    from alvarezgui.minicpm_training import _board_crop_image
+
+                    images.append(_board_crop_image(image))
+                content = [{"type": "image", "image": value} for value in images]
+                content.append({"type": "text", "text": policy_instruction(request.instruction, output_format)})
+                messages = [{"role": "user", "content": content}]
+                if request.max_tokens is None:
+                    request = request.model_copy(update={"max_tokens": policy["max_tokens"]})
+                raw_output = self._generate(model, processor, messages, request)
         self.requests += 1
         try:
-            action = _parse_action(raw_output)
-        except InvalidActionOutputError:
+            action = (_parse_action(raw_output) if output_format == "action-v1"
+                      else parse_policy_output(raw_output, output_format))
+        except (InvalidActionOutputError, ValueError, TypeError) as exc:
             self.rejected += 1
-            raise
+            raise InvalidActionOutputError(
+                f"invalid {output_format} output; raw_output_preview={raw_output[:160]!r}",
+                raw_output=raw_output[:16000], output_format=output_format,
+            ) from exc
         latency_ms = max(0, round((time.monotonic() - started) * 1000))
         self.latencies.append(latency_ms)
         return InferenceResponse(
@@ -264,7 +360,40 @@ class MiniCPMService:
             raw_output=raw_output,
             model_version=request.model_version,
             latency_ms=latency_ms,
+            output_format=output_format,
         )
+
+    def _predict_direction(
+        self,
+        version: str,
+        model: Any,
+        processor: Any,
+        image: Any,
+        request: InferenceRequest,
+    ) -> str:
+        from alvarezgui.minicpm_training import DIRECTIONS, _perception_head_features
+
+        row = {
+            "image": "",
+            "conversations": [
+                {"role": "user", "content": policy_instruction(request.instruction, "action-v1")},
+                {"role": "assistant", "content": ""},
+            ],
+        }
+        with self.torch.inference_mode():
+            features = _perception_head_features(
+                model,
+                processor,
+                row,
+                self.torch,
+                model.device,
+                ("direction",),
+                image=image,
+                multiview=True,
+                task_views=True,
+            )
+            prediction = self.perception_heads[version]["direction"](features["direction"])
+        return DIRECTIONS[int(prediction.argmax(dim=-1).item())]
 
     def _generate(self, model: Any, processor: Any, messages: list[dict[str, Any]], request: InferenceRequest) -> str:
         inputs = processor.apply_chat_template(
@@ -406,7 +535,8 @@ class _Handler(BaseHTTPRequestHandler):
         except ModelVersionNotFoundError:
             self._reply(404, {"detail": "model version not found"})
         except InvalidActionOutputError as exc:
-            self._reply(422, {"detail": str(exc)})
+            self._reply(422, {"detail": str(exc), "raw_output": exc.raw_output,
+                              "output_format": exc.output_format})
         except TimeoutError:
             self._reply(504, {"detail": "inference timeout"})
         except (OSError, ValueError, json.JSONDecodeError) as exc:

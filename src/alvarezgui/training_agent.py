@@ -234,6 +234,13 @@ class TrainingAgent:
         config = run["config"]
         base_path = _local_path(run.get("base_model_checkpoint_uri"), "base model")
         run_dir = self.checkpoint_root / run["run_id"]
+        policy_path = Path(base_path) / "policy_config.json"
+        policy = json.loads(policy_path.read_text()) if policy_path.is_file() else {}
+        if run["algorithm"] != "sft" and (
+            (Path(base_path) / "adapter_config.json").is_file()
+            or policy.get("output_format", "action-v1") != "action-v1"
+        ):
+            raise ValueError("adapter and structured checkpoints currently require SFT")
         if run["algorithm"] == "gigpo":
             self.log(run["run_id"], "GIGPO compatibility mode: GRPO episode advantages and clipped policy loss; "
                      "no step-level state grouping")
@@ -263,6 +270,7 @@ class TrainingAgent:
                     "temperature": 0.0,
                     "seed": config.get("seed", 0),
                     "run_id": run["run_id"],
+                    "runtime_backend": run.get("runtime_backend", "firecracker"),
                 },
                 {"Idempotency-Key": f"{run['run_id']}:auto-eval"},
             )
@@ -292,7 +300,7 @@ class TrainingAgent:
             finally:
                 self.release_training_memory()
             metrics = {**summary, **trained_metrics}
-            step_offset += metrics["update_count"]
+            step_offset += metrics["step_count"]
             policy_version = self.register(run, output_dir, metrics, f"r{round_number}")
             policy_path = str(output_dir)
         if policy_version == run["base_model"]:
@@ -374,6 +382,10 @@ class TrainingAgent:
             learning_rate=config["learning_rate"],
             epochs=config["epochs"],
             gradient_accumulation=config["gradient_accumulation"],
+            finetuning_method=config.get("finetuning_method", "full"),
+            train_merger_mlp=config.get("train_merger_mlp", False),
+            output_format=config.get("output_format", "action-v1"),
+            seed=config.get("seed", 0),
             clip_epsilon=config["clip_epsilon"],
             group_size=config["group_size"],
             compute_old_logprob=True,
@@ -381,7 +393,7 @@ class TrainingAgent:
         )
 
     def register(self, run: dict[str, Any], output_dir: Path, metrics: dict[str, Any], suffix: str) -> str:
-        if not (output_dir / "config.json").is_file():
+        if not any((output_dir / name).is_file() for name in ("config.json", "adapter_config.json")):
             raise RuntimeError(f"training did not produce a reloadable checkpoint in {output_dir}")
         model_name = run.get("config", {}).get("model_name") or run["run_id"]
         version = f"{model_name}-{suffix}"

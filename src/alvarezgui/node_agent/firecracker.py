@@ -407,6 +407,11 @@ class FirecrackerAndroidRuntime(AndroidRuntime):
         tap_name = self._tap_name(sandbox_id)
         self._tap_names[sandbox_id] = tap_name
         try:
+            # A previous guest at this address may remain permanently offline in host ADB.
+            subprocess.run(
+                [self.config.adb_binary, "disconnect", f"{endpoint.guest_ip}:{self.config.guest_adb_port}"],
+                check=False, capture_output=True, timeout=self.config.api_timeout,
+            )
             self._run_ip("tuntap", "add", "dev", tap_name, "mode", "tap")
             self._run_ip(
                 "addr",
