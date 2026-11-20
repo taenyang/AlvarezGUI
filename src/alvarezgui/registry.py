@@ -13,7 +13,7 @@ import psycopg
 from psycopg.types.json import Json
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from alvarezgui.node_agent.android_tasks import resolve_android_task
+from alvarezgui.node_agent.android_tasks import TASK_SETS, resolve_android_task
 
 
 class RegistryConflictError(Exception):
@@ -45,6 +45,26 @@ class CheckpointUnmanagedError(Exception):
     pass
 
 
+class ModelProtectedError(Exception):
+    pass
+
+
+class IncompatibleBaseModelError(Exception):
+    pass
+
+
+# Runs created before the accelerator knob existed belong to the 4090 agent.
+ACCELERATOR_SQL = "COALESCE(config->>'accelerator', '4090')"
+
+# Official base weights every experiment trains from; never deletable through the API.
+PROTECTED_MODEL_VERSIONS = ("minicpm-v-4.7-1b", "qwen3-vl-8b-instruct")
+
+# The trainer records finetuning_method in every model it registers; LoRA output is a PEFT adapter.
+# ponytail: models registered without trainer metrics read as full weights; the claim-time
+# adapter_config.json check stays as the backstop.
+ADAPTER_SQL = "COALESCE(metrics->>'finetuning_method', '') = 'lora'"
+
+
 class CheckpointCleanupError(Exception):
     pass
 
@@ -55,6 +75,8 @@ class ModelVersionRequest(BaseModel):
     checkpoint_uri: str | None = None
     status: Literal["REGISTERED", "READY", "RETIRED"] = "REGISTERED"
     metrics: dict[str, Any] = Field(default_factory=dict)
+    # Trained versions register as checkpoints of their run; publishing promotes one to the run's model.
+    run_id: str | None = Field(default=None, min_length=1)
 
 
 class DatasetRequest(BaseModel):
@@ -90,17 +112,52 @@ class TrainingConfig(BaseModel):
     )
     finetuning_method: Literal["full", "lora"] = "full"
     output_format: Literal["action-v1", "sokoban-plan-v1"] = "action-v1"
+    train_merger_mlp: bool = False
+    multiview: bool = False
+    batch_size: int = Field(default=1, ge=1, le=16)
+    cache_preprocessed: bool = False
+    gradient_checkpointing: bool = True
+    shuffle: bool = False
+    # 4090: the co-located training agent (one run at a time); h800: on-demand Kubernetes pods, concurrent.
+    accelerator: Literal["4090", "h800"] = "4090"
     learning_rate: float = Field(default=1e-6, gt=0, le=1e-3)
     epochs: int = Field(default=1, ge=1, le=10)
     gradient_accumulation: int = Field(default=1, ge=1, le=64)
     clip_epsilon: float = Field(default=0.2, gt=0, le=1)
     group_size: int = Field(default=4, ge=2, le=16)
     rounds: int = Field(default=1, ge=1, le=20)
-    tasks: list[TaskSpec] = Field(default_factory=list, max_length=8)
+    # Online RL pool; SFT and runs without eval_tasks also evaluate on it.
+    tasks: list[TaskSpec] = Field(default_factory=list, max_length=64)
+    # Online RL draws this many pool tasks per round (seeded, every task once before repeats); None = all.
+    tasks_per_round: int | None = Field(default=None, ge=1, le=16)
+    eval_tasks: list[TaskSpec] = Field(default_factory=list, max_length=8)
+    # Names from TASK_SETS, expanded into tasks / eval_tasks at creation.
+    train_set: str | None = None
+    eval_set: str | None = None
     temperature: float = Field(default=1.0, ge=0, le=2)
     max_steps: int = Field(default=3, ge=1, le=50)
     eval_trials: int = Field(default=4, ge=0, le=50)
     seed: int = 0
+    # Keep every N-th round (online RL) or epoch (offline) as a checkpoint; None keeps only the final model.
+    checkpoint_every: int | None = Field(default=None, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def _task_sets(self) -> "TrainingConfig":
+        for name, key in ((self.train_set, "tasks"), (self.eval_set, "eval_tasks")):
+            if name is None:
+                continue
+            if name not in TASK_SETS:
+                raise ValueError(f"unknown task set {name!r}")
+            expanded = [TaskSpec(**task) for task in TASK_SETS[name]["tasks"]]
+            if getattr(self, key) and getattr(self, key) != expanded:
+                raise ValueError(f"{key} conflicts with task set {name!r}")
+            setattr(self, key, expanded)
+        # Limits of one rollout request (16 groups) and one evaluation (8 tasks).
+        if self.tasks_per_round is None and len(self.tasks) > 16:
+            raise ValueError("tasks_per_round is required for more than 16 tasks")
+        if self.eval_trials and len(self.eval_tasks or self.tasks) > 8:
+            raise ValueError("automatic evaluation takes at most 8 tasks; set eval_set or eval_tasks")
+        return self
 
 
 class TrainingRunRequest(BaseModel):
@@ -116,8 +173,12 @@ class TrainingRunRequest(BaseModel):
     def _data_source(self) -> "TrainingRunRequest":
         if self.algorithm != "sft" and (
             self.config.finetuning_method != "full" or self.config.output_format != "action-v1"
+            or self.config.train_merger_mlp or self.config.multiview
+            or self.config.batch_size > 1 or self.config.cache_preprocessed or self.config.shuffle
         ):
-            raise ValueError("LoRA and structured output currently require SFT")
+            raise ValueError("LoRA, merger, multiview, batching, caching, shuffling and structured output currently require SFT")
+        if self.config.train_merger_mlp and self.config.finetuning_method != "lora":
+            raise ValueError("train_merger_mlp requires LoRA")
         if self.algorithm == "sft" and self.dataset_version is None:
             raise ValueError("sft requires dataset_version")
         if self.algorithm in {"grpo", "gigpo"} and self.dataset_version is None and not self.config.tasks:
@@ -160,9 +221,9 @@ class RegistryStore:
                 return self.connection.execute(
                     """
                     INSERT INTO model_versions
-                        (version, base_model, checkpoint_uri, status, metrics)
-                    VALUES (%s, %s, %s, %s, %s)
-                    RETURNING version, base_model, checkpoint_uri, status, metrics, created_at
+                        (version, base_model, checkpoint_uri, status, metrics, run_id, kind)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING version, base_model, checkpoint_uri, status, metrics, created_at, run_id, kind
                     """,
                     (
                         request.version,
@@ -170,6 +231,8 @@ class RegistryStore:
                         request.checkpoint_uri,
                         request.status,
                         Json(request.metrics),
+                        request.run_id,
+                        "model" if request.run_id is None else "checkpoint",
                     ),
                 ).fetchone()
             except psycopg.errors.UniqueViolation as exc:
@@ -221,21 +284,35 @@ class RegistryStore:
                 if existing["request_fingerprint"] not in accepted_fingerprints:
                     raise RegistryConflictError("idempotency key conflict")
                 return existing, False
-            if self.connection.execute(
-                "SELECT 1 FROM model_versions WHERE version = %s AND status != 'RETIRED' FOR UPDATE",
+            base = self.connection.execute(
+                f"SELECT {ADAPTER_SQL} AS adapter, metrics->>'output_format' AS output_format"
+                " FROM model_versions WHERE version = %s AND status != 'RETIRED' FOR UPDATE",
                 (request.base_model,),
-            ).fetchone() is None:
+            ).fetchone()
+            if base is None:
                 raise VersionNotFoundError("model version not found")
+            # Same rules the trainer and claim-time checks enforce, reported before the run is queued.
+            if base["adapter"] and (request.algorithm != "sft" or request.config.finetuning_method != "lora"):
+                raise IncompatibleBaseModelError(
+                    f"base model {request.base_model} is a LoRA adapter checkpoint: only SFT with LoRA can "
+                    f"continue it; merge it into full weights first for {request.algorithm} or full fine-tuning"
+                )
+            if request.algorithm != "sft" and (base["output_format"] or "action-v1") != "action-v1":
+                raise IncompatibleBaseModelError(
+                    f"base model {request.base_model} uses output format {base['output_format']}; "
+                    f"{request.algorithm} currently requires action-v1"
+                )
             if request.dataset_version is not None and self.connection.execute(
                 "SELECT 1 FROM datasets WHERE dataset_version = %s",
                 (request.dataset_version,),
             ).fetchone() is None:
                 raise VersionNotFoundError("dataset version not found")
-            active = self.connection.execute(
-                "SELECT 1 FROM training_runs "
-                "WHERE runtime_backend IN ('firecracker', 'docker') AND status IN ('QUEUED', 'RUNNING') LIMIT 1"
+            # H800 runs each get their own pod, so only the single 4090 agent is exclusive.
+            active = request.config.accelerator == "4090" and self.connection.execute(
+                f"SELECT 1 FROM training_runs WHERE runtime_backend IN ('firecracker', 'docker')"
+                f" AND status IN ('QUEUED', 'RUNNING') AND {ACCELERATOR_SQL} = '4090' LIMIT 1"
             ).fetchone()
-            if active is not None:
+            if active:
                 raise TrainingAlreadyRunningError
             inserted = self.connection.execute(
                 """
@@ -277,7 +354,7 @@ class RegistryStore:
                 raise RegistryConflictError("idempotency key conflict")
             return existing, False
 
-    def claim_next_training_run(self) -> dict[str, Any] | None:
+    def claim_next_training_run(self, accelerator: str = "4090") -> dict[str, Any] | None:
         with self.connection.transaction():
             row = self.connection.execute(
                 """
@@ -290,10 +367,12 @@ class RegistryStore:
                            AS dataset_source
                 FROM training_runs
                 WHERE status = 'QUEUED' AND runtime_backend IN ('firecracker', 'docker')
+                  AND """ + ACCELERATOR_SQL + """ = %s
                 ORDER BY created_at, run_id
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
-                """
+                """,
+                (accelerator,),
             ).fetchone()
             if row is None:
                 return None
@@ -434,6 +513,8 @@ class RegistryStore:
             ).fetchone()
             if model is None:
                 raise VersionNotFoundError("model version not found")
+            if version in PROTECTED_MODEL_VERSIONS:
+                raise ModelProtectedError("base model version is protected")
             training_run_ids = self._model_training_run_ids(version, model["checkpoint_uri"])
             evaluation_ids = self._model_evaluation_ids(version)
             references = self._model_references(version, model["checkpoint_uri"])
@@ -668,8 +749,9 @@ class RegistryStore:
     def get_model_version(self, version: str) -> dict[str, Any] | None:
         with self.connection.transaction():
             return self.connection.execute(
-                """
-                SELECT version, base_model, checkpoint_uri, status, metrics, created_at
+                f"""
+                SELECT version, base_model, checkpoint_uri, status, metrics, created_at, run_id, kind,
+                       {ADAPTER_SQL} AS adapter
                 FROM model_versions WHERE version = %s
                 """,
                 (version,),
@@ -678,11 +760,42 @@ class RegistryStore:
     def list_model_versions(self) -> list[dict[str, Any]]:
         with self.connection.transaction():
             return self.connection.execute(
-                """
-                SELECT version, base_model, checkpoint_uri, status, metrics, created_at
+                f"""
+                SELECT version, base_model, checkpoint_uri, status, metrics, created_at, run_id, kind,
+                       version = ANY(%s) AS protected, {ADAPTER_SQL} AS adapter
                 FROM model_versions ORDER BY created_at
-                """
+                """,
+                (list(PROTECTED_MODEL_VERSIONS),),
             ).fetchall()
+
+    def promote_model_version(self, version: str) -> dict[str, Any]:
+        """Make ``version`` its run's model; the run's previous model becomes a checkpoint."""
+        with self.connection.transaction():
+            row = self.connection.execute(
+                "SELECT run_id, status FROM model_versions WHERE version = %s FOR UPDATE", (version,)
+            ).fetchone()
+            if row is None or row["status"] == "RETIRED":
+                raise VersionNotFoundError("model version not found")
+            if row["run_id"] is None:
+                raise RegistryConflictError("only versions produced by a training run can be promoted")
+            # Two statements: the one-model-per-run index is checked row by row.
+            self.connection.execute(
+                "UPDATE model_versions SET kind = 'checkpoint' WHERE run_id = %s AND version <> %s",
+                (row["run_id"], version),
+            )
+            self.connection.execute("UPDATE model_versions SET kind = 'model' WHERE version = %s", (version,))
+            # The run's output follows the choice; an active run records its own output when it finishes.
+            self.connection.execute(
+                """
+                UPDATE training_runs
+                SET metrics = jsonb_set(metrics, '{model_version}', to_jsonb(%s::text)),
+                    checkpoint_uri = (SELECT checkpoint_uri FROM model_versions WHERE version = %s),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE run_id = %s AND status NOT IN ('QUEUED', 'RUNNING')
+                """,
+                (version, version, row["run_id"]),
+            )
+        return self.get_model_version(version)
 
     def list_datasets(self) -> list[dict[str, Any]]:
         with self.connection.transaction():

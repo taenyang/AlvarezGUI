@@ -38,6 +38,10 @@ class AndroidRuntime:
         self._sandboxes: dict[str, Sandbox] = {}
         self._tasks: dict[str, AndroidTask] = {}
         self._screen_sizes: dict[str, tuple[int, int]] = {}
+        # The last UI dump since the last input. A dump takes about 2 s (uiautomator waits for an
+        # idle UI), so observe() reuses the one that ended execute() or initialize_task().
+        # ponytail: assumes the fixtures change only on input; drop the reuse if one animates.
+        self._ui_texts: dict[str, set[str]] = {}
 
     def initialize_task(
         self, sandbox_id: str, task_type: str, app_image: str, instruction: str
@@ -46,6 +50,7 @@ class AndroidRuntime:
         if sandbox.state not in {SandboxState.READY, SandboxState.RUNNING}:
             raise InvalidStateError(f"cannot initialize task in {sandbox.state}")
         task = resolve_android_task(task_type, app_image)
+        self._ui_texts.pop(sandbox_id, None)
         try:
             self._adb(sandbox_id, "shell", "am", "force-stop", task.target_package)
             if task.task_kind in {"shopping_fixture", "sokoban_fixture"}:
@@ -133,7 +138,8 @@ class AndroidRuntime:
         if sandbox_id in self._tasks:
             observation["foreground_package"] = self._foreground_package(sandbox_id)
             if self._tasks[sandbox_id].target_text is not None:
-                observation["ui_text"] = sorted(self._ui_text(sandbox_id))
+                ui_text = self._ui_texts.get(sandbox_id)
+                observation["ui_text"] = sorted(self._ui_text(sandbox_id) if ui_text is None else ui_text)
         return observation
 
     def execute(self, sandbox_id: str, action: dict[str, Any]) -> dict[str, Any]:
@@ -142,6 +148,7 @@ class AndroidRuntime:
             raise InvalidStateError(f"cannot execute action in {sandbox.state}")
         action = validate_action(action)
         action_type = action["type"]
+        self._ui_texts.pop(sandbox_id, None)
         task = self._tasks.get(sandbox_id)
         if (
             task is not None
@@ -194,14 +201,14 @@ class AndroidRuntime:
         elif action_type == "wait":
             time.sleep(action["duration_ms"] / 1000)
         if task is not None:
+            # The success window starts at the action. A text-checked task's UI dump (about 2 s,
+            # after the UI goes idle) usually fills it, so it is not dumped a second time.
+            deadline = time.monotonic() + min(self.config.api_timeout, 2.0)
             foreground_package, ui_text = self._task_state(sandbox_id, task)
-            if not task.succeeded(foreground_package, ui_text) and action_type != "terminate":
-                deadline = time.monotonic() + min(self.config.api_timeout, 2.0)
-                while time.monotonic() < deadline:
-                    time.sleep(0.05)
-                    foreground_package, ui_text = self._task_state(sandbox_id, task)
-                    if task.succeeded(foreground_package, ui_text):
-                        break
+            while (action_type != "terminate" and not task.succeeded(foreground_package, ui_text)
+                   and time.monotonic() < deadline):
+                time.sleep(0.05)
+                foreground_package, ui_text = self._task_state(sandbox_id, task)
             succeeded = task.succeeded(foreground_package, ui_text)
             if succeeded or action_type == "terminate":
                 return {
@@ -235,20 +242,28 @@ class AndroidRuntime:
         self._adb(sandbox_id, "shell", "uiautomator", "dump", "/sdcard/window.xml")
         payload = self._adb(sandbox_id, "shell", "cat", "/sdcard/window.xml")
         root = ET.fromstring(payload)
-        return {
+        text = {
             value
             for node in root.iter("node")
             for attribute in ("text", "content-desc")
             if (value := node.attrib.get(attribute))
         }
+        self._ui_texts[sandbox_id] = text
+        return text
 
     def _wait_for_ui_text(self, sandbox_id: str, target: str) -> None:
-        deadline = time.monotonic() + min(self.config.api_timeout, 5.0)
+        # Right after a boot the first WebView load can pass 5 s, and a dump can fail (time out,
+        # or write no file); both cleared on retry, so keep polling until the deadline.
+        deadline = time.monotonic() + min(self.config.api_timeout, 15.0)
+        error: Exception | None = None
         while time.monotonic() < deadline:
-            if target in self._ui_text(sandbox_id):
-                return
+            try:
+                if target in self._ui_text(sandbox_id):
+                    return
+            except (RuntimeOperationError, ET.ParseError) as exc:
+                error = exc
             time.sleep(0.1)
-        raise RuntimeOperationError(f"Android fixture did not load: {target}")
+        raise RuntimeOperationError(f"Android fixture did not load: {target}") from error
 
     def _foreground_package(self, sandbox_id: str) -> str | None:
         output = self._adb(sandbox_id, "shell", "dumpsys", "activity", "activities")
@@ -335,6 +350,7 @@ class AndroidRuntime:
         self._sandboxes[sandbox.sandbox_id] = updated
         if state is SandboxState.STOPPED:
             self._screen_sizes.pop(sandbox.sandbox_id, None)
+            self._ui_texts.pop(sandbox.sandbox_id, None)
         return updated
 
 

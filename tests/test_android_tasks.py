@@ -225,6 +225,26 @@ class AndroidTaskTest(unittest.TestCase):
                 self.assertNotIn("test", runtime._tasks)
                 self.assertEqual(runtime._adb.call_count, 4)
 
+    def test_fixture_wait_retries_failed_dumps_until_its_deadline(self) -> None:
+        runtime = AndroidRuntime(SimpleNamespace(api_timeout=30))
+        loaded = b'<hierarchy><node text="Alvarez Test Shop" /></hierarchy>'
+        missing = RuntimeOperationError("ADB action failed: shell cat /sdcard/window.xml (exit 1)")
+        # A timed-out dump, a dump that wrote no file, a truncated file, then the page.
+        runtime._adb = Mock(side_effect=[RuntimeOperationError("ADB action timed out"), b"", missing,
+                                         b"", b"<hierarchy><node", b"", loaded])
+        with patch("alvarezgui.node_agent.android.time.monotonic", side_effect=[0, 1, 4, 7, 10]), patch(
+            "alvarezgui.node_agent.android.time.sleep"
+        ):
+            runtime._wait_for_ui_text("test", "Alvarez Test Shop")  # 5 s alone would have given up
+
+        runtime._adb = Mock(side_effect=[b"", missing] * 3)
+        with patch("alvarezgui.node_agent.android.time.monotonic", side_effect=[0, 1, 7, 13, 16]), patch(
+            "alvarezgui.node_agent.android.time.sleep"
+        ):
+            with self.assertRaisesRegex(RuntimeOperationError, "fixture did not load: Alvarez Test Shop") as raised:
+                runtime._wait_for_ui_text("test", "Alvarez Test Shop")
+        self.assertIs(raised.exception.__cause__, missing)
+
     def test_ui_text_collects_visible_text_and_board_accessibility_description(self) -> None:
         board = ["########", "# .    #", "# $    #", "#   @  #", "#      #", "########"]
         description = "Sokoban board: " + "|".join(board)

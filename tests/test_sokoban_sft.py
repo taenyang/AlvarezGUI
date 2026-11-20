@@ -14,9 +14,36 @@ from alvarezgui.node_agent.android_tasks import SOKOBAN_INSTRUCTION
 from alvarezgui.policy_output import OUTPUT_FORMATS, make_plan, parse_policy_output, policy_instruction
 from alvarezgui.sokoban import ACTIONS, LEVEL_COUNTS, load_levels, parse_board, render_board, solve, transition
 from alvarezgui.sokoban_sft import (
-    collect, collect_level, evaluate_states, export_paired, observed_board, optimal_directions,
-    registration_dataset,
+    augment_targets, collect, collect_augment_level, collect_level, evaluate_states, export_paired,
+    observed_board, optimal_directions, registration_dataset,
 )
+
+
+class GameRuntime:
+    """Plays the real single-box rules and serves boards/screenshots like the Android runtime."""
+
+    def __init__(self, root, levels, broken=False):
+        self.root, self.levels, self.broken, self.frames = root, levels, broken, 0
+
+    def initialize_task(self, sandbox_id, task_type, app_image, instruction):
+        self.walls, self.player, self.box, self.goal = parse_board(self.levels[app_image.split(":")[1]])
+
+    def execute(self, sandbox_id, action):
+        direction = next(key for key, value in ACTIONS.items() if value == action)
+        if self.box != self.goal and not self.broken:
+            self.player, self.box = transition(self.walls, self.player, self.box, direction)
+        solved = self.box == self.goal
+        return {"done": solved, "reward": {"total": int(solved), "success": solved}}
+
+    def observe(self, sandbox_id):
+        self.frames += 1
+        image = self.root / f"frame-{self.frames}.png"
+        board = render_board(self.walls, self.player, self.box, self.goal)
+        image.write_bytes("|".join(board).encode())
+        return {"image_uri": image.as_uri(), "screen_width": 720, "screen_height": 1280,
+                "ui_text": ["Sokoban board: " + "|".join(board).replace(" ", "_")]
+                + (["Sokoban complete"] if self.box == self.goal else [])}
+
 
 
 class SokobanSFTTest(unittest.TestCase):
@@ -60,6 +87,39 @@ class SokobanSFTTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "expected move"):
                 collect_level(runtime, "sandbox", level, bad)
             self.assertFalse((bad / "episodes/train-000.jsonl").exists())
+
+    def test_augmented_states_are_reached_on_device_and_labeled_by_solver(self):
+        import random
+        level = {"id": "train-000", "split": "train", "board": self.board}
+        targets = augment_targets(level, set(), random.Random(0))
+        kinds = Counter(kind for kind, _ in targets)
+        self.assertEqual(kinds, Counter({"player_on_goal": 3, "near_deadlock": 3, "off_path": 2}))
+        walls, _, _, goal = parse_board(self.board)
+        for kind, board in targets:
+            _, player, box, _ = parse_board(board)
+            solve(board)
+            self.assertEqual(player == goal, kind == "player_on_goal")
+        # The evaluation failure: box next to the left wall, one push from a deadlock.
+        near = ["########", "# .    #", "# $@   #", "#      #", "#      #", "########"]
+        with patch.dict("alvarezgui.sokoban_sft.AUGMENT_QUOTAS", {kind: 10_000 for kind in kinds}):
+            everything = augment_targets(level, set(), random.Random(0))
+        self.assertIn(("near_deadlock", near), everything)
+        self.assertNotIn("+", "".join("".join(b) for k, b in everything if k != "player_on_goal"))
+        excluded = {hashlib.sha256("\n".join(board).encode()).hexdigest() for _, board in targets}
+        self.assertFalse(excluded & {hashlib.sha256("\n".join(b).encode()).hexdigest()
+                                     for _, b in augment_targets(level, excluded, random.Random(0))})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "aug"
+            rows = collect_augment_level(GameRuntime(root, {"train-000": self.board}), "s", level, targets, output)
+            self.assertEqual([row["board"] for row in rows], [board for _, board in targets])
+            for row in rows:
+                self.assertIn(row["direction"], optimal_directions(row["board"]))
+                self.assertEqual(Path(row["image"]).read_bytes(), "|".join(row["board"]).encode())
+                self.assertEqual(row["output_format"], "action-v1")
+            with self.assertRaisesRegex(ValueError, "differs from target"):
+                collect_augment_level(GameRuntime(root, {"train-000": self.board}, broken=True),
+                                      "s", level, targets, root / "broken")
 
     def test_workers_share_network_allocator_and_failed_collection_is_not_published(self):
         from threading import Barrier

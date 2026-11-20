@@ -12,12 +12,13 @@ from collections.abc import Callable
 from datetime import timedelta
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
 import redis
 import uvicorn
 
 from alvarezgui.app import create_app
-from alvarezgui.config import Settings
+from alvarezgui.config import MAX_SANDBOXES, Settings
 from alvarezgui.console_store import ConsoleStore, NodeHeartbeat
 from alvarezgui.consumer import Consumer
 from alvarezgui.db import connect
@@ -58,18 +59,42 @@ def node_resources(settings: Settings) -> dict[str, object]:
     }
 
 
-def heartbeat(settings: Settings) -> None:
+def sandbox_ceiling(settings: Settings, runtime_config: Any, resources: dict[str, Any]) -> dict[str, int | None]:
+    """Sandboxes each host resource allows (None: not a limit); the console limit is the smallest."""
+    if settings.runtime_backend == "docker":
+        cpus, memory_mib, network = runtime_config.cpus, runtime_config.memory_mib, None
+    else:
+        cpus, memory_mib = runtime_config.vcpu_count, runtime_config.mem_size_mib
+        # The pool's last /30 is reserved for building templates.
+        network = (2 ** (runtime_config.network_sandbox_prefix_len - runtime_config.network_prefix_len) - 1
+                   if runtime_config.network_enabled else None)
+    cpu_count, memory = resources.get("cpu_count"), resources.get("memory_total_bytes")
+    return {
+        "platform": MAX_SANDBOXES,
+        "cpu": int(cpu_count // cpus) if cpu_count else None,
+        "memory": int(memory // (memory_mib * 2**20)) if memory else None,
+        "network": network,
+    }
+
+
+def heartbeat(settings: Settings, consumer: Consumer) -> None:
+    resources = node_resources(settings)
+    bounds = sandbox_ceiling(settings, consumer.runtime.config, resources)
+    resources["sandbox_ceiling"] = bounds
+    # An explicit SANDBOX_CAPACITY above the estimate is the operator's call; keep it reachable.
+    ceiling = max(settings.sandbox_capacity, min(value for value in bounds.values() if value is not None))
     with connect(settings) as connection:
-        ConsoleStore(connection).heartbeat_node(
+        capacity = ConsoleStore(connection).heartbeat_node(
             settings.node_id,
             NodeHeartbeat(
                 role="docker" if settings.runtime_backend == "docker" else "microvm",
                 address=settings.node_address,
-                capacity={"sandboxes": settings.sandbox_capacity},
-                resources=node_resources(settings),
+                capacity={"sandboxes": settings.sandbox_capacity, "max_sandboxes": ceiling},
+                resources=resources,
                 heartbeat_interval_seconds=HEARTBEAT_SECONDS,
             ),
         )
+    consumer.worker_count = capacity["sandboxes"]
 
 
 def forever(name: str, step: Callable[[], object], interval: float) -> threading.Thread:
@@ -139,7 +164,9 @@ def main() -> None:
     consumer = None
     if settings.server_mode != "control_plane":
         consumer = consumer_for_settings(settings, redis_client, model_service)
-        forever("heartbeat", lambda: heartbeat(settings), HEARTBEAT_SECONDS)
+        if settings.runtime_backend == "firecracker":
+            consumer.runtime.prefetch_template()
+        forever("heartbeat", lambda: heartbeat(settings, consumer), HEARTBEAT_SECONDS)
         forever(f"consumer-{settings.runtime_backend}", consumer.run_once, 0.5)
         forever(f"lifecycle-{settings.runtime_backend}", consumer.run_lifecycle_once, 0.1)
     if settings.server_mode != "worker":
@@ -149,7 +176,7 @@ def main() -> None:
             runtime_backends=settings.scheduler_backend_list,
             use_node_capacity=True,
         )
-        forever("scheduler", scheduler.run_once, 1.0)
+        forever("scheduler", scheduler.run_until_idle, 1.0)
     fixture = serve_fixture(settings.fixture_port) if consumer else None
     try:
         uvicorn.run(

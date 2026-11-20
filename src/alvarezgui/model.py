@@ -28,6 +28,8 @@ class InferenceResponse(BaseModel):
     model_version: str
     latency_ms: int = Field(ge=0)
     output_format: Literal["action-v1", "sokoban-plan-v1"] = "action-v1"
+    # Mean per-token entropy (nats) of the distribution each output token was sampled from.
+    entropy: float | None = Field(default=None, ge=0)
 
 
 class ModelError(Exception):

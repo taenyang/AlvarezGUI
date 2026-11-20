@@ -78,6 +78,20 @@ function modelBadge(status) {
   const [kind, label] = MODEL_STATUS[status] || ["", status];
   return h("span", { class: `badge ${kind}`, title: status }, label);
 }
+const ADAPTER_HINT = "只含 LoRA adapter 权重，加载时依赖基础模型；只能继续 LoRA SFT，GRPO / GIGPO 和全参数训练需先合并为完整权重";
+// <option>s grouped as the resources page shows them: models, LoRA adapters, checkpoints.
+function modelOptions(models, option) {
+  const groups = [["模型", (m) => m.kind !== "checkpoint" && !m.adapter], ["LoRA", (m) => m.kind !== "checkpoint" && m.adapter],
+    ["Checkpoint", (m) => m.kind === "checkpoint"]];
+  return groups.map(([label, test]) => {
+    const rows = models.filter(test);
+    return rows.length ? h("optgroup", { label }, rows.map(option)) : null;
+  });
+}
+
+function modelLabel(m) {
+  return m.adapter ? `${m.version}（LoRA adapter）` : m.version;
+}
 
 function table(columns, rows, onClick) {
   return h("table", {},
@@ -115,28 +129,76 @@ function actionButton(label, question, request, next, className = "danger") {
   } }, label);
 }
 
-async function deleteModel(version) {
-  const path = `/api/v1/model-versions/${encodeURIComponent(version)}`;
+const CASCADEABLE = new Set(["training_runs", "evaluations", "tasks"]);
+
+// MODEL_IN_USE only by ended runs, evaluations and trials, which ?cascade_training_runs=true deletes too.
+function cascadeable(error) {
+  const references = error.detail?.references;
+  return error.code === "MODEL_IN_USE" && references && Object.keys(references).every((key) => CASCADEABLE.has(key));
+}
+
+function referenceText({ references, training_run_ids: ids = [], evaluation_ids: evaluationIds = [] }) {
+  const runText = references.training_runs ? `${references.training_runs} 个训练实验` : "";
+  const evalText = references.evaluations ? `${references.evaluations} 个评测` : "";
+  const taskText = references.tasks ? `${references.tasks} 个 trial` : "";
+  const related = [runText, evalText, taskText].filter(Boolean).join("、");
+  const listedRuns = ids.length ? `训练实验：${ids.map(fmt.short).join("、")}` : "";
+  const listedEvaluations = evaluationIds.length ? `评测：${evaluationIds.map(fmt.short).join("、")}` : "";
+  const listed = [listedRuns, listedEvaluations].filter(Boolean).join("；");
+  return `被 ${related} 引用${listed ? `（${listed}）` : ""}`;
+}
+
+// Deletes one version at a time (cascades lock shared runs): one confirmation up front, one more listing
+// versions whose ended runs / evaluations / trials go with them. A version still loaded in the model
+// service is taken offline first, and loaded again if it ends up kept.
+async function deleteModels(versions, { what, runId = null, loaded = [] }) {
+  if (modelUi.busy) return;
   try {
-    await api(path, { method: "DELETE" });
-  } catch (error) {
-    const references = error.detail?.references;
-    const cascadeable = new Set(["training_runs", "evaluations", "tasks"]);
-    if (error.code !== "MODEL_IN_USE" || !references || Object.keys(references).some((key) => !cascadeable.has(key))) {
-      throw error;
+    const run = runId && (await api("/api/v1/training/runs")).find((r) => r.run_id === runId);
+    if (run && ["QUEUED", "RUNNING"].includes(run.status)) {
+      alert(`实验 ${fmt.short(runId)} 仍在运行，删除它的版本会中断训练；请先在训练实验页取消。`);
+      return;
     }
-    const ids = error.detail.training_run_ids || [];
-    const evaluationIds = error.detail.evaluation_ids || [];
-    const runText = references.training_runs ? `${references.training_runs} 个训练实验` : "";
-    const evalText = references.evaluations ? `${references.evaluations} 个评测` : "";
-    const taskText = references.tasks ? `${references.tasks} 个 trial` : "";
-    const related = [runText, evalText, taskText].filter(Boolean).join("、");
-    const listedRuns = ids.length ? `训练实验：${ids.map(fmt.short).join("、")}` : "";
-    const listedEvaluations = evaluationIds.length ? `评测：${evaluationIds.map(fmt.short).join("、")}` : "";
-    const listed = [listedRuns, listedEvaluations].filter(Boolean).join("；");
-    if (!confirm(`该模型被 ${related} 引用${listed ? `（${listed}）` : ""}。确认删除关联的已结束训练实验、评测、trial 和已结束任务及其指标和日志，并继续删除模型吗？`)) return;
-    await api(`${path}?cascade_training_runs=true`, { method: "DELETE" });
-  }
+    // Taking a loaded version offline would fail an evaluation that is still sampling from it.
+    const busy = loaded.length ? (await api("/api/v1/evaluations")).filter((ev) => ev.status === "RUNNING"
+      && (ev.model_versions || []).some((version) => loaded.includes(version))) : [];
+    if (busy.length) {
+      alert(`评测 ${busy.map((ev) => fmt.short(ev.eval_id)).join("、")} 正在使用这些版本；请等评测结束或先取消。`);
+      return;
+    }
+  } catch (error) { alert(`删除失败：${error.message}`); return; }
+  const unload = loaded.length ? `\n其中 ${loaded.join("、")} 已加载在模型服务中，会先下线。` : "";
+  if (!confirm(`删除${what}并清理受控 checkpoint？${unload}`)) return;
+  modelUi.busy = true;
+  const inUse = [], failed = [], offlined = new Set(), deleted = new Set();
+  const remove = async (version, query = "") => {
+    const path = `/api/v1/model-versions/${encodeURIComponent(version)}`;
+    try {
+      await api(`${path}${query}`, { method: "DELETE" });
+    } catch (error) {
+      if (error.code !== "MODEL_LOADED") throw error;
+      await api(`${path}/offline`, { method: "POST" });
+      offlined.add(version);
+      await api(`${path}${query}`, { method: "DELETE" });
+    }
+    deleted.add(version);
+  };
+  try {
+    for (const version of versions) {
+      try { await remove(version); } catch (error) { (cascadeable(error) ? inUse : failed).push([version, error]); }
+    }
+    const listed = inUse.map(([version, error]) => `${version} ${referenceText(error.detail)}`).join("\n");
+    if (inUse.length && confirm(`${inUse.length} 个版本仍有引用：\n${listed}\n\n确认删除关联的已结束训练实验、评测、trial 和已结束任务及其指标和日志，并继续删除吗？`)) {
+      for (const [version] of inUse) {
+        try { await remove(version, "?cascade_training_runs=true"); } catch (error) { failed.push([version, error]); }
+      }
+    }
+    for (const version of offlined) {
+      if (!deleted.has(version)) await api(`/api/v1/model-versions/${encodeURIComponent(version)}/online`, { method: "POST" }).catch(() => {});
+    }
+  } finally { modelUi.busy = false; }
+  if (failed.length) alert(`${failed.length} 个版本删除失败：\n${failed.map(([version, error]) => `${version}：${error.detail?.message || error.message}`).join("\n")}`);
+  route();
 }
 
 function runActions(run, next) {
@@ -262,6 +324,7 @@ async function resourcesPage() {
   const root = h("div");
   view.replaceChildren(pageHeading("SYSTEM OVERVIEW / 01", "资源总览", "实时查看节点心跳、GPU / KVM 能力、队列压力和当前 sandbox。"), root);
   await poll(async () => {
+    if (root.contains(document.activeElement) && ["SELECT", "INPUT"].includes(document.activeElement.tagName)) return;
     const [data, catalog] = await Promise.all([
       api("/api/v1/overview"),
       api("/api/v1/catalog"),
@@ -286,29 +349,97 @@ async function resourcesPage() {
       h("div", { class: "card" }, nodesTable(data.nodes)),
       h("h3", {}, "Sandbox"),
       h("div", { class: "card" }, sandboxTable(data.sandboxes)),
-      h("h3", {}, "模型 / checkpoint"),
-      h("div", { class: "card" }, modelTable(catalog.model_versions, model)),
+      modelSections(catalog.model_versions, model),
     );
   }, 5000);
 }
 
-function modelTable(models, service) {
+// Resources-page state that survives the 5 s re-render: expanded run groups, and a delete in progress.
+const modelUi = { expanded: new Set(), busy: false };
+
+// Models: one formal model per training run (plus imported and merged ones); the rest of a run's
+// versions are its checkpoints, and any of them can be switched in as the run's model.
+// LoRA and Checkpoint fold each run's versions under one row that can delete them all.
+function modelSections(versions, service) {
+  const byRun = new Map();
+  for (const m of versions) if (m.run_id) byRun.set(m.run_id, [...(byRun.get(m.run_id) || []), m]);
+  const models = versions.filter((m) => m.kind !== "checkpoint");
+  const box = h("div");
+  const section = (title, hint, rows, options = {}) => [
+    h("h3", {}, title, h("span", { class: "hint" }, hint)),
+    h("div", { class: "card" }, modelTable(rows, service, byRun, { noun: title, ...options, rerender: render })),
+  ];
+  const render = () => box.replaceChildren(
+    ...section("模型", "每个训练实验只有一个正式模型，可在 Checkpoint 列切换", models.filter((m) => !m.adapter)),
+    ...section("LoRA", "只含 adapter 权重；GRPO / GIGPO 和全参数训练需先合并", models.filter((m) => m.adapter), { grouped: true }),
+    ...section("Checkpoint", "训练中按保存间隔保留的中间模型；可评测，设为正式模型后进入上方模型 / LoRA 栏",
+      versions.filter((m) => m.kind === "checkpoint"), { checkpoints: true, grouped: true }),
+  );
+  render();
+  return box;
+}
+
+function checkpointName(m) {
+  return m.checkpoint_uri ? m.checkpoint_uri.split("/").pop() || m.checkpoint_uri : null;
+}
+
+function promote(m) {
+  return api(`/api/v1/model-versions/${encodeURIComponent(m.version)}/promote`, { method: "POST" });
+}
+
+// A run's model row picks which of the run's versions is formal; other rows just show the directory.
+// The pick shows the short directory name, underlined like the concurrency values; a click opens the full list.
+function checkpointCell(m, siblings) {
+  const live = (siblings || []).filter((s) => s.status !== "RETIRED");
+  const name = checkpointName(m);
+  if (live.length < 2) {
+    return name ? h("span", { class: "mono", title: m.checkpoint_uri }, fmt.short(name)) : h("span", { class: "muted" }, "无 checkpoint");
+  }
+  const value = h("button", { class: "stepper-value pick mono", title: `${m.checkpoint_uri || m.version}\n点击切换该实验的正式模型`,
+    onclick: (event) => { event.stopPropagation(); pick(); } }, fmt.short(name || m.version));
+  const pick = () => {
+    let open = true;
+    const close = () => { if (open) { open = false; select.replaceWith(value); } }; // removal can fire blur again
+    const select = h("select", { onclick: (event) => event.stopPropagation(), onblur: close,
+      onkeydown: (event) => { if (event.key === "Escape") close(); } },
+      live.map((s) => h("option", { value: s.version, selected: s.version === m.version }, `${checkpointName(s)} · ${s.version}`)));
+    select.addEventListener("change", async () => {
+      const chosen = live.find((s) => s.version === select.value);
+      close();
+      if (!confirm(`把实验 ${fmt.short(m.run_id)} 的正式模型切换为 ${chosen.version}？${m.version} 会移到 Checkpoint 栏。`)) return;
+      try { await promote(chosen); route(); } catch (error) { alert(`切换失败：${error.message}`); }
+    });
+    value.replaceWith(select);
+    select.focus();
+    try { select.showPicker(); } catch { /* No showPicker: the list is focused, one more click opens it. */ }
+  };
+  return h("span", { class: "stepper" }, value);
+}
+
+function modelTable(models, service, byRun, { checkpoints = false, grouped = false, noun = "模型", rerender = null } = {}) {
   const loaded = new Set(service.loaded_versions || []);
-  return table([
-    { label: "版本", render: (m) => h("span", { class: "mono" }, m.version) },
+  const offline = new Set(service.offline_versions || []);
+  const remove = (versions, what, runId) => deleteModels(versions, { what, runId, loaded: versions.filter((v) => loaded.has(v)) });
+  const columns = [
+    { label: "版本", render: (m) => h("div", { class: "row" }, h("span", { class: "mono" }, m.version),
+      m.adapter ? h("span", { class: "badge warning", title: ADAPTER_HINT }, "LoRA adapter") : null) },
     { label: "基础模型", render: (m) => m.base_model || "–" },
+    { label: "来源", render: (m) => (m.run_id ? h("a", { href: `#/runs/${m.run_id}`, onclick: (event) => event.stopPropagation() }, `实验 ${fmt.short(m.run_id)}`)
+      : m.metrics?.merged_from ? `合并自 ${m.metrics.merged_from}` : "导入") },
     { label: "注册状态", render: (m) => modelBadge(m.status) },
     { label: "运行状态", render: (m) => service.backend === "http"
-      ? (loaded.has(m.version) ? badge("READY") : h("span", { class: "muted" }, "未上线"))
+      ? (loaded.has(m.version) ? badge("READY")
+        : h("span", { class: "muted" }, offline.has(m.version) ? "已下线" : grouped ? "未加载" : "未上线"))
       : h("span", { class: "muted" }, "不适用") },
-    { label: "Checkpoint", render: (m) => {
-      if (!m.checkpoint_uri) return h("span", { class: "muted" }, "无 checkpoint");
-      const name = m.checkpoint_uri.split("/").pop() || m.checkpoint_uri;
-      return h("span", { class: "mono", title: m.checkpoint_uri }, name);
-    } },
+    { label: "Checkpoint", render: (m) => checkpointCell(m, checkpoints ? null : byRun.get(m.run_id)) },
     { label: "", render: (m) => {
       const buttons = [];
-      if (service.backend === "http" && m.status !== "RETIRED") {
+      if (checkpoints && m.status !== "RETIRED") buttons.push(actionButton(
+        "设为正式模型", `把 ${m.version} 设为实验 ${fmt.short(m.run_id)} 的正式模型？原正式模型会移到 Checkpoint 栏。`,
+        () => promote(m), undefined, "primary"));
+      // LoRA / Checkpoint rows have no 上线 / 下线: evaluations load them on demand, and 删除 takes a
+      // loaded version offline first.
+      if (service.backend === "http" && m.status !== "RETIRED" && !grouped) {
         const isOnline = loaded.has(m.version);
         buttons.push(actionButton(
           isOnline ? "下线" : "上线",
@@ -318,14 +449,73 @@ function modelTable(models, service) {
           isOnline ? "danger" : "primary",
         ));
       }
-      buttons.push(actionButton(
-        "删除",
-        `删除模型 ${m.version} 并清理受控 checkpoint？存在历史引用时操作会被拒绝。`,
-        () => deleteModel(m.version),
-      ));
+      if (service.backend === "http" && m.adapter && !checkpoints && m.status !== "RETIRED") {
+        buttons.push(h("button", { title: ADAPTER_HINT, onclick: (event) => { event.stopPropagation(); mergeModel(m); } }, "合并完整权重"));
+      }
+      if (!m.protected) buttons.push(h("button", { class: "danger", onclick: (event) => {
+        event.stopPropagation();
+        remove([m.version], `${noun} ${m.version}`, m.run_id);
+      } }, "删除"));
       return h("div", { class: "row" }, buttons);
     } },
-  ], models);
+  ];
+  if (!grouped) return table(columns, models);
+  const deleteAll = (rows) => {
+    const versions = rows.filter((m) => !m.protected).map((m) => m.version);
+    return versions.length ? h("button", { class: "danger", onclick: (event) => {
+      event.stopPropagation();
+      remove(versions, `实验 ${fmt.short(rows[0].run_id)} 的全部 ${versions.length} 个 ${noun}`, rows[0].run_id);
+    } }, "全部删除") : null;
+  };
+  return groupedTable(columns, models, rerender, deleteAll);
+}
+
+// Each training run's versions fold under one header row (collapsed by default) with a delete-all button.
+function groupedTable(columns, models, rerender, deleteAll) {
+  const row = (m, child = false) => h("tr", { class: child ? "group-child" : "" }, columns.map((c) => h("td", {}, c.render(m))));
+  const groups = new Map();
+  for (const m of models) {
+    const key = m.run_id ? `run:${m.run_id}` : `version:${m.version}`;
+    groups.set(key, [...(groups.get(key) || []), m]);
+  }
+  const body = [...groups].flatMap(([key, rows]) => {
+    if (!rows[0].run_id) return [row(rows[0])];
+    const open = modelUi.expanded.has(key);
+    const names = rows.map(checkpointName).filter(Boolean);
+    const range = names.length > 1 ? ` · ${names[0]} … ${names[names.length - 1]}` : names.length ? ` · ${names[0]}` : "";
+    const toggle = () => {
+      if (open) modelUi.expanded.delete(key); else modelUi.expanded.add(key);
+      rerender();
+    };
+    return [
+      h("tr", { class: "clickable group", onclick: toggle },
+        h("td", { colSpan: columns.length - 1 }, h("div", { class: "row" },
+          // Enter / Space click the button; the click bubbles to the row's toggle.
+          h("button", { class: "caret", "aria-expanded": String(open), "aria-label": open ? "折叠" : "展开" }, open ? "▾" : "▸"),
+          h("a", { href: `#/runs/${rows[0].run_id}`, onclick: (event) => event.stopPropagation() }, `实验 ${fmt.short(rows[0].run_id)}`),
+          h("span", { class: "muted" }, `${rows.length} 个版本${range}`))),
+        h("td", {}, deleteAll(rows))),
+      ...(open ? rows.map((m) => row(m, true)) : []),
+    ];
+  });
+  return h("table", {},
+    h("thead", {}, h("tr", {}, columns.map((c) => h("th", {}, c.label)))),
+    h("tbody", {}, body.length ? body : h("tr", {}, h("td", { colSpan: columns.length, class: "muted" }, "暂无数据"))));
+}
+
+async function mergeModel(m) {
+  const target = prompt(
+    `把 ${m.version} 的 LoRA adapter 合并进基础模型，注册为新的完整权重模型。\n`
+    + "合并在 4090 模型服务的 CPU 上进行，约需 1–3 分钟，不影响正在进行的推理。\n"
+    + "BF16 合并可能改变输出，用于训练或评测前请先与原 adapter 对比 validation 输出。\n\n新模型名：",
+    `${m.version}-merged`);
+  if (target === null) return;
+  try {
+    const merged = await api(`/api/v1/model-versions/${encodeURIComponent(m.version)}/merge`, {
+      method: "POST", body: JSON.stringify({ target_version: target.trim() }) });
+    alert(`已注册 ${merged.version}\n${merged.checkpoint_uri}`);
+    route();
+  } catch (error) { alert(`合并失败：${error.message}`); }
 }
 
 function nodesTable(nodes) {
@@ -335,8 +525,69 @@ function nodesTable(nodes) {
     { label: "状态", render: (n) => badge(n.status) },
     { label: "资源", render: (n) => (n.role === "gpu" ? gpuCell(n.resources) : hostCell(n.resources)) },
     { label: "Sandbox", num: true, render: (n) => (n.role === "gpu" ? (n.resources.active_run ? fmt.short(n.resources.active_run) : "空闲") : `${n.active_sandboxes} / ${n.capacity.sandboxes ?? "?"}`) },
+    { label: "并发设置", render: concurrencyCell },
     { label: "最近心跳", render: (n) => fmt.time(n.last_heartbeat_at) },
   ], nodes);
+}
+
+const CONCURRENCY = { sandboxes: "Sandbox", training_runs: "训练", evaluations: "评测推理" };
+const CEILING_PARTS = { platform: "平台", cpu: "CPU", memory: "内存", network: "网络地址" };
+
+// Why the ceiling is what it is, so the user knows what raising it would take.
+function ceilingReason(node, key) {
+  const parts = node.resources.sandbox_ceiling;
+  if (key === "sandboxes" && parts) {
+    const known = Object.entries(parts).filter(([, v]) => v !== null && v !== undefined);
+    return `按每个 sandbox 的配额估算：${known.map(([k, v]) => `${CEILING_PARTS[k] || k} ${v}`).join("、")}，取最小值`;
+  }
+  return "由节点启动参数设定（H800 为 launcher 的 --max-runs / --max-serving，队列配额无法读取）";
+}
+
+function concurrencyCell(node) {
+  const keys = Object.keys(CONCURRENCY).filter((key) => node.capacity[key] !== undefined);
+  if (!keys.length) return h("span", { class: "muted" }, "–");
+  return h("div", {}, keys.map((key) => {
+    const max = node.capacity[`max_${key}`];
+    const label = CONCURRENCY[key];
+    if (typeof max !== "number") return h("div", { class: "secondary" }, `${label} ${node.capacity[key]}（不可调）`);
+    return h("div", { class: "row", title: `${ceilingReason(node, key)}。\n调低不会中断运行中的任务，只是暂停接收新任务；约 10 秒内生效。` },
+      h("span", { class: "stepper" }, label, concurrencyStepper(node, key, max)),
+      h("span", { class: "muted" }, `上限 ${max}`));
+  }));
+}
+
+// The current value; clicking it opens a number input (Enter/blur saves, Esc cancels).
+function concurrencyStepper(node, key, max) {
+  let value = node.capacity[key];
+  const num = h("button", { class: "stepper-value", title: "点击修改", onclick: () => edit() }, value);
+  const set = async (next) => {
+    if (next === value) return;
+    if (!Number.isInteger(next) || next < 1 || next > max) { alert(`请输入 1–${max} 的整数`); return; }
+    num.disabled = true; // one request at a time so changes can't land out of order
+    try {
+      const result = await api(`/api/v1/nodes/${encodeURIComponent(node.node_id)}/limits`, {
+        method: "PUT", body: JSON.stringify({ [key]: next }) });
+      value = result.capacity[key];
+      num.textContent = value;
+    } catch (error) { alert(`调整失败：${error.message}`); }
+    num.disabled = false;
+  };
+  const edit = () => {
+    let done = false;
+    const finish = (commit) => {
+      if (done) return; // Enter removes the input, which can fire blur again
+      done = true;
+      input.replaceWith(num);
+      if (commit && input.value !== "") set(Number(input.value));
+    };
+    const input = h("input", { type: "number", min: 1, max, value, class: "stepper-input",
+      onkeydown: (event) => { if (event.key === "Enter") finish(true); else if (event.key === "Escape") finish(false); },
+      onblur: () => finish(true) });
+    num.replaceWith(input);
+    input.focus();
+    input.select();
+  };
+  return num;
 }
 
 function meter(fraction) {
@@ -390,7 +641,9 @@ const METRIC_LABELS = {
   "rollout/reward_std": ["每轮 reward 标准差", "round"],
   "rollout/mean_steps": ["每轮平均步数", "round"],
   "rollout/zero_variance_groups": ["零方差组数（无梯度）", "round"],
+  "rollout/entropy": ["每轮采样熵 nats/token（按采样 temperature / top-k / top-p）", "round", (v) => fmt.num(v, 3)],
   "train/loss": ["loss", "update"],
+  "train/entropy": ["策略熵 nats/token（训练样本，temperature 1）", "update", (v) => fmt.num(v, 3)],
   "train/grad_norm": ["梯度范数", "update"],
   "train/ratio": ["策略比 ratio", "update"],
   "train/clipped": ["是否被 clip", "update"],
@@ -404,15 +657,28 @@ function algorithmLabel(algorithm) {
   return algorithm === "gigpo" ? "GIGPO（GRPO 兼容版）" : algorithm.toUpperCase();
 }
 
+// Config knobs each algorithm consumes; the form shows and submits only these.
+const SHARED_KNOBS = ["accelerator", "learning_rate", "epochs", "gradient_accumulation", "gradient_checkpointing", "max_steps", "checkpoint_every", "eval_trials", "seed"];
+const ALGORITHM_KNOBS = {
+  sft: ["finetuning_method", "train_merger_mlp", "multiview", "output_format", "batch_size", "cache_preprocessed", ...SHARED_KNOBS],
+  grpo: ["rounds", "tasks_per_round", "group_size", "temperature", "clip_epsilon", ...SHARED_KNOBS],
+};
+ALGORITHM_KNOBS.gigpo = ALGORITHM_KNOBS.grpo;
+
+// Set by "复用配置" on a run detail page and consumed by the next runs page render.
+let pendingRecipe = null;
+
 async function runsPage() {
   const catalog = await api("/api/v1/catalog");
   const list = h("div", { class: "card" });
+  const form = runForm(catalog);
   view.replaceChildren(
-    pageHeading("TRAINING LAB / 02", "训练实验", "配置在线 rollout、选择 runtime，并跟踪 reward、梯度和产出 checkpoint。"),
-    runForm(catalog),
+    pageHeading("TRAINING LAB / 03", "训练实验", "配置在线 rollout、选择 runtime，并跟踪 reward、梯度和产出 checkpoint。"),
+    form,
     h("h3", {}, "实验列表"),
     list,
   );
+  if (pendingRecipe) { form.load(pendingRecipe); pendingRecipe = null; }
   await poll(async () => {
     const runs = await api("/api/v1/training/runs");
     list.replaceChildren(table([
@@ -420,7 +686,7 @@ async function runsPage() {
       { label: "算法", render: (r) => algorithmLabel(r.algorithm) },
       { label: "Runtime", render: (r) => r.runtime_backend || "unknown" },
       { label: "基础模型", key: "base_model" },
-      { label: "数据", render: (r) => r.dataset_version || (r.config.tasks || []).map((t) => t.app_image).join(", ") || "–" },
+      { label: "数据", render: (r) => runData(r) || "–" },
       { label: "状态", render: (r) => badge(r.status) },
       { label: "reward 均值", num: true, render: (r) => fmt.num(r.metrics["rollout/reward_mean"] ?? r.metrics.reward_mean) },
       { label: "产出模型", render: (r) => r.metrics.model_version || "–" },
@@ -428,6 +694,14 @@ async function runsPage() {
       { label: "", render: (r) => runActions(r) },
     ], runs, (r) => { location.hash = `#/runs/${r.run_id}`; }));
   }, 5000);
+}
+
+function runData(run) {
+  return run.dataset_version || run.config.train_set || (run.config.tasks || []).map((t) => t.app_image).join(", ");
+}
+
+function taskSetLabel(set) {
+  return `${set.label}（${set.tasks.length} 题）`;
 }
 
 function field(label, input, hint) {
@@ -443,52 +717,64 @@ function runForm(catalog) {
   const runtimeBackends = catalog.runtime_backends || [catalog.runtime_backend || "firecracker"];
   const defaultBackend = catalog.runtime_backend || runtimeBackends[0];
   const message = h("div");
+  const onlineSets = h("optgroup", { label: "在线题目集" }, catalog.task_sets.map((s) => h(
+    "option", { value: `set:${s.name}`, selected: s.name === "sokoban-train" }, taskSetLabel(s))));
   const inputs = {
     algorithm: h("select", {},
       h("option", { value: "grpo" }, "GRPO（在线 rollout）"),
       h("option", { value: "gigpo" }, "GIGPO（GRPO 兼容版）"),
       h("option", { value: "sft" }, "SFT（离线数据集）")),
+    accelerator: h("select", {}, h("option", { value: "h800" }, "H800（按需创建 Pod，可并行）"), h("option", { value: "4090" }, "4090（常驻，单任务）")),
     finetuning_method: h("select", {}, h("option", { value: "full" }, "全参数"), h("option", { value: "lora" }, "LoRA（仅 SFT，FP32 adapter）")),
+    train_merger_mlp: h("input", { type: "checkbox" }),
+    multiview: h("input", { type: "checkbox" }),
     output_format: h("select", {}, h("option", { value: "action-v1" }, "动作 JSON"), h("option", { value: "sokoban-plan-v1" }, "推箱子：棋盘 / 决策 / 动作")),
     runtime_backend: h("select", {}, runtimeBackends.map((backend) => h(
       "option", { value: backend, selected: backend === defaultBackend }, runtimeLabel(backend)))),
-    base_model: h("select", {}, models.map((m) => h("option", { value: m.version }, m.version))),
+    base_model: h("select", {}, modelOptions(models, (m) => h("option", { value: m.version, title: m.adapter ? ADAPTER_HINT : null },
+      m.adapter ? `${m.version}（LoRA adapter，仅可 LoRA SFT）` : m.version))),
     model_name: h("input", { type: "text", maxlength: 100, pattern: "[A-Za-z0-9][A-Za-z0-9._-]*", placeholder: "例如 sokoban-grpo" }),
-    dataset_version: h("select", {}, h("option", { value: "" }, "不使用（在线 rollout）"), catalog.datasets.map((d) => h("option", { value: d.dataset_version }, `${d.dataset_version}（${d.sample_count} 条）`))),
+    data: h("select", { required: true }, h("option", { value: "" }, "请选择"), onlineSets,
+      h("optgroup", { label: "离线轨迹数据集" }, catalog.datasets.map((d) => h(
+        "option", { value: `ds:${d.dataset_version}` }, `${d.dataset_version}（${d.sample_count} 条）`)))),
+    eval_set: h("select", {}, catalog.task_sets.filter((s) => s.tasks.length <= 8).map((s) => h(
+      "option", { value: s.name, selected: s.name === "sokoban-validation" }, taskSetLabel(s)))),
     rounds: h("input", { type: "number", min: 1, max: 20, value: 2 }),
+    tasks_per_round: h("input", { type: "number", min: 1, max: 16, value: 4 }),
     group_size: h("input", { type: "number", min: 2, max: 16, value: 4 }),
     temperature: h("input", { type: "number", min: 0, max: 2, step: 0.1, value: 1.0 }),
     max_steps: h("input", { type: "number", min: 1, max: 50, value: 3 }),
     learning_rate: h("input", { type: "number", min: 1e-9, max: 1e-3, step: "any", value: 1e-7 }),
     epochs: h("input", { type: "number", min: 1, max: 10, value: 1 }),
     gradient_accumulation: h("input", { type: "number", min: 1, max: 64, value: 1 }),
+    batch_size: h("input", { type: "number", min: 1, max: 16, value: 1 }),
+    cache_preprocessed: h("input", { type: "checkbox" }),
+    gradient_checkpointing: h("input", { type: "checkbox", checked: true }),
     clip_epsilon: h("input", { type: "number", min: 0.01, max: 1, step: 0.01, value: 0.2 }),
     eval_trials: h("input", { type: "number", min: 0, max: 50, value: 4 }),
+    checkpoint_every: h("input", { type: "number", min: 1, max: 100, value: 5, placeholder: "只保留正式模型" }),
     seed: h("input", { type: "number", value: 0 }),
   };
-  const taskSelect = h("select", {}, catalog.tasks.map((t, i) => h(
-    "option", { value: i }, `${t.label}（${t.app_image}）`)));
+  const knobLabels = {};
+  const knob = (key, label, hint) => (knobLabels[key] = field(label, inputs[key], hint));
   const submit = h("button", { class: "primary", type: "submit", disabled: !models.length }, "创建实验");
   const form = h("form", { class: "form", onsubmit: async (event) => {
     event.preventDefault();
-    const task = catalog.tasks[taskSelect.value];
-    const tasks = task ? [{ task_type: task.task_type, app_image: task.app_image }] : [];
-    const num = (k) => Number(inputs[k].value);
+    const data = inputs.data.value;
     const backend = inputs.runtime_backend.value;
+    const knobs = ALGORITHM_KNOBS[inputs.algorithm.value].filter((key) => !inputs[key].disabled).map((key) => {
+      const input = inputs[key];
+      return [key, input.type === "number" ? (input.value === "" ? null : Number(input.value)) : input.type === "checkbox" ? input.checked : input.value];
+    });
     const body = {
       algorithm: inputs.algorithm.value,
       base_model: inputs.base_model.value,
-      dataset_version: inputs.dataset_version.value || null,
+      dataset_version: data.startsWith("ds:") ? data.slice(3) : null,
       environment_version: `android-${backend}-v1`,
       reward_version: "android-task-v1",
       runtime_backend: backend,
-      config: {
-        model_name: inputs.model_name.value.trim() || null,
-        finetuning_method: inputs.finetuning_method.value, output_format: inputs.output_format.value,
-        rounds: num("rounds"), group_size: num("group_size"), temperature: num("temperature"), max_steps: num("max_steps"),
-        learning_rate: num("learning_rate"), epochs: num("epochs"), gradient_accumulation: num("gradient_accumulation"),
-        clip_epsilon: num("clip_epsilon"), eval_trials: num("eval_trials"), seed: num("seed"), tasks,
-      },
+      config: { model_name: inputs.model_name.value.trim() || null, ...Object.fromEntries(knobs),
+        train_set: data.startsWith("set:") ? data.slice(4) : null, eval_set: inputs.eval_set.value },
     };
     submit.disabled = true;
     try {
@@ -499,20 +785,76 @@ function runForm(catalog) {
     } finally { submit.disabled = false; }
   } },
   field("算法", inputs.algorithm, "GIGPO 当前复用 GRPO 更新，不含论文 GiGPO 的步骤级分组"),
+  knob("accelerator", "训练资源", "H800 每个实验独立 Pod，可并行，checkpoint 复制到 4090；在线 GRPO 每轮在 H800 训练、同步到 4090 后采样"),
   field("Runtime", inputs.runtime_backend, "由当前服务配置的 runtime worker 执行；Docker 不支持快照"),
-  field("基础模型 / checkpoint", inputs.base_model, models.length ? "可以选择已有 checkpoint 继续训练" : "尚未注册模型，请先运行 import_artifacts"),
+  field("基础模型", inputs.base_model, models.length ? "也可以选择 checkpoint 继续训练" : "尚未注册模型，请先运行 import_artifacts"),
   field("模型产物名称", inputs.model_name, "可选；只允许字母、数字、点、下划线和短横线，round 会自动追加版本后缀"),
-  field("数据集", inputs.dataset_version, "SFT 必选；GRPO / GIGPO 不选时在线采样"),
-  field("微调方式", inputs.finetuning_method, "LoRA 仅支持 SFT；rank=16 / alpha=32，语言侧注意力层"),
-  field("输出协议", inputs.output_format, "必须与数据集一致；结构化协议仅支持 SFT，执行器仍只执行 action"),
-  field("训练任务", taskSelect, "GRPO / GIGPO 在线采样与训练后自动评测；单选"),
-  field("轮数", inputs.rounds), field("每组 rollout 数 (group size)", inputs.group_size),
-  field("采样 temperature", inputs.temperature, "组内需要 reward 差异，建议 ≥ 0.7"), field("每条 rollout 最大步数", inputs.max_steps),
-  field("学习率", inputs.learning_rate, "1e-5 曾破坏输出格式，默认 1e-7"), field("epochs", inputs.epochs),
-  field("梯度累积", inputs.gradient_accumulation), field("clip ε", inputs.clip_epsilon),
-  field("训练后每任务评测次数", inputs.eval_trials, "0 表示不自动评测"), field("随机 seed", inputs.seed),
+  field("数据集", inputs.data, "GRPO / GIGPO 选题目集时每轮抽题在线 rollout，选轨迹数据集时离线训练；SFT 只能选轨迹数据集。详见数据管理"),
+  knob("finetuning_method", "微调方式", "LoRA：rank=16 / alpha=32，语言侧注意力层"),
+  knob("train_merger_mlp", "全量训练视觉 merger", "仅 LoRA；额外全量训练视觉-语言投影层（MiniCPM-V：model.merger.mlp.0，约 2,597 万参数；Qwen3-VL：model.visual.merger）"),
+  knob("multiview", "双视图输入", "完整截图 + 棋盘裁剪；推理按 checkpoint 配置自动使用"),
+  knob("output_format", "输出协议", "必须与数据集一致；执行器仍只执行 action"),
+  field("评测题目集", inputs.eval_set, "训练后自动评测用，最多 8 题；应与训练题目集不同，否则测不出泛化"),
+  knob("rounds", "轮数"),
+  knob("tasks_per_round", "每轮题目数", "按 seed 洗牌后依次取题，全部做完一遍才会重复；每轮 rollout 数 = 题目数 × group size"),
+  knob("group_size", "每组 rollout 数 (group size)"),
+  knob("temperature", "采样 temperature", "组内需要 reward 差异，建议 ≥ 0.7"), knob("max_steps", "每条 rollout 最大步数"),
+  knob("learning_rate", "学习率", "1e-5 曾破坏输出格式，默认 1e-7"), knob("epochs", "epochs"),
+  knob("gradient_accumulation", "梯度累积", "有效 batch = micro-batch × 梯度累积"), knob("clip_epsilon", "clip ε"),
+  knob("batch_size", "micro-batch", "H800 加速配置为 4（配合梯度累积 1）；需确认显存"),
+  knob("cache_preprocessed", "缓存预处理输入", "CPU 内存换速度；333 条双视图约需 10 GiB 以上"),
+  knob("gradient_checkpointing", "梯度检查点", "关闭更快但显存更高；H800 加速配置为关闭"),
+  knob("checkpoint_every", "checkpoint 保存间隔", "GRPO / GIGPO 每 N 轮、SFT 每 N 个 epoch 保留一个 checkpoint；最后一个总是正式模型；留空只保留正式模型"),
+  knob("eval_trials", "训练后每任务评测次数", "0 表示不自动评测"), knob("seed", "随机 seed"),
   h("div", { class: "wide row" }, submit, message));
-  return h("details", { class: "card" }, h("summary", {}, "新建训练实验"), h("div", { style: "margin-top:12px" }, form));
+  const syncAlgorithm = () => {
+    const visible = new Set(ALGORITHM_KNOBS[inputs.algorithm.value]);
+    if (inputs.finetuning_method.value !== "lora") visible.delete("train_merger_mlp");
+
+    // Disabled controls skip validation, so a hidden knob can never block submit.
+    for (const [key, label] of Object.entries(knobLabels)) label.hidden = inputs[key].disabled = !visible.has(key);
+    onlineSets.disabled = inputs.algorithm.value === "sft";
+    if (inputs.data.selectedOptions[0]?.parentElement.disabled) inputs.data.value = "";
+  };
+  inputs.algorithm.addEventListener("change", syncAlgorithm);
+  inputs.finetuning_method.addEventListener("change", syncAlgorithm);
+  // Default the evaluation set to the held-out split of the chosen pool, else the pool itself.
+  inputs.data.addEventListener("change", () => {
+    const name = inputs.data.value.startsWith("set:") ? inputs.data.value.slice(4) : null;
+    const evalName = name === "sokoban-train" ? "sokoban-validation" : name;
+    if ([...inputs.eval_set.options].some((option) => option.value === evalName)) inputs.eval_set.value = evalName;
+  });
+  syncAlgorithm();
+  const details = h("details", { class: "card" }, h("summary", {}, "新建训练实验"), h("div", { style: "margin-top:12px" }, form));
+  details.load = (run) => {
+    // Runs created before task sets stored a single task in config.tasks, used for training and evaluation.
+    const legacy = (run.config.tasks || []).length === 1 ? run.config.tasks[0].app_image : null;
+    const trainSet = run.config.train_set ?? legacy;
+    const wanted = { algorithm: run.algorithm, base_model: run.base_model,
+      data: run.dataset_version ? `ds:${run.dataset_version}` : trainSet && `set:${trainSet}`,
+      runtime_backend: run.runtime_backend, accelerator: "4090", ...run.config, eval_set: run.config.eval_set ?? legacy };
+    const missing = [];
+    for (const [key, value] of Object.entries(wanted)) {
+      if (!inputs[key] || key === "model_name" || value === undefined) continue;
+      // Blank is meaningful only where the input says so (placeholder); elsewhere keep the default.
+      if (value === null) { if (inputs[key].placeholder) inputs[key].value = ""; continue; }
+      const input = inputs[key];
+      if (input.type === "checkbox") { input.checked = Boolean(value); continue; }
+      input.value = value;
+      if (input.type === "number" ? Number(input.value) !== Number(value) : input.value !== String(value)) {
+        missing.push(`${key}=${value}`);
+      }
+    }
+    // A reused name would collide with the earlier run's registered version.
+    inputs.model_name.value = "";
+    syncAlgorithm();
+    message.replaceChildren(h("p", { class: missing.length ? "error-text" : "muted" }, missing.length
+      ? `已载入 ${fmt.short(run.run_id)} 的配置，以下项当前不可用，请重新选择：${missing.join("，")}`
+      : `已载入 ${fmt.short(run.run_id)} 的配置，模型产物名称已清空`));
+    details.open = true;
+    details.scrollIntoView({ behavior: "smooth" });
+  };
+  return details;
 }
 
 async function runDetailPage(runId) {
@@ -535,8 +877,11 @@ async function runDetailPage(runId) {
       h("div", { class: "card" }, h("dl", { class: "kv" },
         h("dt", {}, "基础模型"), h("dd", {}, run.base_model),
         h("dt", {}, "Runtime"), h("dd", {}, run.runtime_backend || "unknown"),
-        h("dt", {}, "数据"), h("dd", {}, run.dataset_version || (run.config.tasks || []).map((t) => `${t.task_type}/${t.app_image}`).join(", ")),
-        h("dt", {}, "配置"), h("dd", { class: "mono" }, JSON.stringify({ ...run.config, tasks: undefined })),
+        h("dt", {}, "数据"), h("dd", {}, runData(run) || "–"),
+        h("dt", {}, "评测题目"), h("dd", {}, run.config.eval_set || (run.config.eval_tasks?.length ? run.config.eval_tasks : run.config.tasks || []).map((t) => t.app_image).join(", ") || "–"),
+        h("dt", {}, "配置"), h("dd", {}, h("div", { class: "row" },
+          h("span", { class: "mono" }, JSON.stringify({ ...run.config, tasks: undefined, eval_tasks: undefined })),
+          h("button", { onclick: () => { pendingRecipe = run; location.hash = "#/runs"; } }, "复用配置"))),
         h("dt", {}, "创建 / 更新"), h("dd", {}, `${fmt.time(run.created_at)} / ${fmt.time(run.updated_at)}`),
         h("dt", {}, "产出模型"), h("dd", {}, run.metrics.model_version || "–"),
         h("dt", {}, "checkpoint"), h("dd", { class: "mono" }, run.checkpoint_uri || "–"),
@@ -579,9 +924,37 @@ function rolloutBrowser(rollouts) {
           { label: "结果", render: (r) => badge(r.outcome) },
           { label: "reward", num: true, render: (r) => fmt.num(r.reward_total) },
           { label: "步数", num: true, key: "steps" },
+          { label: "尝试", num: true, render: (r) => (r.attempts > 1 ? h("span", { title: "运行错误后用同一 seed 重跑" }, `${r.attempts} 次`) : "1") },
           { label: "动作序列", render: (r) => (r.step_records || []).map((s) => describeAction(s.action)).join(" → ") || r.error || "–" },
         ], members, (r) => { location.hash = `#/episodes/${r.episode_id}`; }));
     }))));
+}
+
+// ---------------------------------------------------------------- data
+
+async function dataPage() {
+  const catalog = await api("/api/v1/catalog");
+  view.replaceChildren(
+    pageHeading("DATA REGISTRY / 02", "数据管理", "SFT 使用离线轨迹数据集；GRPO / GIGPO 每轮从题目集抽题在线 rollout，训练后在评测题目集上自动评测。"),
+    h("h3", {}, "离线轨迹数据集"),
+    h("div", { class: "card" }, table([
+      { label: "版本", render: (d) => h("span", { class: "mono" }, d.dataset_version) },
+      { label: "schema", key: "schema_version" },
+      { label: "样本数", num: true, render: (d) => fmt.num(d.sample_count, 0) },
+      { label: "来源", render: (d) => h("span", { class: "mono" }, d.source) },
+      { label: "注册时间", render: (d) => fmt.time(d.created_at) },
+    ], catalog.datasets)),
+    h("h3", {}, "题目集"),
+    h("div", { class: "card" },
+      h("p", { class: "muted" }, "单次评测最多 8 题，更大的题目集只能用于训练；训练和评测应选不同 split，避免在训练题上评测。"),
+      table([
+        { label: "名称", render: (s) => h("span", { class: "mono" }, s.name) },
+        { label: "说明", key: "label" },
+        { label: "用途", render: (s) => (s.tasks.length <= 8 ? "训练 / 评测" : "训练") },
+        { label: "题目", render: (s) => h("details", {}, h("summary", {}, `${s.tasks.length} 题`),
+          h("div", { class: "mono" }, s.tasks.map((t) => t.app_image).join(", "))) },
+      ], catalog.task_sets)),
+  );
 }
 
 // ---------------------------------------------------------------- evaluations
@@ -589,7 +962,7 @@ function rolloutBrowser(rollouts) {
 async function evaluationsPage() {
   const catalog = await api("/api/v1/catalog");
   const list = h("div", { class: "card" });
-  view.replaceChildren(pageHeading("EVALUATION DECK / 03", "模型评测", "用相同任务、seed 和 runtime 对比基础模型与训练产出，结果可回放、可追溯。"), evalForm(catalog), h("h3", {}, "评测记录"), list);
+  view.replaceChildren(pageHeading("EVALUATION DECK / 04", "模型评测", "用相同任务、seed 和 runtime 对比基础模型与训练产出，结果可回放、可追溯。"), evalForm(catalog), h("h3", {}, "评测记录"), list);
   await poll(async () => {
     const rows = await api("/api/v1/evaluations");
     list.replaceChildren(table([
@@ -597,6 +970,7 @@ async function evaluationsPage() {
         h("a", { href: `#/evaluations/${e.eval_id}` }, e.name || fmt.short(e.eval_id)),
         h("div", { class: "muted mono" }, fmt.short(e.eval_id))) },
       { label: "Runtime", render: (e) => e.runtime_backend || "unknown" },
+      { label: "推理", render: (e) => inferenceLabel(e) },
       { label: "模型", render: (e) => e.model_versions.join(" vs ") },
       { label: "任务", render: (e) => e.task_set.map((t) => t.app_image).join(", ") },
       { label: "状态", render: (e) => badge(e.status) },
@@ -616,10 +990,24 @@ function evalForm(catalog) {
   const name = h("input", { type: "text", maxlength: 100, placeholder: "例如 sokoban-baseline" });
   const runtimeBackend = h("select", {}, runtimeBackends.map((backend) => h(
     "option", { value: backend, selected: backend === defaultBackend }, runtimeLabel(backend))));
-  const modelBoxes = models.map((m, i) => h("input", { type: "checkbox", value: m.version, checked: i === models.length - 1 }));
-  const taskSelect = h("select", {}, catalog.tasks.map((t, i) => h("option", { value: i }, `${t.label}（${t.app_image}）`)));
+  const accelerator = h("select", {}, h("option", { value: "4090" }, "4090（常驻模型服务）"),
+    h("option", { value: "h800" }, "H800（按需部署所选模型）"));
+  const formal = models.filter((m) => m.kind !== "checkpoint");
+  const modelBoxes = models.map((m) => h("input", { type: "checkbox", value: m.version, checked: m === formal[formal.length - 1] }));
+  const boxes = (rows) => h("div", { class: "checks" }, rows.map((m) => h("label", {}, modelBoxes[models.indexOf(m)], modelLabel(m))));
+  const checkpoints = models.filter((m) => m.kind === "checkpoint");
+  // A single evaluation takes at most 8 tasks, so the 48-level training set is not offered.
+  const evalSets = catalog.task_sets.filter((s) => s.tasks.length <= 8);
+  const taskSelect = h("select", {},
+    h("optgroup", { label: "单个任务" }, catalog.tasks.map((t, i) => h("option", { value: `task:${i}` }, `${t.label}（${t.app_image}）`))),
+    evalSets.length ? h("optgroup", { label: "题目集" }, evalSets.map((s) => h("option", { value: `set:${s.name}` }, taskSetLabel(s)))) : null);
+  const selectedTasks = () => (taskSelect.value.startsWith("set:")
+    ? evalSets.find((s) => s.name === taskSelect.value.slice(4)).tasks
+    : [catalog.tasks[Number(taskSelect.value.slice(5))]]);
+  // Every task of a set shares its type's instruction (one Sokoban instruction for all levels).
+  const defaultInstruction = () => catalog.tasks.find((t) => t.task_type === selectedTasks()[0]?.task_type)?.instruction || "";
   const instruction = h("textarea", { value: catalog.tasks[0]?.instruction || "" });
-  taskSelect.addEventListener("change", () => { instruction.value = catalog.tasks[taskSelect.value].instruction; });
+  taskSelect.addEventListener("change", () => { instruction.value = defaultInstruction(); });
   const trials = h("input", { type: "number", min: 1, max: 50, value: 1 });
   const maxSteps = h("input", { type: "number", min: 1, max: 50, value: 5 });
   const temperature = h("input", { type: "number", min: 0, max: 2, step: 0.1, value: 0 });
@@ -629,14 +1017,14 @@ function evalForm(catalog) {
     event.preventDefault();
     const versions = modelBoxes.filter((b) => b.checked).map((b) => b.value);
     if (!versions.length) { message.replaceChildren(h("p", { class: "error-text" }, "至少选择一个模型")); return; }
-    const task = catalog.tasks[taskSelect.value];
     const body = {
       model_versions: versions,
-      tasks: [{ task_type: task.task_type, app_image: task.app_image, instruction: instruction.value.trim() || null }],
+      tasks: selectedTasks().map((t) => ({ task_type: t.task_type, app_image: t.app_image, instruction: instruction.value.trim() || null })),
       trials_per_task: Number(trials.value), max_steps: Number(maxSteps.value),
       temperature: Number(temperature.value), seed: Number(seed.value),
       name: name.value.trim() || null,
       runtime_backend: runtimeBackend.value,
+      accelerator: accelerator.value,
     };
     submit.disabled = true;
     try {
@@ -647,15 +1035,23 @@ function evalForm(catalog) {
     } finally { submit.disabled = false; }
   } },
   h("div", { class: "wide" }, h("div", { class: "secondary" }, "模型 / checkpoint（多选即为对比评测，所有模型使用相同 seed）"),
-    h("div", { class: "checks" }, models.map((m, i) => h("label", {}, modelBoxes[i], m.version)))),
+    boxes(formal),
+    checkpoints.length ? h("details", {}, h("summary", { class: "secondary" }, `Checkpoint（${checkpoints.length} 个）`), boxes(checkpoints)) : null),
   field("评测名称", name, "可选；不填写时自动生成名称"),
   field("Runtime", runtimeBackend, "Firecracker 使用 Android microVM；Docker 使用 Android 容器"),
-  field("任务", taskSelect),
-  field("每个模型的 trial 次数", trials, "选 1 次可实时观看单次执行；对比成功率建议 ≥ 20"),
+  field("推理资源", accelerator, "H800 为本次评测单独创建 Pod 并预加载所选模型，加载完成后 trial 才开始；评测结束自动删除"),
+  field("任务 / 题目集", taskSelect, "题目集的每一题都会跑；训练关卡 48 题超过单次评测上限 8 题，不能选"),
+  field("每题 trial 次数", trials, "temperature 为 0 时同一题重复 trial 结果基本相同，要增加样本请用题目集；对比成功率建议总 trial ≥ 20"),
   field("最大步数", maxSteps), field("temperature", temperature, "0 为贪心解码"), field("起始 seed", seed),
   h("label", { class: "wide" }, "指令（可修改）", instruction),
   h("div", { class: "wide row" }, submit, message));
-  return h("div", { class: "card" }, form);
+  return h("details", { class: "card" }, h("summary", {}, "新建模型评测"), h("div", { style: "margin-top:12px" }, form));
+}
+
+function inferenceLabel(ev) {
+  if (ev.accelerator !== "h800") return "4090";
+  if (ev.model_ready) return "H800（模型已就绪）";
+  return ev.status === "RUNNING" ? "H800（部署中）" : "H800";
 }
 
 function evalSummary(ev) {
@@ -689,7 +1085,7 @@ async function evaluationDetailPage(evalId) {
       h("div", { class: "row" }, h("h2", {}, ev.name || `评测 ${fmt.short(ev.eval_id)}`), badge(ev.status), h("div", { class: "spacer" }),
         evalActions(ev, "#/evaluations")),
       h("div", { class: "card" },
-        h("div", { class: "secondary" }, `Runtime ${ev.runtime_backend || "unknown"} · 任务 ${ev.task_set.map((t) => `${t.task_type}/${t.app_image}`).join(", ")} · 每模型 ${ev.trials_per_task} 次 · 最多 ${ev.max_steps} 步 · temperature ${ev.temperature} · seeds ${ev.seeds.join(", ")}`),
+        h("div", { class: "secondary" }, `Runtime ${ev.runtime_backend || "unknown"} · 推理 ${inferenceLabel(ev)} · 任务 ${ev.task_set.map((t) => `${t.task_type}/${t.app_image}`).join(", ")} · 每模型 ${ev.trials_per_task} 次 · 最多 ${ev.max_steps} 步 · temperature ${ev.temperature} · seeds ${ev.seeds.join(", ")}`),
         evalSummary(ev)),
       h("h3", {}, "每次 trial"),
       h("div", { class: "card" }, table([
@@ -746,6 +1142,7 @@ async function episodeView(episodeId) {
           h("dt", {}, "动作"), h("dd", {}, describeAction(s.action)),
           h("dt", {}, "模型输出"), h("dd", { class: "mono" }, modelOutput(s.model_output?.raw_output)),
           h("dt", {}, "延迟"), h("dd", {}, fmt.ms(s.model_output?.latency_ms)),
+          s.model_output?.entropy != null ? [h("dt", {}, "采样熵"), h("dd", {}, `${fmt.num(s.model_output.entropy, 3)} nats/token`)] : null,
           h("dt", {}, "reward"), h("dd", {}, `${fmt.num(s.reward.total)}${s.reward.success ? " · 成功" : ""}${s.done ? " · 结束" : ""}`),
           h("dt", {}, "前台应用"), h("dd", {}, s.reward.foreground_package || s.observation?.foreground_package || "–")))),
       ep.has_final_screenshot ? h("div", { class: "card step" },
@@ -816,7 +1213,7 @@ function architectureDiagram() {
     architectureNode(570, 45, 190, 90, "Redis Streams", ["任务队列 · Consumer Group"], "queue"),
     architectureNode(820, 45, 220, 150, "Consumer Worker Pool", ["并发 sandbox worker", "XAUTOCLAIM · ACK", "动作与 reward 记录"], "worker"),
     architectureNode(300, 265, 190, 90, "PostgreSQL", ["实验 · 任务 · 轨迹", "指标与 checkpoint 元数据"], "storage"),
-    architectureNode(30, 300, 230, 110, "Model Service", ["MiniCPM-V HTTP API", "截图 → 结构化动作", "GPU / max-loaded=1"], "model"),
+    architectureNode(30, 300, 230, 110, "Model Service", ["MiniCPM-V / Qwen3-VL HTTP API", "截图 → 结构化动作", "GPU / max-loaded=1"], "model"),
     architectureNode(30, 500, 230, 80, "Training Agent", ["SFT / GRPO / GIGPO · 训练后评测"], "training"),
     architectureNode(300, 500, 190, 80, "Artifacts", ["checkpoint · rollout", "可复现运行记录"], "storage"),
     architectureNode(820, 270, 220, 100, "Runtime Layer", ["Firecracker / Docker Android", "sandbox 生命周期"], "runtime"),
@@ -836,12 +1233,12 @@ function architectureDiagram() {
 
 function guidePage() {
   view.replaceChildren(
-    pageHeading("PLAYBOOK / 04", "从实验到结果", "用 AlvarezGUI 管理模型、runtime、rollout 和评测。下面的流程图对应平台当前的真实执行链路。"),
+    pageHeading("PLAYBOOK / 05", "从实验到结果", "用 AlvarezGUI 管理模型、runtime、rollout 和评测。下面的流程图对应平台当前的真实执行链路。"),
     h("div", { class: "guide-banner card" },
       h("div", {}, h("div", { class: "eyebrow" }, "QUICK START"), h("h3", {}, "四步启动一次可复现实验"), h("p", {}, "先准备模型和数据，再选择 runtime。在线 rollout 会保留 seed、动作、截图和 reward，方便定位每一步发生了什么。")),
       h("a", { class: "primary action-link", href: "#/runs" }, "创建训练实验 →")),
     h("div", { class: "guide-steps" },
-      guideStep("01", "准备模型与任务", "在训练实验页选择已注册的基础模型，勾选 shopping、Sokoban 或 Android smoke 任务。", "模型版本 · task catalog"),
+      guideStep("01", "准备模型与数据", "在数据管理页查看轨迹数据集和题目集；训练实验页选择基础模型、训练数据和评测题目集。", "模型版本 · 数据集 · 题目集"),
       guideStep("02", "使用 Runtime", "平台按配置选择 Firecracker 或 Docker，为每条 rollout 分配独立 Android sandbox。", "runtime_backend · sandbox capacity"),
       guideStep("03", "观察 rollout", "Scheduler 将任务发布到对应 Redis Stream，Consumer worker 并发执行动作，并持续更新 lease 和轨迹。", "queue · worker pool · lease"),
       guideStep("04", "分析训练结果", "训练 agent 汇总 reward 和指标，GRPO 只对有 reward 方差的 group 更新模型，训练后可自动发起评测。", "reward · metrics · checkpoint")),
@@ -870,6 +1267,7 @@ function guidePage() {
 const routes = [
   [/^#\/resources$/, resourcesPage, "resources"],
   [/^#\/guide$/, guidePage, "guide"],
+  [/^#\/data$/, dataPage, "data"],
   [/^#\/runs$/, runsPage, "runs"],
   [/^#\/runs\/([\w-]+)$/, runDetailPage, "runs"],
   [/^#\/evaluations$/, evaluationsPage, "evaluations"],

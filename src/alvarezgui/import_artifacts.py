@@ -135,6 +135,81 @@ def _import_rollout(connection: Any, group: dict[str, Any], row: dict[str, Any],
     return 1
 
 
+SOKOBAN_DATASET = ("sokoban-sft-v2-action-full", "file:///home/alvarez-datasets/sokoban-sft-v2/action-v1/train.jsonl", 333)
+SOKOBAN_MODEL = "sokoban-v2-action-full-merger-e10"
+SOKOBAN_CHECKPOINT = "file:///home/alvarez-checkpoints/sokoban-v2-action-full-merger-e10"
+SOKOBAN_RUN = "run_history_sokoban_full_merger_e10"
+# Exactly the TrainingConfig knobs of the 4090 CLI run, so the console can reuse it as a recipe.
+SOKOBAN_CONFIG = {
+    "model_name": None, "finetuning_method": "lora", "train_merger_mlp": True, "multiview": True,
+    "output_format": "action-v1", "learning_rate": 1e-5, "epochs": 10, "gradient_accumulation": 4,
+    "batch_size": 1, "cache_preprocessed": False, "gradient_checkpointing": True,
+    "eval_trials": 0, "max_steps": 24, "seed": 20261117,
+    "tasks": [{"task_type": "sokoban", "app_image": "android-sokoban-v1"}],
+}
+SOKOBAN_LOG = """\
+2026-11-18 在 4090 上用训练 CLI 手动执行的 SFT，2026-11-19 导入 console；当前 Sokoban 候选。
+命令：python -m alvarezgui.minicpm_training --algorithm sft --finetuning-method lora --train-merger-mlp --multiview \\
+  --base-model /home/alvarez-models/MiniCPM-V-4.7-1B --dataset /home/alvarez-datasets/sokoban-sft-v2/action-v1/train.jsonl \\
+  --output-dir /home/alvarez-checkpoints/sokoban-v2-action-full-merger-e10 \\
+  --learning-rate 1e-5 --epochs 10 --gradient-accumulation 4 --seed 20261117
+实现：语言 attention LoRA r16/alpha32 + 全量 model.merger.mlp.0，共 31,481,344 个可训练 FP32 参数；视觉编码器冻结；
+  输入为完整截图 + 棋盘裁剪双视图；只监督 assistant 的 action-v1 tap JSON；micro-batch 1、开启梯度检查点、BF16 混合精度。
+数据：train 333 条 solver-verified 真实截图，SHA-256 2f3d22481836648a783f0b9e82f7d8090cf8ce02dee4b1801e445f54604fff81；
+  标签由 BFS 求解器给出并在真实 Android 中逐步核验，求解器轨迹不进入模型输入。
+训练：3330 样本步 / 840 次更新（每轮 84，含尾批），loss=0.05795616，6079.04 秒。
+checkpoint：adapter_model.safetensors SHA-256 604654b0f02f81dbd13cd403a7d7ffe397187618206a618e228c1d0c4ab65c83。
+评测（temperature 0）：validation 39/57，历史 test 43/55，合法/可执行全部通过；真实 Docker Android 8 个 test 关卡连续通关 3/8，
+  42 次点击中 27 次最优，转移一致 42/42。2026-11-18 合并推理复测 validation 为 38/57，与 39/57 的差异原因未确认。
+限制：该次运行未启用 --checkpoint-dir，没有训练器生成的配方摘要；训练源码早于提交 bc10a05，未单独归档其哈希。
+证据：var/runs/sokoban-binding-followup/full333-merger-*.json、android-full333-merger-r1-report.json；说明见 docs/sokoban-sft-v2.md。
+"""
+
+
+def import_sokoban_candidate(settings: Settings, runs_dir: Path) -> dict[str, int]:
+    evidence = runs_dir / "sokoban-binding-followup"
+    trained = json.loads((evidence / "full333-merger-metrics.json").read_text())
+    validation = json.loads((evidence / "full333-merger-validation.json").read_text())
+    test = json.loads((evidence / "full333-merger-test.json").read_text())
+    metrics = {
+        **{key: trained[key] for key in ("loss", "sample_count", "update_count", "step_count", "elapsed_seconds")},
+        "validation_correct": validation["correct"], "validation_total": validation["total"],
+        "test_correct": test["correct"], "test_total": test["total"],
+        "android_solved": 3, "android_levels": 8,
+    }
+    dataset_version, dataset_uri, sample_count = SOKOBAN_DATASET
+    counts = {}
+    with connect(settings) as connection, connection.transaction():
+        counts["datasets"] = connection.execute(
+            """
+            INSERT INTO datasets (dataset_version, source, schema_version, sample_count)
+            VALUES (%s, %s, 'minicpm-sft-v1', %s) ON CONFLICT (dataset_version) DO NOTHING
+            """,
+            (dataset_version, dataset_uri, sample_count),
+        ).rowcount
+        counts["models"] = connection.execute(
+            """
+            INSERT INTO model_versions (version, base_model, checkpoint_uri, status, metrics)
+            VALUES (%s, 'minicpm-v-4.7-1b', %s, 'READY', %s) ON CONFLICT (version) DO NOTHING
+            """,
+            (SOKOBAN_MODEL, SOKOBAN_CHECKPOINT, Json(metrics)),
+        ).rowcount
+        counts["runs"] = connection.execute(
+            """
+            INSERT INTO training_runs (run_id, algorithm, base_model, dataset_version, environment_version,
+                                       reward_version, runtime_backend, config, status, checkpoint_uri, metrics, log_tail,
+                                       idempotency_key, request_fingerprint, created_at, updated_at)
+            VALUES (%s, 'sft', 'minicpm-v-4.7-1b', %s, 'android-docker-v1', 'android-task-v1', 'docker', %s,
+                    'SUCCEEDED', %s, %s, %s, %s, %s,
+                    '2026-11-18 15:50:00+08', '2026-11-18 17:31:00+08')
+            ON CONFLICT (run_id) DO NOTHING
+            """,
+            (SOKOBAN_RUN, dataset_version, Json(SOKOBAN_CONFIG), SOKOBAN_CHECKPOINT,
+             Json({**metrics, "model_version": SOKOBAN_MODEL}), SOKOBAN_LOG, f"import:{SOKOBAN_RUN}", "0" * 64),
+        ).rowcount
+    return counts
+
+
 def main() -> None:
     settings = Settings()
     print(json.dumps(import_history(settings, settings.data_dir / "runs")))

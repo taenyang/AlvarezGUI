@@ -1,0 +1,15 @@
+[Unit]
+Description=AlvarezGUI H800 training launcher (one Kubernetes Deployment per SFT run)
+After=alvarez-platform.service network-online.target
+
+[Service]
+WorkingDirectory=/home/github/AlvarezGUI
+EnvironmentFile=/home/github/AlvarezGUI/var/platform.env
+ExecStart=/home/github/AlvarezGUI/.venv/bin/python -m alvarezgui.h800_launcher serve \
+    --control-plane-url http://127.0.0.1:8600 --kubeconfig /home/github/h800.yaml \
+    --template-deployment ainf-run-data-cleaning-kbench-20261118-t141 --max-runs 4 --max-serving 4
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

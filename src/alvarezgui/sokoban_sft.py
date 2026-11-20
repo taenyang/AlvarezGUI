@@ -172,6 +172,174 @@ def collect(settings: Any, levels_file: Path, output: Path, workers: int, seed: 
     return report
 
 
+AUGMENT_QUOTAS = {"player_on_goal": 3, "near_deadlock": 3, "off_path": 2}
+
+
+def augment_targets(level: dict, exclude: set[str], rng: random.Random) -> list[tuple[str, list[str]]]:
+    """Solvable train states the teacher trajectory never shows: player on goal, one move from a deadlock, off path."""
+    walls, player, box, goal = parse_board(level["board"])
+    seen, pending = {(player, box)}, [(player, box)]
+    while pending:
+        state = pending.pop()
+        if state[1] == goal:
+            continue
+        for direction in ACTIONS:
+            following = transition(walls, *state, direction)
+            if following not in seen:
+                seen.add(following)
+                pending.append(following)
+
+    def solvable(state: tuple) -> bool:
+        try:
+            solve(render_board(walls, *state, goal))
+            return True
+        except ValueError:
+            return False
+
+    kinds: dict[str, list[list[str]]] = {kind: [] for kind in AUGMENT_QUOTAS}
+    for state in sorted(seen):
+        board = render_board(walls, *state, goal)
+        if state[1] == goal or hashlib.sha256("\n".join(board).encode()).hexdigest() in exclude or not solvable(state):
+            continue
+        if state[0] == goal:
+            kinds["player_on_goal"].append(board)
+        elif any(transition(walls, *state, d)[1] != state[1] and not solvable(transition(walls, *state, d))
+                 for d in ACTIONS):
+            kinds["near_deadlock"].append(board)
+        else:
+            kinds["off_path"].append(board)
+    return [(kind, board) for kind, boards in kinds.items()
+            for board in rng.sample(boards, min(AUGMENT_QUOTAS[kind], len(boards)))]
+
+
+def _state_path(walls: frozenset, start: tuple, target: tuple, goal: tuple) -> list[str] | None:
+    parents, pending = {start: None}, [start]
+    for state in pending:
+        if state == target:
+            path = []
+            while parents[state] is not None:
+                state, direction = parents[state]
+                path.append(direction)
+            return path[::-1]
+        if state[1] == goal:
+            continue
+        for direction in ACTIONS:
+            following = transition(walls, *state, direction)
+            if following not in parents:
+                parents[following] = (state, direction)
+                pending.append(following)
+    return None
+
+
+def collect_augment_level(runtime: Any, sandbox_id: str, level: dict, targets: list[tuple[str, list[str]]],
+                          output: Path) -> list[dict]:
+    """Walk the real Android game to each target, screenshot it, then execute and check the teacher move."""
+    level_id = level["id"]
+    image_dir = output / "images" / level_id
+    image_dir.mkdir(parents=True)
+    walls, start_player, start_box, goal = parse_board(level["board"])
+    current, rows = None, []
+    for index, (kind, board) in enumerate(targets):
+        _, player, box, _ = parse_board(board)
+        path = _state_path(walls, current, (player, box), goal) if current else None
+        if path is None:
+            runtime.initialize_task(sandbox_id, "sokoban", f"android-sokoban-v1:{level_id}", SOKOBAN_INSTRUCTION)
+            path = _state_path(walls, (start_player, start_box), (player, box), goal)
+        for direction in path:
+            runtime.execute(sandbox_id, dict(ACTIONS[direction]))
+        observation = runtime.observe(sandbox_id)
+        if observed_board(observation) != board:
+            raise ValueError(f"{level_id} target {index}: Android board differs from target")
+        if (observation["screen_width"], observation["screen_height"]) != (720, 1280):
+            raise ValueError("Sokoban fixture collection requires the calibrated 720x1280 device layout")
+        source = urlsplit(observation["image_uri"])
+        if source.scheme != "file" or source.netloc:
+            raise ValueError("collector requires local runtime screenshots")
+        image = image_dir / f"{index:03d}.png"
+        shutil.copyfile(unquote(source.path), image)
+        direction = solve(board)[0]
+        action = dict(ACTIONS[direction])
+        result = runtime.execute(sandbox_id, action)
+        player, box = transition(walls, player, box, direction)
+        after = runtime.observe(sandbox_id)
+        if observed_board(after) != render_board(walls, player, box, goal):
+            raise ValueError(f"{level_id} target {index}: Android did not execute the expected move")
+        solved = box == goal
+        if (result["done"] != solved or result["reward"]["success"] != solved
+                or result["reward"].get("invalid_action")):
+            raise ValueError(f"{level_id} target {index}: runtime reward disagrees with board")
+        if solved and "Sokoban complete" not in after.get("ui_text", []):
+            raise ValueError(f"{level_id}: missing completion text")
+        current = None if solved else (player, box)
+        rows.append(_paired_row({
+            "id": f"{output.name}:{level_id}:{index}", "episode_id": f"{output.name}:{level_id}",
+            "group_id": level_id, "step_id": index, "image": str(image.resolve()),
+            "reward": result["reward"], "done": result["done"], "level_id": level_id, "split": "train",
+            "board": board, "direction": direction, "optimal_directions": optimal_directions(board),
+            "augment_kind": kind, "state_hash": hashlib.sha256("\n".join(board).encode()).hexdigest(),
+            "screen_hash": hashlib.sha256(image.read_bytes()).hexdigest(),
+        }, "action-v1"))
+    print(json.dumps({"collected": level_id, "samples": len(rows)}), flush=True)
+    return rows
+
+
+def collect_augment(settings: Any, levels_file: Path, base_train: Path, output: Path, workers: int,
+                    seed: int) -> dict:
+    """Append real-Android off-trajectory TRAIN states to a verified action-v1 TRAIN file."""
+    from alvarezgui.node_agent.factory import runtime_from_settings
+
+    base_rows = load_dataset(base_train)
+    if any(row.get("split") != "train" or row.get("output_format") != "action-v1" for row in base_rows):
+        raise ValueError("base dataset must be the action-v1 TRAIN split")
+    exclude = {row["state_hash"] for row in base_rows}
+    levels = [level for level in load_levels(levels_file) if level["split"] == "train"]
+    plans = [(level, augment_targets(level, exclude, random.Random(f"{seed}:{level['id']}"))) for level in levels]
+    if not 1 <= workers <= settings.sandbox_capacity:
+        raise ValueError("workers must be between one and the configured sandbox capacity")
+    output = output.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    report = {"status": "collecting", "version": "sokoban-sft-v3-augment", "teacher_source": "solver-verified",
+              "runtime_backend": settings.runtime_backend, "seed": seed, "quotas": AUGMENT_QUOTAS,
+              "base_train": str(base_train), "base_sha256": _sha256(base_train),
+              "manifest_sha256": _sha256(levels_file)}
+    report_path = output / "report.json"
+    report_path.write_text(json.dumps(report, indent=2))
+
+    def batch_collect(batch: list[tuple[dict, list]]) -> list[dict]:
+        sandbox_id = f"sft-{uuid.uuid4().hex}"
+        runtime.create(sandbox_id)
+        try:
+            return [row for level, targets in batch
+                    for row in collect_augment_level(runtime, sandbox_id, level, targets, output)]
+        finally:
+            runtime.destroy(sandbox_id)
+
+    try:
+        runtime = runtime_from_settings(settings)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            batches = [plans[index::workers] for index in range(min(workers, len(plans)))]
+            added = [row for result in pool.map(batch_collect, batches) for row in result]
+        for row in added:
+            _validate_teacher_row(row, "train", provenance=True)
+        rows = base_rows + added
+        if len({row["state_hash"] for row in rows}) != len(rows):
+            raise ValueError("duplicate semantic states detected; refusing to publish dataset")
+        random.Random(seed).shuffle(rows)
+        for name, selected in (("augment.jsonl", added), ("train.jsonl", rows)):
+            (output / name).write_text("".join(json.dumps(row) + "\n" for row in selected), encoding="utf-8")
+        load_dataset(output / "train.jsonl")
+        report.update(status="complete", added=len(added), samples=len(rows),
+                      kinds=dict(Counter(row["augment_kind"] for row in added)),
+                      directions=dict(Counter(row["direction"] for row in rows)),
+                      sha256=_sha256(output / "train.jsonl"))
+    except Exception as exc:
+        report.update(status="failed", error=str(exc))
+        raise
+    finally:
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -344,6 +512,14 @@ def registration_dataset(directory: Path, train_file: str = "train.jsonl") -> tu
     if train_file not in {"train.jsonl", "train-small.jsonl"}:
         raise ValueError("registration requires train.jsonl or train-small.jsonl")
     report = json.loads((directory / "report.json").read_text())
+    if report.get("version") == "sokoban-sft-v3-augment":
+        if train_file != "train.jsonl" or report.get("status") != "complete" \
+                or _sha256(directory / train_file) != report.get("sha256"):
+            raise ValueError("augmented TRAIN file is incomplete or changed")
+        rows = load_dataset(directory / train_file)
+        for row in rows:
+            _validate_teacher_row(row, "train", provenance=True)
+        return directory / train_file, rows
     if report.get("version") != "sokoban-sft-v2":
         datasets, _ = _load_collection(directory)
         if train_file != "train.jsonl":
@@ -523,6 +699,13 @@ def main() -> None:
     evaluate.add_argument("--output", type=Path, required=True)
     evaluate.add_argument("--seed", type=int, default=20261117)
     evaluate.add_argument("--allow-train", action="store_true", help="explicitly enable training-state diagnostics")
+    augment = commands.add_parser("collect-augment")
+    augment.add_argument("--env-file", action="append", required=True)
+    augment.add_argument("--levels", type=Path, default=Path("fixtures/sokoban/levels.json"))
+    augment.add_argument("--base-train", type=Path, required=True)
+    augment.add_argument("--output", type=Path, required=True)
+    augment.add_argument("--workers", type=int, default=1)
+    augment.add_argument("--seed", type=int, default=20261119)
     export = commands.add_parser("export-paired")
     export.add_argument("--source-dir", type=Path, required=True)
     export.add_argument("--output-dir", type=Path, required=True)
@@ -538,6 +721,8 @@ def main() -> None:
         settings = Settings(_env_file=tuple(args.env_file))
         if args.command == "collect":
             result = collect(settings, args.levels, args.output, args.workers, args.seed, args.level_id)
+        elif args.command == "collect-augment":
+            result = collect_augment(settings, args.levels, args.base_train, args.output, args.workers, args.seed)
         elif args.command == "register":
             from alvarezgui.training_agent import ControlPlane
 

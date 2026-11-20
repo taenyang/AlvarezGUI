@@ -133,6 +133,23 @@ TASK_CATALOG: tuple[dict[str, str], ...] = (
     },
 )
 
+SOKOBAN_SPLIT_LABELS = {"train": "推箱子训练关卡", "validation": "推箱子验证关卡", "test": "推箱子测试关卡"}
+
+# Named task sets: RL training pools and evaluation sets. A run stores the expanded task list,
+# so editing this table never changes what an existing run trained or evaluated on.
+# Single fixed tasks (shop, default Sokoban board, settings) stay out: RL on them repeats one
+# problem every round; they remain in TASK_CATALOG for manual evaluations.
+TASK_SETS: dict[str, dict[str, Any]] = {
+    f"sokoban-{split}": {
+        "label": SOKOBAN_SPLIT_LABELS[split],
+        "tasks": [
+            {"task_type": "sokoban", "app_image": f"android-sokoban-v1:{split}-{index:03d}"}
+            for index in range(count)
+        ],
+    }
+    for split, count in LEVEL_COUNTS.items()
+}
+
 
 def sokoban_action_allowed(action: dict[str, Any]) -> bool:
     """Keep model actions inside the fixture controls and away from Android chrome."""

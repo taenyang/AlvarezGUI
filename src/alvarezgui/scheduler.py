@@ -74,9 +74,19 @@ class Scheduler:
             return dispatch
         return None
 
+    def run_until_idle(self) -> int:
+        """Dispatch until the queue or every backend's capacity runs out; returns the count.
+
+        A batch (an evaluation, a rollout group) then starts together instead of one task per tick.
+        """
+        dispatched = 0
+        while self.run_once() is not None:
+            dispatched += 1
+        return dispatched
+
     def run_forever(self, interval: float = 1.0) -> None:
         while True:
-            self.run_once()
+            self.run_until_idle()
             time.sleep(interval)
 
 

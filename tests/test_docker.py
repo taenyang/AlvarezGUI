@@ -297,6 +297,32 @@ class DockerAndroidRuntimeTest(unittest.TestCase):
                 "http://172.17.0.1:18090/shopping/",
             )
 
+    def test_fixture_network_retries_root_refused_right_after_boot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = self.runtime(Path(directory))
+            runtime._containers["sandbox-1"] = "container-1"
+            runtime._adb_ports["sandbox-1"] = 40123
+            runtime._inspect = Mock(return_value={"NetworkSettings": {"Networks": {"bridge": {"Gateway": "172.17.0.1"}}}})
+            runtime._wait_for_guest_ready = Mock()
+            runtime._adb = Mock()
+            refused = self.completed(stderr=b"adb: unable to connect for root: closed\n", returncode=1)
+            with patch("alvarezgui.node_agent.docker.subprocess.run",
+                       side_effect=[refused, refused, self.completed(stdout=b"restarting adbd as root\n")]) as run, \
+                    patch("alvarezgui.node_agent.docker.time.sleep") as sleep:
+                runtime._prepare_fixture_network("sandbox-1")
+            self.assertEqual(run.call_count, 3)
+            self.assertEqual(sleep.call_count, 2)
+            runtime._wait_for_guest_ready.assert_called_once_with("sandbox-1")
+
+            # An image that cannot run adbd as root still fails, once the retry window ends.
+            runtime._guest_gateways.clear()
+            with patch("alvarezgui.node_agent.docker.subprocess.run", return_value=refused) as run, \
+                    patch("alvarezgui.node_agent.docker.time.sleep"), \
+                    patch("alvarezgui.node_agent.docker.time.monotonic", side_effect=[0, 10, 20, 31]):
+                with self.assertRaisesRegex(RuntimeOperationError, "must support root.*closed"):
+                    runtime._prepare_fixture_network("sandbox-1")
+            self.assertEqual(run.call_count, 3)
+
     def test_shared_adb_screenshot_input_and_fixture_url(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = self.runtime(Path(directory))

@@ -22,7 +22,8 @@ class MigrationContractTest(unittest.TestCase):
     def test_firecracker_contract_migrations_are_repeatable_and_status_aware(self) -> None:
         migrations = Path(__file__).resolve().parents[1] / "migrations"
         with connect(self.settings) as connection:
-            for migration in ("007_firecracker_only.sql", "008_firecracker_only_corrective.sql", "009_docker_runtime.sql", "010_evaluation_name.sql"):
+            for migration in ("007_firecracker_only.sql", "008_firecracker_only_corrective.sql", "009_docker_runtime.sql", "010_evaluation_name.sql",
+                              "011_evaluation_accelerator.sql", "012_node_limits.sql", "013_model_checkpoints.sql"):
                 sql = (migrations / migration).read_text()
                 connection.execute(sql)
                 connection.execute(sql)

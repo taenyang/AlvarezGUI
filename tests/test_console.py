@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import io
 import json
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 
 import redis
@@ -22,9 +24,12 @@ from alvarezgui.db import connect
 from alvarezgui.minicpm_service import MiniCPMService
 from alvarezgui.model import FakeModelService, InferenceRequest, ModelVersionNotFoundError
 from runtime_stub import StubRuntime
-from alvarezgui.registry import ModelVersionRequest, RegistryStore, TrainingConfig, TrainingRunRequest
+from alvarezgui.registry import DatasetRequest, ModelVersionRequest, RegistryStore, TrainingConfig, TrainingRunRequest
 from alvarezgui.scheduler import Scheduler
-from alvarezgui.training_agent import TrainingAgent, episode_advantages, rollout_metrics
+from alvarezgui.task_store import TaskStore
+from alvarezgui.training_agent import (
+    TrainingAgent, checkpoint_retained, episode_advantages, round_tasks, rollout_metrics,
+)
 
 PASSWORD = "test-console-password"
 
@@ -130,6 +135,41 @@ class ConsoleApiTest(unittest.TestCase):
         status, headers, _ = call(self.app, "GET", "/console/")
         self.assertEqual((status, headers["location"]), (303, "/console/login"))
         self.assertEqual(call(self.app, "GET", "/api/v1/overview")[0], 401)
+
+    def test_run_versions_register_as_checkpoints_and_promotion_switches_the_model(self) -> None:
+        register = lambda body: call(self.app, "POST", "/internal/v1/model-versions",
+                                     {"base_model": "base-v1", **body}, bearer())
+        for round_number in range(3):
+            self.assertEqual(register({"version": f"g-r{round_number}", "run_id": "run_x",
+                                       "checkpoint_uri": f"file:///c/run_x/round-{round_number}"})[0], 200)
+        promote = lambda version: call(self.app, "POST", f"/api/v1/model-versions/{version}/promote", headers=bearer())
+        kinds = lambda: {m["version"]: m["kind"] for m in json.loads(call(
+            self.app, "GET", "/api/v1/catalog", headers=bearer())[2])["model_versions"]}
+        self.assertEqual(kinds(), {"base-v1": "model", "grpo-v1": "model",
+                                   "g-r0": "checkpoint", "g-r1": "checkpoint", "g-r2": "checkpoint"})
+        self.assertEqual(promote("g-r2")[0], 200)
+        self.assertEqual(promote("g-r0")[0], 200)
+        self.assertEqual(promote("g-r0")[0], 200)  # idempotent
+        self.assertEqual({v: k for v, k in kinds().items() if v.startswith("g-")},
+                         {"g-r0": "model", "g-r1": "checkpoint", "g-r2": "checkpoint"})
+        with connect(self.settings) as connection:
+            connection.execute(
+                """INSERT INTO training_runs (run_id, algorithm, base_model, environment_version, reward_version,
+                       config, status, metrics, checkpoint_uri, idempotency_key, request_fingerprint)
+                   VALUES ('run_x', 'grpo', 'base-v1', 'env', 'reward', '{}', 'SUCCEEDED',
+                           '{"model_version": "g-r0", "loss": 0.5}', 'file:///c/run_x/round-0', 'promote-key', %s)""",
+                ("1" * 64,))
+        self.assertEqual(promote("g-r1")[0], 200)
+        run = json.loads(call(self.app, "GET", "/api/v1/training/runs/run_x", headers=bearer())[2])
+        self.assertEqual((run["metrics"], run["checkpoint_uri"]),
+                         ({"model_version": "g-r1", "loss": 0.5}, "file:///c/run_x/round-1"))
+        # The previous output is now an ordinary checkpoint: deleting it does not touch the run.
+        with connect(self.settings) as connection:
+            deleted = RegistryStore(connection).delete_model_version("g-r0", None, checkpoint_cleanup=lambda _: False)
+        self.assertTrue(deleted["deleted"])
+        status, _, body = promote("base-v1")
+        self.assertEqual((status, json.loads(body)["detail"]["code"]), (409, "NOT_A_RUN_CHECKPOINT"))
+        self.assertEqual(promote("missing")[0], 404)
         self.assertEqual(call(self.app, "DELETE", "/api/v1/model-versions/grpo-v1")[0], 401)
         self.assertEqual(call(self.app, "POST", "/internal/v1/training/claim")[0], 401)
         self.assertEqual(call(self.app, "GET", "/console/login")[0], 200)
@@ -219,6 +259,84 @@ class ConsoleApiTest(unittest.TestCase):
         claimed = json.loads(call(self.app, "POST", "/internal/v1/training/claim", headers=bearer())[2])["run"]
         self.assertEqual(claimed["runtime_backend"], "firecracker")
 
+    def test_h800_runs_run_concurrently_and_claim_separately_from_4090(self) -> None:
+        with connect(self.settings) as connection:
+            RegistryStore(connection).register_dataset(DatasetRequest(
+                dataset_version="data-v1", source="file:///data.jsonl", schema_version="minicpm-sft-v1", sample_count=1))
+        body = {"algorithm": "sft", "base_model": "base-v1", "dataset_version": "data-v1",
+                "environment_version": "env", "reward_version": "reward", "config": {"accelerator": "h800"}}
+        for key in ("h800-a", "h800-b"):
+            self.assertEqual(call(self.app, "POST", "/api/v1/training/runs", body, bearer(**{"Idempotency-Key": key}))[0], 201)
+        legacy = {**body, "config": {}}
+        self.assertEqual(call(self.app, "POST", "/api/v1/training/runs", legacy, bearer(**{"Idempotency-Key": "4090-a"}))[0], 201)
+        self.assertEqual(call(self.app, "POST", "/api/v1/training/runs", legacy, bearer(**{"Idempotency-Key": "4090-b"}))[0], 409)
+        claim = lambda query="": json.loads(call(self.app, "POST", f"/internal/v1/training/claim{query}", headers=bearer())[2])["run"]
+        self.assertEqual(claim()["config"]["accelerator"], "4090")
+        self.assertIsNone(claim())
+        self.assertEqual([claim("?accelerator=h800")["config"]["accelerator"] for _ in range(2)], ["h800", "h800"])
+        self.assertIsNone(claim("?accelerator=h800"))
+        grpo = {**body, "algorithm": "grpo"}
+        self.assertEqual(call(self.app, "POST", "/api/v1/training/runs", grpo, bearer(**{"Idempotency-Key": "grpo"}))[0], 201)
+        self.assertEqual(claim("?accelerator=h800")["algorithm"], "grpo")
+
+    def test_adapter_base_is_flagged_and_rejected_at_creation_unless_lora_sft(self) -> None:
+        with connect(self.settings) as connection:
+            store = RegistryStore(connection)
+            store.register_dataset(DatasetRequest(
+                dataset_version="data-v1", source="file:///data.jsonl", schema_version="minicpm-sft-v1", sample_count=1))
+            store.register_model(ModelVersionRequest(version="lora-v1", base_model="base-v1",
+                                                     metrics={"finetuning_method": "lora"}))
+            store.register_model(ModelVersionRequest(version="plan-v1", base_model="base-v1",
+                                                     metrics={"finetuning_method": "full", "output_format": "sokoban-plan-v1"}))
+        catalog = json.loads(call(self.app, "GET", "/api/v1/catalog", headers=bearer())[2])
+        self.assertEqual({m["version"]: m["adapter"] for m in catalog["model_versions"]},
+                         {"base-v1": False, "grpo-v1": False, "lora-v1": True, "plan-v1": False})
+        self.assertEqual(len(next(s for s in catalog["task_sets"] if s["name"] == "sokoban-train")["tasks"]), 48)
+        tasks = [{"task_type": "shopping", "app_image": "android-shop-v1"}]
+        create = lambda body, key: call(self.app, "POST", "/api/v1/training/runs", {
+            "environment_version": "env", "reward_version": "reward", **body}, bearer(**{"Idempotency-Key": key}))
+        for key, body in (("grpo", {"algorithm": "grpo", "base_model": "lora-v1", "config": {"tasks": tasks}}),
+                          ("full-sft", {"algorithm": "sft", "base_model": "lora-v1", "dataset_version": "data-v1"}),
+                          ("plan-grpo", {"algorithm": "grpo", "base_model": "plan-v1", "config": {"tasks": tasks}})):
+            with self.subTest(key):
+                status, _, payload = create(body, key)
+                self.assertEqual(status, 422)
+                self.assertIn(body["base_model"], json.loads(payload)["detail"])
+        with connect(self.settings) as connection:
+            self.assertEqual(connection.execute("SELECT count(*) AS n FROM training_runs").fetchone()["n"], 0)
+        lora_sft = {"algorithm": "sft", "base_model": "lora-v1", "dataset_version": "data-v1",
+                    "config": {"finetuning_method": "lora"}}
+        self.assertEqual(create(lora_sft, "lora-sft")[0], 201)
+
+    def test_merge_registers_full_weight_child_through_model_service(self) -> None:
+        with connect(self.settings) as connection:
+            RegistryStore(connection).register_model(ModelVersionRequest(
+                version="lora-v1", base_model="base-v1", status="READY",
+                metrics={"finetuning_method": "lora", "visual_views": "full+board-crop", "loss": 0.1}))
+        merge = lambda app, version, target=None: call(app, "POST", f"/api/v1/model-versions/{version}/merge",
+                                                       {"target_version": target}, bearer())
+        self.assertEqual(merge(self.app, "lora-v1")[0], 409)  # fake_policy backend has no model service
+        app = create_app(self.settings.model_copy(update={"model_backend": "http", "model_service_url": "http://model"}))
+        for version, target, code in (("base-v1", None, "NOT_ADAPTER"), ("lora-v1", "grpo-v1", "MODEL_EXISTS")):
+            status, _, payload = merge(app, version, target)
+            self.assertEqual((status, json.loads(payload)["detail"]["code"]), (409, code))
+        self.assertEqual(merge(app, "lora-v1", "../escape")[0], 422)
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"checkpoint":"/home/alvarez-checkpoints/merged/lora-v1-merged"}'
+        with patch("alvarezgui.app.urlopen", return_value=response) as request:
+            status, _, payload = merge(app, "lora-v1")
+        self.assertEqual(status, 201)
+        self.assertEqual(request.call_args.args[0].full_url, "http://model/internal/v1/model/merge")
+        self.assertEqual(json.loads(request.call_args.args[0].data),
+                         {"model_version": "lora-v1", "target_version": "lora-v1-merged"})
+        merged = json.loads(payload)
+        self.assertEqual((merged["version"], merged["base_model"], merged["checkpoint_uri"], merged["metrics"]), (
+            "lora-v1-merged", "lora-v1", "file:///home/alvarez-checkpoints/merged/lora-v1-merged",
+            {"visual_views": "full+board-crop", "merged_from": "lora-v1"}))
+        catalog = json.loads(call(app, "GET", "/api/v1/catalog", headers=bearer())[2])
+        self.assertFalse(next(m for m in catalog["model_versions"] if m["version"] == "lora-v1-merged")["adapter"])
+
     def test_catalog_exposes_configured_docker_runtime_for_training(self) -> None:
         settings = self.settings.model_copy(update={"runtime_backend": "docker", "docker_image": "android:test"})
         catalog = json.loads(call(create_app(settings), "GET", "/api/v1/catalog", headers=bearer())[2])
@@ -284,6 +402,7 @@ class ConsoleApiTest(unittest.TestCase):
         self.assertEqual(status, 201)
         evaluation = EvaluationRequest(**body).model_dump(mode="json")
         evaluation.pop("runtime_backend")
+        evaluation.pop("accelerator")
         legacy_fingerprint = hashlib.sha256(json.dumps(evaluation, sort_keys=True).encode()).hexdigest()
         eval_id = json.loads(payload)["eval_id"]
         with connect(self.settings) as connection:
@@ -361,6 +480,75 @@ class ConsoleApiTest(unittest.TestCase):
             ).fetchone()
         self.assertEqual((json.loads(payload)["name"], row["runtime_backend"]), ("sokoban docker check", "docker"))
 
+    def test_h800_evaluation_waits_for_published_endpoint_and_uses_it(self) -> None:
+        body = {"model_versions": ["base-v1"], "tasks": [{"task_type": "shopping", "app_image": "android-shop-v1"}],
+                "trials_per_task": 2, "accelerator": "h800"}
+        plain = {**body, "accelerator": "4090"}
+        eval_id = json.loads(call(self.app, "POST", "/api/v1/evaluations", body, bearer(**{"Idempotency-Key": "h1"}))[2])["eval_id"]
+        resident = json.loads(call(self.app, "POST", "/api/v1/evaluations", plain, bearer(**{"Idempotency-Key": "h2"}))[2])["eval_id"]
+        self.assertEqual(call(self.app, "POST", "/api/v1/evaluations", plain, bearer(**{"Idempotency-Key": "h1"}))[0], 409)
+        self.assertEqual(call(self.app, "GET", "/internal/v1/evaluations/h800")[0], 401)
+        listed = json.loads(call(self.app, "GET", "/internal/v1/evaluations/h800", headers=bearer())[2])
+        self.assertEqual(listed, [{"eval_id": eval_id, "model_versions": ["base-v1"], "model_endpoint": None}])
+        detail = json.loads(call(self.app, "GET", f"/api/v1/evaluations/{eval_id}", headers=bearer())[2])
+        self.assertEqual((detail["accelerator"], detail["model_ready"]), ("h800", False))
+        self.assertNotIn("model_token", detail)
+
+        # Until the launcher publishes an endpoint only the 4090 evaluation is dispatched.
+        with connect(self.settings) as connection:
+            store = TaskStore(connection)
+            claimed = []
+            while (row := store.claim_next_queued()) is not None:
+                claimed.append(row["task_id"])
+            waiting = connection.execute("SELECT task_id, eval_id FROM tasks WHERE status = 'QUEUED'").fetchall()
+        self.assertEqual({row["eval_id"] for row in waiting}, {eval_id})
+        self.assertEqual(len(claimed), 2)  # Both trials of the 4090 evaluation.
+
+        for bad in ({"endpoint": "http://10.0.0.5:4321"}, {"endpoint": "file:///etc", "token": "t" * 32},
+                    {"endpoint": "http://h:1/x?y", "token": "t" * 32}):
+            with self.subTest(bad=bad):
+                self.assertEqual(call(self.app, "PUT", f"/internal/v1/evaluations/{eval_id}/model-endpoint",
+                                      bad, bearer())[0], 422)
+        endpoint = {"endpoint": "http://10.0.0.5:4321", "token": "t" * 32}
+        self.assertEqual(call(self.app, "PUT", f"/internal/v1/evaluations/{resident}/model-endpoint",
+                              endpoint, bearer())[0], 404)
+        self.assertEqual(call(self.app, "PUT", f"/internal/v1/evaluations/{eval_id}/model-endpoint",
+                              endpoint, bearer())[0], 200)
+        with connect(self.settings) as connection:
+            store = TaskStore(connection)
+            row = store.claim_next_queued()
+            context = store.get_execution_context(row["task_id"], row["episode_id"])
+        self.assertEqual((context["accelerator"], context["model_endpoint"], context["model_token"]),
+                         ("h800", "http://10.0.0.5:4321", "t" * 32))
+
+        consumer = Consumer(self.settings, MagicMock(), self.redis, consumer_name="test", stream=self.stream,
+                            group=self.group, claim_idle_ms=0, model_service=FakeModelService())
+        with patch("alvarezgui.consumer.HttpModelService") as remote, \
+                patch.object(TaskStore, "mark_waiting_model", return_value=True), \
+                patch.object(TaskStore, "heartbeat_lease", return_value=True), \
+                patch.object(TaskStore, "validate_lease", return_value={}), \
+                patch.object(TaskStore, "mark_running_after_model", return_value=True):
+            remote.return_value.infer.return_value = FakeModelService().infer(InferenceRequest(
+                request_id="r", model_version="base-v1", instruction="i", image_uri="memory://x"))
+            consumer._next_action({**context, "current_step": 0}, {"image_uri": "memory://s"}, "s", "lease")
+            remote.assert_called_once_with("http://10.0.0.5:4321", self.settings.model_request_timeout_seconds,
+                                           "t" * 32)
+            with self.assertRaisesRegex(Exception, "H800 model service"):
+                consumer._next_action({**context, "current_step": 0, "model_endpoint": None},
+                                      {"image_uri": "memory://s"}, "s", "lease")
+
+        self.assertEqual(call(self.app, "PUT", f"/internal/v1/evaluations/{eval_id}/model-endpoint",
+                              {"endpoint": None, "token": None}, bearer())[0], 200)
+        status, _, payload = call(self.app, "POST", f"/internal/v1/evaluations/{eval_id}/serving-failed",
+                                  {"message": "CUDA error"}, bearer())
+        self.assertEqual((status, json.loads(payload)["canceled_trials"]), (200, 2))
+        listed = json.loads(call(self.app, "GET", "/internal/v1/evaluations/h800", headers=bearer())[2])
+        self.assertEqual(listed, [])
+        with connect(self.settings) as connection:
+            reasons = {r["cancel_reason"] for r in connection.execute(
+                "SELECT cancel_reason FROM episodes JOIN tasks USING (task_id) WHERE eval_id = %s", (eval_id,)).fetchall()}
+        self.assertEqual(reasons, {"h800_model_service_failed: CUDA error"})
+
     def test_training_agent_protocol_rollouts_metrics_cancel(self) -> None:
         run_body = {
             "algorithm": "grpo", "base_model": "base-v1", "environment_version": "env", "reward_version": "r",
@@ -396,6 +584,39 @@ class ConsoleApiTest(unittest.TestCase):
         series = json.loads(call(self.app, "GET", f"/api/v1/training/runs/{run_id}/metrics", headers=bearer())[2])["series"]
         self.assertEqual(series["train/loss"], [[1, 0.5], [2, 0.3]])
         call(self.app, "POST", f"/internal/v1/training/runs/{run_id}/logs", {"lines": ["hello"]}, bearer())
+
+        # Runtime errors are rerun with the same seed; policy outcomes are not.
+        retry = lambda: json.loads(call(self.app, "POST", f"/internal/v1/training/runs/{run_id}/rollouts/retry",
+                                        {"round": 0, "max_attempts": 3}, bearer())[2])["tasks"]
+        self.assertEqual(retry(), [])
+        with connect(self.settings) as connection:
+            first, second = connection.execute(
+                "SELECT task_id FROM tasks WHERE run_id = %s AND round = 0 ORDER BY seed", (run_id,)).fetchall()
+            connection.execute("UPDATE tasks SET status = 'FAILED' WHERE task_id = ANY(%s)",
+                               ([first["task_id"], second["task_id"]],))
+            connection.execute("UPDATE episodes SET result = %s WHERE task_id = %s",
+                               (json.dumps({"error": "screenshot upload failed: ClientError"}), first["task_id"]))
+            connection.execute("UPDATE episodes SET result = %s WHERE task_id = %s",
+                               (json.dumps({"error": "maximum task steps exceeded"}), second["task_id"]))
+        retried = retry()
+        self.assertEqual(len(retried), 1)
+        self.assertEqual(retry(), [])  # The rerun is still queued.
+        rollouts = lambda: json.loads(call(self.app, "GET", f"/internal/v1/training/runs/{run_id}/rollouts?round=0",
+                                           headers=bearer())[2])["tasks"]
+        state = rollouts()
+        self.assertEqual([(t["seed"], t["attempts"], t["outcome"]) for t in state],
+                         [(0, 2, "queued"), (1, 1, "max_steps")])
+        for _ in range(2):  # Attempts 2 and 3 hit runtime errors too.
+            with connect(self.settings) as connection:
+                connection.execute("UPDATE tasks SET status = 'FAILED' WHERE task_id = %s", (retried[0]["task_id"],))
+                connection.execute("UPDATE episodes SET result = %s WHERE task_id = %s",
+                                   (json.dumps({"error": "sandbox is unhealthy"}), retried[0]["task_id"]))
+            retried = retry()
+        self.assertEqual(retried, [])  # Three attempts used up.
+        self.assertEqual([(t["attempts"], t["outcome"]) for t in rollouts()], [(3, "error"), (1, "max_steps")])
+        with connect(self.settings) as connection:
+            seeds = connection.execute("SELECT seed FROM tasks WHERE run_id = %s AND round = 0", (run_id,)).fetchall()
+        self.assertEqual(sorted(r["seed"] for r in seeds), [0, 0, 0, 1])
 
         call(self.app, "POST", f"/internal/v1/training/runs/{run_id}/rollouts", {**rollout, "round": 1}, bearer())
         status, _, payload = call(self.app, "POST", f"/api/v1/training/runs/{run_id}/cancel", headers=bearer())
@@ -678,6 +899,21 @@ class ConsoleApiTest(unittest.TestCase):
                 "SELECT 1 FROM evaluations WHERE eval_id = %s", (eval_id,)
             ).fetchone())
 
+    def test_protected_base_model_cannot_be_deleted(self) -> None:
+        with connect(self.settings) as connection:
+            for version, base in (("minicpm-v-4.7-1b", "MiniCPM-V"), ("qwen3-vl-8b-instruct", "Qwen3-VL")):
+                RegistryStore(connection).register_model(ModelVersionRequest(
+                    version=version, base_model=base, status="READY"))
+        catalog = json.loads(call(self.app, "GET", "/api/v1/catalog", headers=bearer())[2])
+        self.assertEqual({m["version"]: m["protected"] for m in catalog["model_versions"]},
+                         {"base-v1": False, "grpo-v1": False, "minicpm-v-4.7-1b": True, "qwen3-vl-8b-instruct": True})
+        for version in ("minicpm-v-4.7-1b", "qwen3-vl-8b-instruct"):
+            for query in ("", "?cascade_training_runs=true"):
+                status, _, payload = call(self.app, "DELETE", f"/api/v1/model-versions/{version}{query}", headers=bearer())
+                self.assertEqual((status, json.loads(payload)["detail"]["code"]), (409, "MODEL_PROTECTED"))
+            self.assertEqual(json.loads(call(self.app, "GET", f"/internal/v1/model-versions/{version}",
+                                             headers=bearer())[2])["status"], "READY")
+
     def test_delete_model_without_checkpoint_is_idempotent(self) -> None:
         status, _, payload = call(self.app, "DELETE", "/api/v1/model-versions/grpo-v1", headers=bearer())
         self.assertEqual((status, json.loads(payload)), (200, {
@@ -884,6 +1120,28 @@ class ConsoleApiTest(unittest.TestCase):
         self.assertIsNotNone(scheduler.run_once())
         self.assertIsNone(scheduler.run_once())
 
+    def test_node_concurrency_limits_are_set_in_console_within_reported_ceiling(self) -> None:
+        beat = {"role": "docker", "capacity": {"sandboxes": 4, "max_sandboxes": 7}, "resources": {}}
+        reply = json.loads(call(self.app, "POST", "/internal/v1/nodes/d1/heartbeat", beat, bearer())[2])
+        self.assertEqual(reply["capacity"]["sandboxes"], 4)
+        path = "/api/v1/nodes/d1/limits"
+        self.assertEqual(call(self.app, "PUT", path, {"sandboxes": 6})[0], 401)
+        for bad in ({"sandboxes": 8}, {"sandboxes": 0}, {"sandboxes": "6"}, {"gpus": 1}, {}):
+            with self.subTest(bad=bad):
+                self.assertEqual(call(self.app, "PUT", path, bad, bearer())[0], 422)
+        self.assertEqual(call(self.app, "PUT", "/api/v1/nodes/nope/limits", {"sandboxes": 1}, bearer())[0], 404)
+        status, _, payload = call(self.app, "PUT", path, {"sandboxes": 6}, bearer())
+        self.assertEqual((status, json.loads(payload)["capacity"]["sandboxes"]), (200, 6))
+        # The node keeps reporting its own default; the console value wins and reaches the node via the reply.
+        reply = json.loads(call(self.app, "POST", "/internal/v1/nodes/d1/heartbeat", beat, bearer())[2])
+        self.assertEqual(reply["capacity"], {"sandboxes": 6, "max_sandboxes": 7})
+        overview = json.loads(call(self.app, "GET", "/api/v1/overview", headers=bearer())[2])
+        self.assertEqual(overview["nodes"][0]["capacity"]["sandboxes"], 6)
+        # A node restarted with a smaller ceiling caps the stored value instead of exceeding it.
+        reply = json.loads(call(self.app, "POST", "/internal/v1/nodes/d1/heartbeat",
+                                {**beat, "capacity": {"sandboxes": 2, "max_sandboxes": 3}}, bearer())[2])
+        self.assertEqual(reply["capacity"]["sandboxes"], 3)
+
     def test_node_heartbeat_and_overview(self) -> None:
         beat = {"role": "gpu", "capacity": {"gpus": 1}, "resources": {"gpus": []}, "heartbeat_interval_seconds": 10}
         self.assertEqual(call(self.app, "POST", "/internal/v1/nodes/gpu-1/heartbeat", beat, bearer())[0], 200)
@@ -941,7 +1199,8 @@ class ConsolePureTest(unittest.TestCase):
             for backend in ("docker", "firecracker", None):
                 with self.subTest(backend=backend):
                     cp = MagicMock()
-                    cp.call.return_value = {"eval_id": "eval-test"}
+                    cp.call.side_effect = lambda method, path, *args: (
+                        {"model_versions": []} if path == "/api/v1/catalog" else {"eval_id": "eval-test"})
                     agent = TrainingAgent(cp, node_id="gpu-test", checkpoint_root=root,
                                           work_root=root, model_service_url=None)
                     run = {
@@ -980,6 +1239,116 @@ class ConsolePureTest(unittest.TestCase):
             self.assertEqual([call.args[-1] for call in train.call_args_list], [0, 10, 20])
             self.assertEqual(version, "r2")
             self.assertEqual((metrics["update_count"], metrics["step_count"]), (4, 10))
+
+    def test_publish_promotes_prunes_outside_retention_and_evaluates(self) -> None:
+        uri = lambda name: f"file:///home/alvarez-checkpoints/run_x/{name}"
+        self.assertTrue(checkpoint_retained(uri("final"), None))
+        self.assertTrue(checkpoint_retained(uri("round-4"), 5))  # round-4 is the 5th round
+        self.assertFalse(checkpoint_retained(uri("round-5"), 5))
+        self.assertFalse(checkpoint_retained(uri("round-4"), None))
+        self.assertTrue(checkpoint_retained(uri("epoch-4"), 2))
+        self.assertFalse(checkpoint_retained(uri("epoch-3"), 2))
+        self.assertTrue(checkpoint_retained("file:///home/alvarez-checkpoints/merged/m", 2))
+        versions = [{"version": f"g-r{n}", "run_id": "run_x", "status": "REGISTERED", "checkpoint_uri": uri(f"round-{n}")}
+                    for n in range(6)]
+        versions.append({"version": "other-r0", "run_id": "run_y", "status": "REGISTERED", "checkpoint_uri": uri("round-0")})
+        deleted, loaded = [], {"g-r2"}
+
+        def call(method, path, body=None, headers=None):
+            if path == "/api/v1/catalog":
+                return {"model_versions": versions}
+            if not path.startswith("/api/v1/model-versions/"):
+                return {"eval_id": "e"}
+            version = path.split("/")[4]
+            if method == "DELETE":
+                if version in loaded:
+                    raise HTTPError(path, 409, "loaded", {}, io.BytesIO(b'{"detail":{"code":"MODEL_LOADED"}}'))
+                deleted.append(version)
+            elif path.endswith("/offline"):
+                loaded.discard(version)
+            return {}
+
+        cp = MagicMock()
+        cp.call.side_effect = call
+        agent = TrainingAgent(cp, node_id="t", checkpoint_root=Path("/tmp"), work_root=Path("/tmp"), model_service_url=None)
+        agent.publish({"run_id": "run_x", "base_model": "b", "config": {
+            "checkpoint_every": 2, "eval_trials": 1, "max_steps": 1,
+            "tasks": [{"task_type": "shopping", "app_image": "android-shop-v1"}]}}, "g-r5")
+        self.assertEqual(cp.call.call_args_list[0].args[:2], ("POST", "/api/v1/model-versions/g-r5/promote"))
+        # Every 2nd round stays (r1, r3), the model r5 stays, and the loaded r2 is unloaded first.
+        self.assertEqual(deleted, ["g-r0", "g-r2", "g-r4"])
+        self.assertIn(("POST", "/api/v1/model-versions/g-r2/offline"), [c.args[:2] for c in cp.call.call_args_list])
+        paths = [c.args[1] for c in cp.call.call_args_list]
+        self.assertGreater(paths.index("/api/v1/evaluations"), paths.index("/api/v1/model-versions/g-r4"))
+
+    def test_register_epochs_registers_epoch_models_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for epoch in (10, 2, 4):
+                (root / f"epoch-{epoch}").mkdir()
+                (root / f"epoch-{epoch}/config.json").write_text("{}")
+                (root / f"epoch-{epoch}/metrics.json").write_text(json.dumps({"epoch": epoch}))
+            (root / ".epoch-6.incomplete").mkdir()
+            (root / "final").mkdir()
+            cp = MagicMock()
+            agent = TrainingAgent(cp, node_id="t", checkpoint_root=root, work_root=root, model_service_url=None)
+            agent.register_epochs({"run_id": "run_x", "base_model": "b", "config": {"model_name": "m"}}, root)
+            bodies = [c.args[2] for c in cp.call.call_args_list if c.args[1] == "/internal/v1/model-versions"]
+            self.assertEqual([b["version"] for b in bodies], ["m-e2", "m-e4", "m-e10"])
+            self.assertEqual({b["run_id"] for b in bodies}, {"run_x"})
+            self.assertEqual(bodies[0]["metrics"], {"epoch": 2})
+
+    def test_finished_rollouts_waits_for_runtime_error_retries(self) -> None:
+        done = [{"outcome": "success", "attempts": 1}, {"outcome": "error", "attempts": 1}]
+        retries = iter([[{"task_id": "t"}], []])
+        cp = MagicMock()
+        cp.call.side_effect = lambda method, path, body=None: (
+            {"status": "RUNNING", "tasks": done} if method == "GET"
+            else {"tasks": next(retries)} if path.endswith("/retry") else {})
+        agent = TrainingAgent(cp, node_id="t", checkpoint_root=Path("/tmp"), work_root=Path("/tmp"), model_service_url=None)
+        run = {"run_id": "run_x"}
+        self.assertIsNone(agent.finished_rollouts(run, 2))  # Retry queued: keep waiting.
+        retry_call = next(c for c in cp.call.call_args_list if c.args[0] == "POST" and c.args[1].endswith("/retry"))
+        self.assertEqual(retry_call.args[2], {"round": 2, "max_attempts": 3})
+        self.assertEqual(agent.finished_rollouts(run, 2), done)  # Attempts used up: train without it.
+        self.assertEqual(rollout_metrics([{**r, "reward_total": 1.0, "steps": 1, "group_id": "g"} for r in done]
+                                         + [{"outcome": "success", "attempts": 3, "reward_total": 0.0, "steps": 1,
+                                             "group_id": "g"}])["rollout/retries"], 2.0)
+
+    def test_round_tasks_cover_pool_before_repeating(self) -> None:
+        pool = [{"task_type": "sokoban", "app_image": f"android-sokoban-v1:train-{i:03d}"} for i in range(5)]
+        config = {"tasks": pool, "tasks_per_round": 2, "seed": 7}
+        rounds = [round_tasks(config, number) for number in range(5)]
+        self.assertEqual(rounds, [round_tasks(config, number) for number in range(5)])  # resumable
+        self.assertTrue(all(len(tasks) == 2 for tasks in rounds))
+        picks = [task["app_image"] for tasks in rounds for task in tasks]
+        self.assertEqual(sorted(picks[:5]), sorted(t["app_image"] for t in pool))
+        self.assertEqual(sorted(picks[5:10]), sorted(t["app_image"] for t in pool))
+        self.assertEqual(round_tasks({"tasks": pool}, 3), pool)  # legacy runs: whole pool every round
+
+    def test_task_sets_expand_into_training_and_evaluation_tasks(self) -> None:
+        config = TrainingConfig(train_set="sokoban-train", eval_set="sokoban-validation", tasks_per_round=4)
+        self.assertEqual(len(config.tasks), 48)
+        self.assertEqual(config.eval_tasks[0].app_image, "android-sokoban-v1:validation-000")
+        # A stored, already-expanded config can be submitted again.
+        TrainingConfig(**config.model_dump())
+        for bad, message in (
+            ({"train_set": "sokoban-train", "eval_set": "sokoban-test"}, "tasks_per_round is required"),
+            ({"train_set": "sokoban-train", "tasks_per_round": 4}, "at most 8 tasks"),
+            ({"eval_set": "sokoban-train"}, "at most 8 tasks"),
+            ({"train_set": "nope"}, "unknown task set"),
+            ({"eval_set": "sokoban-test", "eval_tasks": [{"task_type": "shopping", "app_image": "android-shop-v1"}]},
+             "conflicts"),
+        ):
+            with self.subTest(bad), self.assertRaisesRegex(ValidationError, message):
+                TrainingConfig(**bad)
+        cp = MagicMock()
+        cp.call.return_value = {"eval_id": "eval-test"}
+        agent = TrainingAgent(cp, node_id="t", checkpoint_root=Path("/tmp"), work_root=Path("/tmp"),
+                              model_service_url=None)
+        agent.queue_evaluation({"run_id": "r", "base_model": "b", "config": config.model_dump(mode="json")}, "v")
+        evaluation = next(call for call in cp.call.call_args_list if call.args[1] == "/api/v1/evaluations")
+        self.assertEqual(evaluation.args[2]["tasks"], config.model_dump(mode="json")["eval_tasks"])
 
     def test_named_training_artifact_version(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1030,13 +1399,17 @@ class ConsolePureTest(unittest.TestCase):
             self.assertIsNone(screenshot_path("http://example.com/a.png", [root]))
 
     def test_lora_configuration_and_agent_forwarding(self) -> None:
-        config = TrainingConfig(finetuning_method="lora", output_format="sokoban-plan-v1", seed=42)
+        config = TrainingConfig(finetuning_method="lora", output_format="sokoban-plan-v1", seed=42,
+                                train_merger_mlp=True, multiview=True, batch_size=4,
+                                cache_preprocessed=True, gradient_checkpointing=False, shuffle=True)
         request = dict(algorithm="sft", base_model="base", dataset_version="data",
                        environment_version="env", reward_version="reward", config=config)
         self.assertEqual(TrainingRunRequest(**request).config.output_format, "sokoban-plan-v1")
         for algorithm in ("grpo", "gigpo"):
             with self.assertRaises(ValidationError):
                 TrainingRunRequest(**{**request, "algorithm": algorithm})
+        with self.assertRaisesRegex(ValidationError, "requires LoRA"):
+            TrainingRunRequest(**{**request, "config": config.model_copy(update={"finetuning_method": "full"})})
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             agent = TrainingAgent(MagicMock(), node_id="test", checkpoint_root=root,
@@ -1047,6 +1420,12 @@ class ConsolePureTest(unittest.TestCase):
             self.assertEqual(train.call_args.kwargs["finetuning_method"], "lora")
             self.assertEqual(train.call_args.kwargs["output_format"], "sokoban-plan-v1")
             self.assertEqual(train.call_args.kwargs["seed"], 42)
+            self.assertTrue(train.call_args.kwargs["train_merger_mlp"])
+            self.assertTrue(train.call_args.kwargs["multiview"])
+            self.assertEqual(train.call_args.kwargs["batch_size"], 4)
+            self.assertTrue(train.call_args.kwargs["cache_preprocessed"])
+            self.assertFalse(train.call_args.kwargs["gradient_checkpointing"])
+            self.assertTrue(train.call_args.kwargs["shuffle"])
             (root / "adapter_config.json").write_text("{}")
             self.assertEqual(agent.register({"run_id": "r", "base_model": "base"}, root, {}, "final"), "r-final")
             with self.assertRaisesRegex(ValueError, "currently require SFT"):
@@ -1092,6 +1471,11 @@ class ConsolePureTest(unittest.TestCase):
         metrics = rollout_metrics(rollouts)
         self.assertEqual((metrics["rollout/zero_variance_groups"], metrics["rollout/errors"]), (1.0, 1.0))
         self.assertEqual(metrics["rollout/success_rate"], 0.75)
+        self.assertNotIn("rollout/entropy", metrics)  # Older model services report no entropy.
+        rollouts[0]["step_records"] = [{"model_output": {"entropy": 0.5}}, {"model_output": {"entropy": None}}]
+        rollouts[1]["step_records"] = [{"model_output": {"entropy": 0.1}}, {"model_output": None}]
+        rollouts[2]["step_records"] = [{"model_output": {"entropy": 9.0}}]  # error rollouts are not scored
+        self.assertAlmostEqual(rollout_metrics(rollouts)["rollout/entropy"], 0.3)
 
     def test_minicpm_service_loads_on_demand_and_evicts_lru(self) -> None:
         loads: list[str] = []
@@ -1112,7 +1496,7 @@ class ConsolePureTest(unittest.TestCase):
             return f"/ckpt/{version}"
 
         service = MiniCPMService(resolver, max_loaded=2, loader=loader)
-        service._generate = lambda model, processor, messages, request: '{"type":"back"}'
+        service._generate = lambda model, processor, messages, request: ('{"type":"back"}', None)
 
         def infer(version: str) -> None:
             with patch("alvarezgui.minicpm_service._read_image", return_value=object()):

@@ -111,6 +111,19 @@ class SchedulerTest(unittest.TestCase):
         consumer.close()
         self.assertEqual(consumer._available_slots(), 2)
 
+    def test_consumer_worker_count_changes_while_running(self) -> None:
+        consumer = self.consumer(worker_count=2)
+        release = threading.Event()
+        consumer._process_and_ack = lambda message_id, fields: release.wait(timeout=5)
+        entries = [(f"{i}-0", {"task_id": f"task-{i}"}) for i in range(5)]
+        self.assertEqual(consumer._submit_batch(entries), 2)
+        consumer.worker_count = 1  # Lowered: running work continues, nothing new starts.
+        self.assertEqual(consumer._available_slots(), 0)
+        consumer.worker_count = 4  # Raised beyond the starting size: the pool grows with it.
+        self.assertEqual(consumer._submit_batch(entries[2:]), 2)
+        release.set()
+        consumer.close()
+
     def status(self, task_id: str) -> dict:
         with connect(self.settings) as connection:
             return TaskStore(connection).get_dispatch(task_id)
@@ -223,6 +236,37 @@ class SchedulerTest(unittest.TestCase):
                 ))
             self.assertIsNotNone(scheduler.run_once())
             self.assertIsNone(scheduler.run_once())
+            with connect(self.settings) as connection:
+                ConsoleStore(connection).heartbeat_node("remote-docker", NodeHeartbeat(
+                    role="docker", capacity={"sandboxes": 1, "max_sandboxes": 2},
+                ))
+                ConsoleStore(connection).set_node_limits("remote-docker", {"sandboxes": 2})
+            self.assertIsNotNone(scheduler.run_once())  # The console limit, not the reported default, applies.
+        finally:
+            with connect(self.settings) as connection:
+                connection.execute("TRUNCATE nodes")
+
+    def test_scheduler_dispatches_a_batch_up_to_capacity_at_once(self) -> None:
+        with connect(self.settings) as connection:
+            connection.execute("TRUNCATE nodes")
+            store = TaskStore(connection)
+            for _ in range(5):
+                store.create_task(TaskCreateRequest(
+                    task_type="shopping", instruction="buy", app_image="android-shop-v1",
+                    policy_version="policy-v1", max_steps=2,
+                ), uuid.uuid4().hex)
+            ConsoleStore(connection).heartbeat_node("local-firecracker", NodeHeartbeat(
+                role="microvm", capacity={"sandboxes": 3},
+            ))
+        scheduler = Scheduler(self.settings, self.redis, stream=self.stream, group=self.group,
+                              use_node_capacity=True)
+        try:
+            self.assertEqual(scheduler.run_until_idle(), 3)
+            self.assertEqual(scheduler.run_until_idle(), 0)  # full: the rest stay QUEUED
+            with connect(self.settings) as connection:
+                self.assertEqual(TaskStore(connection).count_active("firecracker"), 3)
+                self.assertEqual(connection.execute(
+                    "SELECT count(*) AS n FROM tasks WHERE status = 'QUEUED'").fetchone()["n"], 2)
         finally:
             with connect(self.settings) as connection:
                 connection.execute("TRUNCATE nodes")

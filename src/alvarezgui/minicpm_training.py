@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 import math
+import random
 import shutil
 import time
 from collections import defaultdict
@@ -13,7 +14,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from alvarezgui.minicpm_service import _read_image
+from alvarezgui.minicpm_service import _read_image, token_entropies
+from alvarezgui.model_families import MINICPM_V_4_7, ModelFamily, model_family, prepare_model
 from alvarezgui.policy_output import PLAN_INSTRUCTION_MARKER, parse_policy_output, policy_instruction
 from alvarezgui.sokoban import parse_board
 
@@ -142,25 +144,18 @@ def _adapter_base_model(path: str | Path) -> str | None:
 
 
 def _language_attention_targets(model: Any, torch: Any) -> list[str]:
-    # MiniCPM-V 4.7 uses Qwen3.5: full attention and gated linear attention alternate.
-    # Full paths are essential: the vision tower also has q_proj/k_proj/v_proj names.
-    config = model.config
-    text_config = getattr(config, "text_config", None)
-    if getattr(config, "model_type", None) != "minicpmv4_7" or getattr(text_config, "model_type", None) != "qwen3_5_text":
-        raise ValueError("LoRA target discovery supports MiniCPM-V 4.7 with Qwen3.5 text only")
-    layer_types = getattr(text_config, "layer_types", [])
-    if not layer_types or len(layer_types) != text_config.num_hidden_layers:
+    # Full paths are essential: vision towers also have q_proj/k_proj/v_proj names.
+    family = model_family(model.config)
+    layers = getattr(getattr(model.config, "text_config", None), "num_hidden_layers", None)
+    if not isinstance(layers, int) or layers < 1:
         raise ValueError("language layer configuration is incomplete")
     linear_names = [name for name, module in model.named_modules() if isinstance(module, torch.nn.Linear)]
     targets = []
-    for index, layer_type in enumerate(layer_types):
-        attention = {"full_attention": "self_attn", "linear_attention": "linear_attn"}.get(layer_type)
-        if attention is None:
-            raise ValueError(f"unsupported language layer type: {layer_type}")
-        prefix = f"model.language_model.layers.{index}.{attention}."
-        layer_targets = [name for name in linear_names if name.startswith(prefix)]
+    for index in range(layers):
+        prefixes = tuple(f"{family.language_layers}.{index}.{attention}." for attention in family.attention_modules)
+        layer_targets = [name for name in linear_names if name.startswith(prefixes)]
         if not layer_targets:
-            raise ValueError(f"no language attention linear modules found under {prefix}")
+            raise ValueError(f"no {family.name} language attention linear modules under {prefixes}")
         targets.extend(layer_targets)
     return targets
 
@@ -170,13 +165,11 @@ def _top_layer_modules(config: Any, count: int) -> list[str]:
         raise ValueError("train_top_layers must be a non-negative integer")
     if count == 0:
         return []
-    text_config = getattr(config, "text_config", None)
-    if getattr(config, "model_type", None) != "minicpmv4_7" or getattr(text_config, "model_type", None) != "qwen3_5_text":
-        raise ValueError("top-layer training supports MiniCPM-V 4.7 with Qwen3.5 text only")
-    total = text_config.num_hidden_layers
+    family = model_family(config)
+    total = config.text_config.num_hidden_layers
     if count >= total:
         raise ValueError("train_top_layers must leave at least one language layer for LoRA")
-    return [f"model.language_model.layers.{index}" for index in range(total - count, total)]
+    return [f"{family.language_layers}.{index}" for index in range(total - count, total)]
 
 
 def _lora_model(
@@ -194,9 +187,10 @@ def _lora_model(
     top_modules = _top_layer_modules(model.config, train_top_layers)
     targets = [name for name in _language_attention_targets(model, torch)
                if not any(name.startswith(f"{module}.") for module in top_modules)]
-    merger_module = "model.merger.mlp.0"
+    family = model_family(model.config)
+    merger_module = family.merger_module
     if train_merger_mlp and not any(name == merger_module for name, _ in model.named_modules()):
-        raise ValueError(f"MiniCPM model has no supported merger module: {merger_module}")
+        raise ValueError(f"{family.name} model has no supported merger module: {merger_module}")
     modules_to_save = top_modules + ([merger_module] if train_merger_mlp else [])
     if adapter_path is None:
         config = LoraConfig(
@@ -276,6 +270,7 @@ def _prepare(
     processor: Any,
     row: dict[str, Any],
     *,
+    family: ModelFamily,
     prompt_only: bool = False,
     image: Any | None = None,
     multiview: bool = False,
@@ -292,9 +287,7 @@ def _prepare(
         add_generation_prompt=prompt_only,
         return_dict=True,
         return_tensors="pt",
-        downsample_mode="16x",
-        max_slice_nums=36,
-        enable_thinking=False,
+        **family.chat_template_kwargs,
     )
     input_length = int(batch.input_ids.shape[-1])
     return batch, input_length
@@ -305,10 +298,14 @@ def _masked_batch(
     row: dict[str, Any],
     torch: Any,
     *,
+    family: ModelFamily,
     multiview: bool = False,
 ) -> tuple[Any, Any]:
-    batch, _ = _prepare(processor, row, multiview=multiview)
-    _, prompt_length = _prepare(processor, row, prompt_only=True, multiview=multiview)
+    batch, _ = _prepare(processor, row, family=family, multiview=multiview)
+    prompt, prompt_length = _prepare(processor, row, family=family, prompt_only=True, multiview=multiview)
+    if not torch.equal(batch.input_ids[:, :prompt_length], prompt.input_ids):
+        # Loss masking assumes the chat template renders the prompt identically with and without the answer.
+        raise ValueError(f"{family.name} chat template: the prompt is not a prefix of the full conversation")
     labels = batch.input_ids.clone()
     labels[:, :prompt_length] = -100
     if getattr(processor, "tokenizer", None) is not None:
@@ -318,22 +315,20 @@ def _masked_batch(
     return batch, labels
 
 
-def _collate_sft(samples: list[tuple[Any, Any]], processor: Any, torch: Any) -> tuple[dict[str, Any], Any]:
-    """Collate the verified MiniCPM-V 4.7 image schema, preserving row/slice order."""
-    text_keys = ("input_ids", "attention_mask", "mm_token_type_ids")
-    expected_keys = {*text_keys, "pixel_values", "target_sizes"}
+def _collate_sft(
+    samples: list[tuple[Any, Any]], processor: Any, torch: Any, *, family: ModelFamily,
+) -> tuple[dict[str, Any], Any]:
+    """Collate a family's verified processor schema, preserving row/image order."""
+    image_keys, text_keys = family.image_concat, family.text_keys
     pad_token_id = processor.tokenizer.pad_token_id
     if pad_token_id is None:
         raise ValueError("SFT batching requires a tokenizer pad_token_id")
     for batch, labels in samples:
-        if set(batch) != expected_keys:
-            raise ValueError(f"unsupported MiniCPM SFT processor keys: {sorted(batch)}")
+        if set(batch) != {*text_keys, *image_keys}:
+            raise ValueError(f"unsupported {family.name} SFT processor keys: {sorted(batch)}")
         length = batch["input_ids"].shape[-1]
         if any(batch[key].shape != (1, length) for key in text_keys) or labels.shape != (1, length):
             raise ValueError("SFT collation expects individually prepared token sequences")
-        if (batch["pixel_values"].ndim != 4 or batch["pixel_values"].shape[0] != 1
-                or batch["target_sizes"].ndim != 2 or batch["target_sizes"].shape[1] != 2):
-            raise ValueError("unsupported MiniCPM packed image schema")
     length = max(labels.shape[-1] for _, labels in samples)
 
     def pad(value: Any, fill: int) -> Any:
@@ -341,9 +336,8 @@ def _collate_sft(samples: list[tuple[Any, Any]], processor: Any, torch: Any) -> 
 
     batch = {key: torch.cat([pad(sample[key], pad_token_id if key == "input_ids" else 0)
                              for sample, _ in samples], dim=0) for key in text_keys}
-    # NaViT packs all image slices into one strip; forward consumes pixel_values[:1].
-    batch["pixel_values"] = torch.cat([sample["pixel_values"] for sample, _ in samples], dim=-1)
-    batch["target_sizes"] = torch.cat([sample["target_sizes"] for sample, _ in samples], dim=0)
+    for key, dim in image_keys.items():
+        batch[key] = torch.cat([sample[key] for sample, _ in samples], dim=dim)
     labels = torch.cat([pad(labels, -100) for _, labels in samples], dim=0)
     labels[batch["attention_mask"] == 0] = -100
     return batch, labels
@@ -375,17 +369,19 @@ def _perception_feature_views(
     multiview: bool = False,
     required_views: set[str] | None = None,
 ) -> dict[str, Any]:
+    # Perception heads read MiniCPM vision-encoder internals; train_perception rejects other families.
     if not multiview:
         if image is None:
-            batch, _ = _prepare(processor, row, prompt_only=True)
+            batch, _ = _prepare(processor, row, family=MINICPM_V_4_7, prompt_only=True)
         else:
-            batch, _ = _prepare(processor, row, prompt_only=True, image=image)
+            batch, _ = _prepare(processor, row, family=MINICPM_V_4_7, prompt_only=True, image=image)
         return {"full": _visual_features(model, _move(batch, device), torch, spatial=True).float()}
     full_image = image if image is not None else _read_image(Path(row["image"]).as_uri(), 30)
     images = {"full": full_image, "board-crop": _board_crop_image(full_image)}
     return {
         view: _visual_features(
-            model, _move(_prepare(processor, row, prompt_only=True, image=view_image)[0], device), torch, spatial=True
+            model, _move(_prepare(processor, row, family=MINICPM_V_4_7, prompt_only=True, image=view_image)[0], device),
+            torch, spatial=True
         ).float()
         for view, view_image in images.items()
         if required_views is None or view in required_views
@@ -628,6 +624,22 @@ def _checkpoint(model: Any, processor: Any, accelerator: Any, output_dir: Path) 
         processor.save_pretrained(output_dir)
 
 
+def _save_epoch_model(model: Any, processor: Any, accelerator: Any, target: Path,
+                      policy_config: dict[str, Any], metrics: dict[str, Any]) -> None:
+    """Publish an intermediate model; the rename keeps a partial save from looking complete."""
+    pending = target.with_name(f".{target.name}.incomplete")
+    if accelerator.is_main_process and pending.exists():
+        shutil.rmtree(pending)
+    _checkpoint(model, processor, accelerator, pending)
+    if accelerator.is_main_process:
+        (pending / "policy_config.json").write_text(json.dumps(policy_config, indent=2), encoding="utf-8")
+        (pending / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        if target.exists():
+            shutil.rmtree(target)
+        pending.rename(target)
+    accelerator.wait_for_everyone()
+
+
 def _validate_grpo_rows(rows: list[dict[str, Any]], group_size: int, require_old_logprob: bool = True) -> None:
     group_counts = defaultdict(int)
     for row in rows:
@@ -688,6 +700,8 @@ def train_perception(
     accelerator = Accelerator(gradient_accumulation_steps=gradient_accumulation, mixed_precision="bf16")
     processor = AutoProcessor.from_pretrained(base_model)
     model = AutoModelForImageTextToText.from_pretrained(base_model, torch_dtype=torch.bfloat16)
+    if model_family(model.config) is not MINICPM_V_4_7:
+        raise ValueError("perception diagnostics support MiniCPM-V 4.7 only")
     model.requires_grad_(False)
     model.eval()
     model.to(accelerator.device)
@@ -950,8 +964,18 @@ def train(
     batch_size: int = 1,
     cache_preprocessed: bool = False,
     gradient_checkpointing: bool = True,
+    shuffle: bool = False,
+    save_every: int | None = None,
+    sampling_temperature: float | None = None,
 ) -> dict[str, Any]:
     """Train and save a checkpoint.
+
+    ``sampling_temperature`` is the temperature online rollouts were sampled at; policy log-probabilities
+    (old and current) are computed from logits divided by it, so the ratio is over the sampling
+    distribution. None or 0 (greedy sampling) leaves logits unscaled. ``train/entropy`` stays at T=1.
+
+    ``save_every`` also publishes the model after every N-th epoch (before the last) as
+    ``<output_dir parent>/epoch-<completed epochs>``, with the same policy_config as the final one.
 
     ``checkpoint_dir`` enables single-process SFT epoch state saves and automatic resume.
     ``epochs`` is the total target, including completed epochs; it may be increased on resume.
@@ -968,10 +992,13 @@ def train(
     per accumulation window. ``cache_preprocessed`` keeps deterministic processor
     outputs on CPU. ``training_seconds`` includes transfers/forward/backward/updates,
     excluding preprocessing, callbacks and checkpoint saves in this invocation.
+    ``shuffle`` reorders SFT rows every epoch with a permutation seeded by ``seed`` and
+    the epoch number, so a resumed run replays the same order.
 
     ``compute_old_logprob`` fills missing policy ``old_logprob`` values with the loaded base policy
     before any update, which matches on-policy rollouts sampled from that same checkpoint.
     GIGPO currently uses this same GRPO-compatible clipped policy objective.
+    Policy algorithms ignore ``multiview`` and use the base checkpoint's ``visual_views``.
     """
     # ponytail: GIGPO is a GRPO alias; paper GiGPO needs step-level state grouping.
     if algorithm != "sft" and algorithm not in POLICY_ALGORITHMS:
@@ -980,10 +1007,10 @@ def train(
         raise ValueError("checkpoint_dir is supported only for SFT")
     if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
         raise ValueError("batch_size must be a positive integer")
-    if not isinstance(cache_preprocessed, bool) or not isinstance(gradient_checkpointing, bool):
-        raise ValueError("cache_preprocessed and gradient_checkpointing must be booleans")
-    if algorithm != "sft" and (batch_size > 1 or cache_preprocessed):
-        raise ValueError("batch_size > 1 and cache_preprocessed are supported only for SFT")
+    if not all(isinstance(value, bool) for value in (cache_preprocessed, gradient_checkpointing, shuffle)):
+        raise ValueError("cache_preprocessed, gradient_checkpointing and shuffle must be booleans")
+    if algorithm != "sft" and (batch_size > 1 or cache_preprocessed or shuffle):
+        raise ValueError("batch_size > 1, cache_preprocessed and shuffle are supported only for SFT")
     if finetuning_method not in ("full", "lora"):
         raise ValueError("finetuning_method must be full or lora")
     if train_merger_mlp and finetuning_method != "lora":
@@ -1003,10 +1030,22 @@ def train(
     adapter_base = _adapter_base_model(base_model)
     if adapter_base is not None and finetuning_method != "lora":
         raise ValueError("an existing adapter requires finetuning_method='lora'; full training cannot merge adapters")
+    if algorithm in POLICY_ALGORITHMS:
+        # Train the policy that was sampled: the model service picks views from the checkpoint's policy_config.
+        policy_path = Path(base_model) / "policy_config.json"
+        policy = json.loads(policy_path.read_text(encoding="utf-8")) if policy_path.is_file() else {}
+        multiview = policy.get("visual_views", "full") == "full+board-crop"
     if not rows or epochs < 1 or gradient_accumulation < 1:
         raise ValueError("training requires rows, positive epochs and gradient_accumulation")
     if not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed < 2**32:
         raise ValueError("seed must be an integer in [0, 2**32)")
+    if save_every is not None and (not isinstance(save_every, int) or isinstance(save_every, bool) or save_every < 1):
+        raise ValueError("save_every must be a positive integer")
+    if sampling_temperature is not None and (isinstance(sampling_temperature, bool)
+                                             or not isinstance(sampling_temperature, (int, float))
+                                             or not math.isfinite(sampling_temperature) or sampling_temperature < 0):
+        raise ValueError("sampling_temperature must be finite and non-negative")
+    logit_scale = float(sampling_temperature) if sampling_temperature else 1.0
     for row in rows:
         _validate_protocol(row, output_format)
     if algorithm in POLICY_ALGORITHMS:
@@ -1015,6 +1054,15 @@ def train(
         _validate_grpo_rows(rows, group_size, require_old_logprob=not compute_old_logprob)
     top_layer_options = ({"train_top_layers": train_top_layers, "top_layer_learning_rate": top_layer_learning_rate}
                          if train_top_layers else {})
+    policy_config = {
+        "output_format": output_format,
+        "max_tokens": POLICY_MAX_TOKENS[output_format],
+        "finetuning_method": finetuning_method,
+        "train_merger_mlp": train_merger_mlp,
+        **top_layer_options,
+        "visual_views": "full+board-crop" if multiview else "full",
+        "seed": seed,
+    }
     resume_path = None
     completed_epochs = 0
     losses: list[float] = []
@@ -1028,7 +1076,7 @@ def train(
             "seed": seed, "multiview": multiview, "train_merger_mlp": train_merger_mlp,
             "mixed_precision": "bf16", "dataset_sha256": _sft_dataset_digest(rows),
             "batch_size": batch_size, "cache_preprocessed": cache_preprocessed,
-            "gradient_checkpointing": gradient_checkpointing,
+            "gradient_checkpointing": gradient_checkpointing, "shuffle": shuffle,
             **top_layer_options,
         }
         checkpoints = _sft_checkpoints(checkpoint_dir)
@@ -1036,7 +1084,7 @@ def train(
             resume_path = checkpoints[-1]
             state = json.loads((resume_path / "training_state.json").read_text(encoding="utf-8"))
             saved_recipe = {"batch_size": 1, "cache_preprocessed": False, "gradient_checkpointing": True,
-                            **state["recipe"]}
+                            "shuffle": False, **state["recipe"]}
             if saved_recipe != recipe:
                 raise ValueError("SFT checkpoint recipe or dataset does not match this run")
             completed_epochs = state["completed_epochs"]
@@ -1063,7 +1111,9 @@ def train(
 
         top_modules = _top_layer_modules(AutoConfig.from_pretrained(adapter_base or base_model), train_top_layers)
     processor = AutoProcessor.from_pretrained(base_model)
-    model = AutoModelForImageTextToText.from_pretrained(adapter_base or base_model, torch_dtype=torch.bfloat16)
+    model = prepare_model(
+        AutoModelForImageTextToText.from_pretrained(adapter_base or base_model, torch_dtype=torch.bfloat16))
+    family = model_family(model.config)
     if finetuning_method == "lora":
         model = _lora_model(
             model, torch, base_model if adapter_base is not None else None,
@@ -1100,8 +1150,7 @@ def train(
     def masked_batch(row: dict[str, Any]) -> tuple[Any, Any]:
         nonlocal preprocessing_seconds
         before = time.monotonic()
-        result = (_masked_batch(processor, row, torch, multiview=True) if multiview
-                  else _masked_batch(processor, row, torch))
+        result = _masked_batch(processor, row, torch, family=family, multiview=multiview)
         preprocessing_seconds += time.monotonic() - before
         return result
 
@@ -1120,6 +1169,7 @@ def train(
     if on_cuda:
         torch.cuda.reset_peak_memory_stats(accelerator.device)
     advantages: list[float] = []
+    entropies: list[float] = []
     if algorithm in POLICY_ALGORITHMS:
         # Multi-step rollouts carry an episode-level advantage; single-step rows are grouped here.
         if all("advantage" in row for row in rows):
@@ -1136,16 +1186,19 @@ def train(
                 batch = _move(batch, accelerator.device)
                 with accelerator.autocast():
                     logits = model(**batch, use_cache=False).logits
-                row["old_logprob"] = float(_sequence_logprob(torch, logits, labels.to(accelerator.device)))
+                row["old_logprob"] = float(_sequence_logprob(torch, logits / logit_scale, labels.to(accelerator.device)))
         model.train()
     remainder = len(dataloader) % gradient_accumulation
     for epoch in range(completed_epochs, epochs):
+        order = list(range(len(rows)))
+        if shuffle:
+            random.Random(f"{seed}:{epoch}").shuffle(order)
         for batch_index, indices in enumerate(dataloader):
-            indices = [int(index) for index in indices]
+            indices = [order[int(index)] for index in indices]
             index = indices[0]
             row = rows[index]
             samples = [sample_batch(index) for index in indices]
-            batch, labels = samples[0] if len(samples) == 1 else _collate_sft(samples, processor, torch)
+            batch, labels = samples[0] if len(samples) == 1 else _collate_sft(samples, processor, torch, family=family)
             before_training = time.monotonic()
             batch = _move(batch, accelerator.device)
             labels = labels.to(accelerator.device)
@@ -1166,7 +1219,10 @@ def train(
                             sample_losses = _sft_sample_losses(torch, outputs.logits, labels)
                             loss = sample_losses.mean()
                     else:
-                        current_logprob = _sequence_logprob(torch, outputs.logits, labels)
+                        current_logprob = _sequence_logprob(torch, outputs.logits / logit_scale, labels)
+                        with torch.no_grad():  # Monitoring only; the objective has no entropy term.
+                            completion = labels[..., 1:] != -100
+                            entropy = float(token_entropies(torch, outputs.logits[..., :-1, :][completion]).mean())
                         old_logprob = torch.as_tensor(float(row["old_logprob"]), device=accelerator.device)
                         ratio = torch.exp(current_logprob - old_logprob)
                         advantage = torch.as_tensor(advantages[index], device=accelerator.device)
@@ -1205,10 +1261,21 @@ def train(
                         step_metrics["train/ratio"] = ratio_value
                         step_metrics["train/advantage"] = advantages[index]
                         step_metrics["train/clipped"] = float(abs(ratio_value - 1) > clip_epsilon)
+                        if math.isfinite(entropy):
+                            step_metrics["train/entropy"] = entropy
+                            entropies.append(entropy)
                     on_step(len(losses), step_metrics)
                 if checkpoint_dir is not None and len(losses) % 50 == 0:
                     print(json.dumps({"event": "sft_progress", "step": len(losses), "total": epochs * len(rows),
                                       "loss": sample_loss, "updates": updates}), flush=True)
+        # Before the resume state: a pod lost mid-save redoes this epoch and saves the model again.
+        if save_every and (epoch + 1) % save_every == 0 and epoch + 1 < epochs:
+            _save_epoch_model(model, processor, accelerator, Path(output_dir).parent / f"epoch-{epoch + 1}",
+                              policy_config, {
+                                  "algorithm": algorithm, "epoch": epoch + 1, "loss": sum(losses) / len(losses),
+                                  "sample_count": len(rows), "step_count": len(losses), "update_count": updates,
+                                  "base_model": base_model, **policy_config,
+                              })
         if checkpoint_dir is not None:
             _save_sft_epoch(accelerator, checkpoint_dir, {
                 "recipe": recipe, "completed_epochs": epoch + 1, "losses": losses, "updates": updates,
@@ -1235,6 +1302,7 @@ def train(
         "effective_batch_size": batch_size * gradient_accumulation,
         "cache_preprocessed": cache_preprocessed,
         "gradient_checkpointing": gradient_checkpointing,
+        "shuffle": shuffle,
         "base_model": base_model,
         "finetuning_method": finetuning_method,
         "train_merger_mlp": train_merger_mlp,
@@ -1243,6 +1311,7 @@ def train(
         "visual_views": "full+board-crop" if multiview else "full",
         "seed": seed,
         "group_size": group_size if algorithm in POLICY_ALGORITHMS else 0,
+        **({"entropy_mean": sum(entropies) / len(entropies)} if entropies else {}),
         "implementation": (
             "sft-cross-entropy"
             if algorithm == "sft"
@@ -1252,15 +1321,6 @@ def train(
     if checkpoint_dir is not None:
         metrics["completed_epochs"] = epochs
     if accelerator.is_main_process:
-        policy_config = {
-            "output_format": output_format,
-            "max_tokens": POLICY_MAX_TOKENS[output_format],
-            "finetuning_method": finetuning_method,
-            "train_merger_mlp": train_merger_mlp,
-            **top_layer_options,
-            "visual_views": "full+board-crop" if multiview else "full",
-            "seed": seed,
-        }
         Path(output_dir, "policy_config.json").write_text(json.dumps(policy_config, indent=2), encoding="utf-8")
         Path(output_dir, "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     return metrics
@@ -1300,6 +1360,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=1, help="SFT microbatch size")
     parser.add_argument("--cache-preprocessed", action="store_true", help="SFT: cache processor outputs on CPU")
     parser.add_argument("--no-gradient-checkpointing", dest="gradient_checkpointing", action="store_false")
+    parser.add_argument("--shuffle", action="store_true", help="SFT: reshuffle rows every epoch (seeded)")
     parser.add_argument("--group-size", type=int, default=2)
     parser.add_argument("--finetuning-method", choices=("full", "lora"), default="full")
     parser.add_argument("--output-format", choices=tuple(POLICY_MAX_TOKENS), default="action-v1")
@@ -1308,7 +1369,7 @@ def main() -> None:
     parser.add_argument("--direction-mlp", action="store_true", help="use a small MLP for the direction head")
     parser.add_argument("--structured-state", action="store_true", help="also train goal and wall-layout heads")
     parser.add_argument("--multiview", action="store_true", help="combine the full screenshot with a board crop")
-    parser.add_argument("--train-merger-mlp", action="store_true", help="train model.merger.mlp alongside language LoRA")
+    parser.add_argument("--train-merger-mlp", action="store_true", help="fully train the vision-language merger alongside language LoRA")
     parser.add_argument("--train-top-layers", type=int, default=0, help="SFT + LoRA: fully train the final N language layers")
     parser.add_argument("--top-layer-learning-rate", type=float, default=1e-6)
     parser.add_argument("--task-views", action="store_true", help="route state heads to full or board-crop views")
@@ -1317,8 +1378,8 @@ def main() -> None:
         parser.error("--checkpoint-dir is supported only for SFT")
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
-    if args.algorithm != "sft" and (args.batch_size > 1 or args.cache_preprocessed):
-        parser.error("--batch-size > 1 and --cache-preprocessed are supported only for SFT")
+    if args.algorithm != "sft" and (args.batch_size > 1 or args.cache_preprocessed or args.shuffle):
+        parser.error("--batch-size > 1, --cache-preprocessed and --shuffle are supported only for SFT")
     if args.train_top_layers < 0:
         parser.error("--train-top-layers must be non-negative")
     if args.train_top_layers and (args.algorithm != "sft" or args.finetuning_method != "lora"):
@@ -1360,6 +1421,7 @@ def main() -> None:
             batch_size=args.batch_size,
             cache_preprocessed=args.cache_preprocessed,
             gradient_checkpointing=args.gradient_checkpointing,
+            shuffle=args.shuffle,
         )
     print(json.dumps(metrics, sort_keys=True))
 

@@ -4,6 +4,8 @@ from typing import Literal
 from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+MAX_SANDBOXES = 32  # Per runtime node, whatever its hardware.
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -85,9 +87,9 @@ class Settings(BaseSettings):
     firecracker_network_enabled: bool = True
     firecracker_network_iface_id: str = "eth0"
     firecracker_network_host_ip: str = "192.168.100.1"
-    firecracker_network_guest_ip: str = "192.168.100.2"
     firecracker_network_prefix_len: int = Field(default=24, ge=1, le=30)
     firecracker_network_sandbox_prefix_len: int = Field(default=30, ge=30, le=30)
+    firecracker_template_enabled: bool = True
     firecracker_ip_binary: str = "ip"
     guest_adb_port: int = Field(default=5555, ge=1, le=65535)
     guest_screen_bridge_port: int = Field(default=8080, ge=1, le=65535)
@@ -106,7 +108,7 @@ class Settings(BaseSettings):
     console_port: int = Field(default=8600, ge=1, le=65535)
     node_id: str = "node-local"
     node_address: str = ""
-    sandbox_capacity: int = Field(default=4, ge=1, le=32)
+    sandbox_capacity: int = Field(default=4, ge=1, le=MAX_SANDBOXES)  # Default; the console may change it.
     fixture_port: int = Field(default=18090, ge=1, le=65535)
 
     @property

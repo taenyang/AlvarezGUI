@@ -2,6 +2,7 @@ import json
 import time
 import uuid
 import zlib
+import shutil
 from collections.abc import Generator
 from datetime import timedelta
 from pathlib import Path
@@ -11,12 +12,12 @@ from urllib.request import Request as UrlRequest, urlopen
 
 import psycopg
 import redis
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 from typing import Any, Literal
 
 from alvarezgui.artifacts import get as get_artifact, put_png
@@ -26,12 +27,15 @@ from alvarezgui.console_store import (
     ConsoleStore,
     StillActiveError,
     EvaluationRequest,
+    ModelEndpointRequest,
     NodeHeartbeat,
     RolloutRequest,
+    RolloutRetryRequest,
     RuntimeBackendRetiredError,
+    ServingFailure,
     screenshot_path,
 )
-from alvarezgui.node_agent.android_tasks import TASK_CATALOG
+from alvarezgui.node_agent.android_tasks import TASK_CATALOG, TASK_SETS
 from alvarezgui.queue import (
     RUNTIME_BACKENDS,
     TASK_CONSUMER_GROUP,
@@ -57,6 +61,8 @@ from alvarezgui.node_agent.runtime import (
 from alvarezgui.registry import (
     CheckpointCleanupError,
     CheckpointUnmanagedError,
+    IncompatibleBaseModelError,
+    ModelProtectedError,
     DatasetRequest,
     MetricPoint,
     ModelInUseError,
@@ -68,6 +74,7 @@ from alvarezgui.registry import (
     VersionNotFoundError,
 )
 from alvarezgui.db import get_db
+from alvarezgui.h800_launcher import cfs_checkpoint, cfs_staged_copy
 from alvarezgui.task_store import (
     CancelRequest,
     IdempotencyConflictError,
@@ -102,6 +109,15 @@ class FinishRequest(BaseModel):
     succeeded: bool
     metrics: dict[str, Any] = Field(default_factory=dict)
     checkpoint_uri: str | None = None
+
+
+class MergeRequest(BaseModel):
+    # Becomes a directory name on the serving host; the model service checks it again.
+    target_version: str | None = Field(default=None, max_length=100, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+# Loading, merging and saving a 1–8B checkpoint on CPU takes about 1–3 minutes.
+MERGE_TIMEOUT_SECONDS = 900
 
 
 CONSOLE_DIR = Path(__file__).parent / "console"
@@ -332,6 +348,8 @@ def create_app(
             )
         except VersionNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from None
+        except IncompatibleBaseModelError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
         except TrainingAlreadyRunningError:
             raise HTTPException(status_code=409, detail="training already running") from None
         except RegistryConflictError:
@@ -514,23 +532,28 @@ def create_app(
             return {"backend": "http", "url": current_settings.model_service_url, "healthy": False,
                     "error": str(exc)[:200]}
 
-    def model_service_command(path: str, version: str) -> dict[str, Any]:
+    def model_service_command(path: str, version: str, timeout: float | None = None, **extra: Any) -> dict[str, Any]:
         request = UrlRequest(
             current_settings.model_service_url.rstrip("/") + path,
-            data=json.dumps({"model_version": version}).encode(),
+            data=json.dumps({"model_version": version, **extra}).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         try:
-            with urlopen(request, timeout=current_settings.model_request_timeout_seconds) as response:
+            with urlopen(request, timeout=timeout or current_settings.model_request_timeout_seconds) as response:
                 body = json.loads(response.read())
         except HTTPError as exc:
             if exc.code == 404:
                 raise HTTPException(status_code=404, detail={
                     "code": "MODEL_NOT_FOUND", "message": "model version not found in model service",
                 }) from None
+            try:
+                reason = json.loads(exc.read()).get("detail")
+            except (OSError, ValueError, AttributeError):
+                reason = None
             raise HTTPException(status_code=503, detail={
-                "code": "MODEL_SERVICE_ERROR", "message": f"model service returned HTTP {exc.code}",
+                "code": "MODEL_SERVICE_ERROR",
+                "message": f"model service returned HTTP {exc.code}" + (f": {reason}" if reason else ""),
             }) from None
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=503, detail={
@@ -584,9 +607,19 @@ def create_app(
     @app.post("/internal/v1/nodes/{node_id}/heartbeat")
     def node_heartbeat(
         node_id: str, beat: NodeHeartbeat, connection: psycopg.Connection = Depends(database)
-    ) -> dict[str, str]:
-        ConsoleStore(connection).heartbeat_node(node_id, beat)
-        return {"node_id": node_id}
+    ) -> dict[str, Any]:
+        return {"node_id": node_id, "capacity": ConsoleStore(connection).heartbeat_node(node_id, beat)}
+
+    @app.put("/api/v1/nodes/{node_id}/limits")
+    def set_node_limits(
+        node_id: str, limits: dict[str, StrictInt] = Body(), connection: psycopg.Connection = Depends(database)
+    ) -> dict[str, Any]:
+        try:
+            return ConsoleStore(connection).set_node_limits(node_id, limits)
+        except LookupError:
+            raise HTTPException(status_code=404, detail="node not found") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
 
     @app.post("/api/v1/sandboxes/{sandbox_id}/destroy")
     def destroy_sandbox(sandbox_id: str, connection: psycopg.Connection = Depends(database)) -> dict:
@@ -626,6 +659,7 @@ def create_app(
         store = RegistryStore(connection)
         return {
             "tasks": list(TASK_CATALOG),
+            "task_sets": [{"name": name, **task_set} for name, task_set in TASK_SETS.items()],
             "model_versions": store.list_model_versions(),
             "datasets": store.list_datasets(),
             "runtime_backend": current_settings.runtime_backend,
@@ -647,6 +681,51 @@ def create_app(
     @app.post("/api/v1/model-versions/{version}/offline")
     def offline_model_version(version: str, connection: psycopg.Connection = Depends(database)) -> dict[str, Any]:
         return model_operation(version, "/internal/v1/model/unload", False, connection)
+
+    @app.post("/api/v1/model-versions/{version}/promote")
+    def promote_model_version(version: str, connection: psycopg.Connection = Depends(database)) -> dict[str, Any]:
+        try:
+            return RegistryStore(connection).promote_model_version(version)
+        except VersionNotFoundError:
+            raise HTTPException(status_code=404, detail={"code": "MODEL_NOT_FOUND", "message": "model version not found"}) from None
+        except RegistryConflictError as exc:
+            raise HTTPException(status_code=409, detail={"code": "NOT_A_RUN_CHECKPOINT", "message": str(exc)}) from None
+
+    @app.post("/api/v1/model-versions/{version}/merge", status_code=201)
+    def merge_model_version(
+        version: str, request: MergeRequest, connection: psycopg.Connection = Depends(database),
+    ) -> dict[str, Any]:
+        """Register ``version``'s LoRA adapter merged into full weights as a new model (child of ``version``)."""
+        if current_settings.model_backend != "http":
+            raise HTTPException(status_code=409, detail={
+                "code": "MODEL_SERVICE_DISABLED", "message": "merging requires the HTTP model service",
+            })
+        store = RegistryStore(connection)
+        model = store.get_model_version(version)
+        if model is None or model["status"] == "RETIRED":
+            raise HTTPException(status_code=404, detail={"code": "MODEL_NOT_FOUND", "message": "model version not found"})
+        if not model["adapter"]:
+            raise HTTPException(status_code=409, detail={
+                "code": "NOT_ADAPTER", "message": f"{version} already has full weights",
+            })
+        target = request.target_version or f"{version}-merged"
+        if len(target) > 100 or store.get_model_version(target) is not None:
+            raise HTTPException(status_code=409, detail={
+                "code": "MODEL_EXISTS", "message": f"model version {target} already exists or is too long",
+            })
+        # ponytail: synchronous request; make it a background job if merges outgrow the timeout.
+        result = model_service_command("/internal/v1/model/merge", version, MERGE_TIMEOUT_SECONDS,
+                                       target_version=target)
+        metrics = {key: model["metrics"][key] for key in ("output_format", "visual_views") if key in model["metrics"]}
+        try:
+            return store.register_model(ModelVersionRequest(
+                version=target, base_model=version, checkpoint_uri=Path(result["checkpoint"]).as_uri(),
+                metrics={**metrics, "merged_from": version},
+            ))
+        except (RegistryConflictError, VersionNotFoundError) as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": "MODEL_EXISTS", "message": f"merged into {result['checkpoint']} but not registered: {exc}",
+            }) from None
 
     @app.delete("/api/v1/model-versions/{version}")
     def delete_model_version(
@@ -677,13 +756,24 @@ def create_app(
                         message = detail.get("message", str(detail)) if isinstance(detail, dict) else str(detail)
                         raise CheckpointCleanupError(message) from exc
                     return bool(result.get("checkpoint_deleted"))
+        model = RegistryStore(connection).get_model_version(version)
         try:
-            return RegistryStore(connection).delete_model_version(
+            result = RegistryStore(connection).delete_model_version(
                 version,
                 current_settings.checkpoint_cleanup_root,
                 cascade_training_runs=cascade_training_runs,
                 checkpoint_cleanup=remote_checkpoint_cleanup,
             )
+            # H800 runs keep their original checkpoint on CFS next to the serving copy.
+            original = cfs_checkpoint(model["checkpoint_uri"]) if model else None
+            if original is not None and original.is_dir():
+                shutil.rmtree(original)
+            # A copy staged for H800 evaluations must not outlive the model: a later model at the
+            # same path would otherwise be served from the stale copy.
+            staged = cfs_staged_copy(model["checkpoint_uri"]) if model else None
+            if staged is not None:
+                shutil.rmtree(staged)
+            return result
         except VersionNotFoundError:
             raise HTTPException(status_code=404, detail={
                 "code": "MODEL_NOT_FOUND",
@@ -696,6 +786,11 @@ def create_app(
                 "references": exc.references,
                 "training_run_ids": exc.training_run_ids,
                 "evaluation_ids": exc.evaluation_ids,
+            }) from None
+        except ModelProtectedError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": "MODEL_PROTECTED",
+                "message": str(exc),
             }) from None
         except CheckpointUnmanagedError as exc:
             raise HTTPException(status_code=409, detail={
@@ -783,8 +878,11 @@ def create_app(
     # --- training agent (GPU host) ------------------------------------------------
 
     @app.post("/internal/v1/training/claim")
-    def claim_training_run(connection: psycopg.Connection = Depends(database)) -> dict[str, Any]:
-        return {"run": RegistryStore(connection).claim_next_training_run()}
+    def claim_training_run(
+        accelerator: Literal["4090", "h800"] = Query(default="4090"),
+        connection: psycopg.Connection = Depends(database),
+    ) -> dict[str, Any]:
+        return {"run": RegistryStore(connection).claim_next_training_run(accelerator)}
 
     def require_run(store: RegistryStore, run_id: str) -> str:
         status = store.run_status(run_id)
@@ -830,6 +928,14 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from None
         except RuntimeBackendRetiredError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from None
+
+    @app.post("/internal/v1/training/runs/{run_id}/rollouts/retry")
+    def retry_training_rollouts(
+        run_id: str, request: RolloutRetryRequest, connection: psycopg.Connection = Depends(database)
+    ) -> dict[str, Any]:
+        if require_live_run(RegistryStore(connection), run_id) != "RUNNING":
+            raise HTTPException(status_code=409, detail="training run is not running")
+        return {"tasks": ConsoleStore(connection).retry_rollouts(run_id, request)}
 
     @app.get("/internal/v1/training/runs/{run_id}/rollouts")
     def get_training_rollouts(
@@ -879,6 +985,29 @@ def create_app(
         if not task_ids:
             raise HTTPException(status_code=409, detail="evaluation already finished")
         return {"eval_id": eval_id, "canceled_trials": cancel_tasks(connection, task_ids, "evaluation_canceled")}
+
+    # H800 launcher: deploy the models of accelerator=h800 evaluations, then publish the endpoint.
+    @app.get("/internal/v1/evaluations/h800")
+    def active_h800_evaluations(connection: psycopg.Connection = Depends(database)) -> list[dict]:
+        return ConsoleStore(connection).active_h800_evaluations()
+
+    @app.put("/internal/v1/evaluations/{eval_id}/model-endpoint")
+    def publish_model_endpoint(
+        eval_id: str, request: ModelEndpointRequest, connection: psycopg.Connection = Depends(database)
+    ) -> dict:
+        if not ConsoleStore(connection).set_model_endpoint(eval_id, request.endpoint, request.token):
+            raise HTTPException(status_code=404, detail="H800 evaluation not found")
+        return {"eval_id": eval_id, "model_ready": request.endpoint is not None}
+
+    @app.post("/internal/v1/evaluations/{eval_id}/serving-failed")
+    def h800_serving_failed(
+        eval_id: str, request: ServingFailure, connection: psycopg.Connection = Depends(database)
+    ) -> dict:
+        task_ids = ConsoleStore(connection).evaluation_task_ids(eval_id)
+        if task_ids is None:
+            raise HTTPException(status_code=404, detail="evaluation not found")
+        reason = f"h800_model_service_failed: {request.message}"
+        return {"eval_id": eval_id, "canceled_trials": cancel_tasks(connection, task_ids, reason)}
 
     @app.delete("/api/v1/evaluations/{eval_id}")
     def delete_evaluation(eval_id: str, connection: psycopg.Connection = Depends(database)) -> dict:

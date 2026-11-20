@@ -259,15 +259,22 @@ class DockerAndroidRuntime(AndroidRuntime):
         if not isinstance(gateway, str):
             raise RuntimeOperationError("Docker Android network has no gateway")
         target = self._adb_target(sandbox_id)
-        try:
-            rooted = subprocess.run(
-                [self.config.adb_binary, "-s", target, "root"],
-                check=False,
-                capture_output=True,
-                timeout=self.config.api_timeout,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise RuntimeOperationError("Android adbd root request failed") from exc
+        # adbd can refuse root just after boot ("unable to connect for root: closed"); an image
+        # without root support keeps failing, so the error is reported after a bounded retry.
+        deadline = time.monotonic() + 30.0
+        while True:
+            try:
+                rooted = subprocess.run(
+                    [self.config.adb_binary, "-s", target, "root"],
+                    check=False,
+                    capture_output=True,
+                    timeout=self.config.api_timeout,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise RuntimeOperationError("Android adbd root request failed") from exc
+            if not rooted.returncode or time.monotonic() >= deadline:
+                break
+            time.sleep(1.0)
         if rooted.returncode:
             detail = rooted.stderr[:300].decode(errors="replace").strip()
             raise RuntimeOperationError(

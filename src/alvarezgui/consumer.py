@@ -17,7 +17,7 @@ import redis
 
 from alvarezgui.action import validate_action
 from alvarezgui.artifacts import get as get_artifact, local_file, put_png, remove_local_screenshot
-from alvarezgui.config import Settings
+from alvarezgui.config import MAX_SANDBOXES, Settings
 from alvarezgui.db import connect
 from alvarezgui.model import InferenceRequest, ModelService
 from alvarezgui.model_http import HttpModelService
@@ -74,9 +74,10 @@ class Consumer:
         self.batch_size = batch_size
         if worker_count < 1:
             raise ValueError("worker_count must be positive")
+        # Assignable while running: the node heartbeat applies the console's sandbox limit here.
         self.worker_count = worker_count
         self._executor = ThreadPoolExecutor(
-            max_workers=worker_count,
+            max_workers=max(worker_count, MAX_SANDBOXES),  # Threads start lazily, up to worker_count busy.
             thread_name_prefix=f"{self.runtime_backend}-worker",
         )
         self._in_flight: set[Future[object]] = set()
@@ -130,7 +131,8 @@ class Consumer:
             self._in_flight.difference_update(
                 [future for future in self._in_flight if future.done()]
             )
-            return self.worker_count - len(self._in_flight)
+            # A lowered limit lets in-flight work finish; nothing new starts until it drains below.
+            return max(0, self.worker_count - len(self._in_flight))
 
     def _submit_batch(self, entries: list[tuple[str, dict[str, Any]]]) -> int:
         if self.worker_count == 1:
@@ -421,7 +423,15 @@ class Consumer:
         sandbox_id: str,
         lease_id: str,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-        if self.model_service is None:
+        model_service = self.model_service
+        if context.get("accelerator") == "h800":
+            # The H800 launcher publishes an on-demand model service; never fall back to the 4090 one.
+            if not context.get("model_endpoint"):
+                raise RuntimeOperationError("H800 model service for this evaluation is not available")
+            model_service = HttpModelService(
+                context["model_endpoint"], self.settings.model_request_timeout_seconds, context.get("model_token")
+            )
+        if model_service is None:
             return {"type": "terminate", "reason": "fixed_policy"}, None
         if not self._store_call(
             "mark_waiting_model", context["task_id"], context["episode_id"], lease_id
@@ -437,7 +447,7 @@ class Consumer:
             self.runtime.pause(sandbox_id)
             if self.wait_mode == "snapshot_stop":
                 snapshot_id = self.runtime.snapshot(sandbox_id).snapshot_id
-            response = self.model_service.infer(
+            response = model_service.infer(
                 InferenceRequest(
                     request_id=f"{context['episode_id']}-{context['current_step']}",
                     model_version=context["policy_version"],
@@ -457,6 +467,7 @@ class Consumer:
                 "model_version": response.model_version,
                 "latency_ms": response.latency_ms,
                 "output_format": response.output_format,
+                "entropy": response.entropy,
             }
             action = validate_action(response.action)
             if not self._store_call("heartbeat_lease", lease_id, sandbox_id, self.lease_ttl):

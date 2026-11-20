@@ -20,7 +20,7 @@ from alvarezgui.config import Settings
 from alvarezgui.node_agent.docker import DockerAndroidRuntime
 from alvarezgui.node_agent.firecracker import FirecrackerAndroidRuntime
 from alvarezgui.queue import stream_for_backend
-from alvarezgui.server import consumer_for_settings, node_resources
+from alvarezgui.server import consumer_for_settings, node_resources, sandbox_ceiling
 
 
 PNG = base64.b64decode(
@@ -105,6 +105,20 @@ class ServerTest(unittest.TestCase):
             minio_root_password="12345678",
         )
         self.assertEqual(settings.scheduler_backend_list, ("firecracker", "docker"))
+
+    def test_sandbox_ceiling_reflects_host_and_per_sandbox_quota(self) -> None:
+        settings = Settings(postgres_password="test", minio_root_password="12345678", runtime_backend="docker",
+                            docker_image="android:test")
+        docker = consumer_for_settings(settings, Mock(), None)
+        host = {"cpu_count": 14, "memory_total_bytes": 125 * 2**30}
+        self.assertEqual(sandbox_ceiling(settings, docker.runtime.config, host),
+                         {"platform": 32, "cpu": 7, "memory": 31, "network": None})
+        docker.close()
+        settings = Settings(postgres_password="test", minio_root_password="12345678")
+        firecracker = consumer_for_settings(settings, Mock(), None)
+        self.assertEqual(sandbox_ceiling(settings, firecracker.runtime.config, {"cpu_count": None}),
+                         {"platform": 32, "cpu": None, "memory": None, "network": 63})  # /24 pool of /30s, less the template builder's.
+        firecracker.close()
 
     def test_windows_resources_without_proc_or_loadavg(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

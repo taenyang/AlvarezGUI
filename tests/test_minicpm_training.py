@@ -1,11 +1,13 @@
 import json
 import math
+import statistics
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import tempfile
 import unittest
 from pathlib import Path
 
+from alvarezgui.model_families import MINICPM_V_4_7, QWEN3_VL
 from alvarezgui.minicpm_training import (
     DatasetValidationError, _adapter_base_model, _collate_sft, _direction_head, _direction_targets,
     _language_attention_targets, _lora_model, _masked_batch, _messages, _perception_features,
@@ -110,8 +112,9 @@ class MiniCPMTrainingTest(unittest.TestCase):
                 *[("sft", {"batch_size": size}) for size in (0, -1, True, 1.5, "2")],
                 ("sft", {"cache_preprocessed": "false"}),
                 ("sft", {"gradient_checkpointing": "true"}),
+                ("sft", {"shuffle": "true"}),
                 *[(algorithm, option) for algorithm in ("grpo", "gigpo")
-                  for option in ({"batch_size": 2}, {"cache_preprocessed": True})],
+                  for option in ({"batch_size": 2}, {"cache_preprocessed": True}, {"shuffle": True})],
                 ("sft", {"train_top_layers": -1}),
                 ("sft", {"train_top_layers": True}),
                 ("sft", {"train_top_layers": 1.5}),
@@ -150,17 +153,23 @@ class MiniCPMTrainingTest(unittest.TestCase):
             def input_ids(self):
                 return self["input_ids"]
 
+        processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
         for output_format in ("action-v1", "sokoban-plan-v1"):
             batch = Batch(input_ids=torch.tensor([[1, 2, 3, 4, 5, 0]]), tgt_sizes=torch.tensor([1]))
-            processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
+            prompt = Batch(input_ids=torch.tensor([[1, 2, 3]]))
             with self.subTest(output_format=output_format), patch(
-                "alvarezgui.minicpm_training._prepare", side_effect=[(batch, 6), (None, 3)]
+                "alvarezgui.minicpm_training._prepare", side_effect=[(batch, 6), (prompt, 3)]
             ):
-                result, labels = _masked_batch(processor, {"output_format": output_format}, torch)
+                result, labels = _masked_batch(processor, {"output_format": output_format}, torch, family=MINICPM_V_4_7)
             self.assertEqual(labels.tolist(), [[-100, -100, -100, 4, 5, -100]])
             self.assertEqual(result.input_ids.tolist(), [[1, 2, 3, 4, 5, 0]])
             self.assertIn("target_sizes", result)
             self.assertNotIn("tgt_sizes", result)
+        batch = Batch(input_ids=torch.tensor([[1, 2, 3, 4]]))
+        with patch("alvarezgui.minicpm_training._prepare",
+                   side_effect=[(batch, 4), (Batch(input_ids=torch.tensor([[1, 9]])), 2)]), \
+                self.assertRaisesRegex(ValueError, "not a prefix"):
+            _masked_batch(processor, {}, torch, family=QWEN3_VL)
 
     def test_sft_collation_keeps_image_order_prompt_masks_and_padding(self) -> None:
         try:
@@ -178,9 +187,10 @@ class MiniCPMTrainingTest(unittest.TestCase):
                 "pixel_values": torch.full((1, 3, 14, slices * 14), float(index + 1)),
                 "tgt_sizes": torch.full((slices, 2), index + 1, dtype=torch.int32),
             })
-            with patch("alvarezgui.minicpm_training._prepare", side_effect=[(batch, length), (None, prompt_length)]):
-                samples.append(_masked_batch(processor, {}, torch))
-        batch, labels = _collate_sft(samples, processor, torch)
+            prompt = BatchFeature({"input_ids": ids[:, :prompt_length]})
+            with patch("alvarezgui.minicpm_training._prepare", side_effect=[(batch, length), (prompt, prompt_length)]):
+                samples.append(_masked_batch(processor, {}, torch, family=MINICPM_V_4_7))
+        batch, labels = _collate_sft(samples, processor, torch, family=MINICPM_V_4_7)
         self.assertEqual(batch["input_ids"].tolist(), [list(range(7)), [0, 1, 2, 3, 4, 99, 99]])
         self.assertEqual(batch["attention_mask"].tolist(), [[1] * 7, [1] * 5 + [0, 0]])
         self.assertEqual(labels.tolist(), [[-100] * 4 + [4, 5, 6], [-100, -100, 2, 3, 4, -100, -100]])
@@ -194,7 +204,25 @@ class MiniCPMTrainingTest(unittest.TestCase):
         self.assertEqual(samples[1][1].tolist(), [[-100, -100, 2, 3, 4]])
         samples[0][0]["unexpected_images"] = torch.zeros(1)
         with self.assertRaisesRegex(ValueError, "processor keys"):
-            _collate_sft(samples, processor, torch)
+            _collate_sft(samples, processor, torch, family=MINICPM_V_4_7)
+
+        # Qwen3-VL flattens every image's patches along dim 0 with one grid_thw row per image.
+        qwen = []
+        for index, (length, images) in enumerate(((6, 2), (4, 1))):
+            ids = torch.arange(length).unsqueeze(0)
+            qwen.append((BatchFeature({
+                "input_ids": ids, "attention_mask": torch.ones_like(ids), "mm_token_type_ids": torch.zeros_like(ids),
+                "pixel_values": torch.full((images * 4, 8), float(index + 1)),
+                "image_grid_thw": torch.tensor([[1, 2, 2]] * images) * (index + 1),
+            }), ids.clone()))
+        batch, labels = _collate_sft(qwen, processor, torch, family=QWEN3_VL)
+        self.assertEqual(batch["pixel_values"].shape, (12, 8))
+        self.assertEqual(batch["pixel_values"][:, 0].tolist(), [1.0] * 8 + [2.0] * 4)
+        self.assertEqual(batch["image_grid_thw"].tolist(), [[1, 2, 2], [1, 2, 2], [2, 4, 4]])
+        self.assertEqual(batch["input_ids"].tolist(), [list(range(6)), [0, 1, 2, 3, 99, 99]])
+        self.assertEqual(labels.tolist(), [list(range(6)), [0, 1, 2, 3, -100, -100]])
+        with self.assertRaisesRegex(ValueError, "Qwen3-VL SFT processor keys"):
+            _collate_sft(samples[1:], processor, torch, family=QWEN3_VL)
 
     def test_visual_features_pool_direct_encoder_output(self) -> None:
         try:
@@ -246,7 +274,7 @@ class MiniCPMTrainingTest(unittest.TestCase):
         row = {"image": "/tmp/screen.png", "conversations": []}
         images = []
 
-        def prepare(_processor, _row, *, prompt_only, image):
+        def prepare(_processor, _row, *, family, prompt_only, image):
             images.append(image)
             return {"input_ids": torch.zeros((1, 1), dtype=torch.long)}, 1
 
@@ -364,6 +392,8 @@ class MiniCPMTrainingTest(unittest.TestCase):
             self.skipTest("requires torch and accelerate")
 
         class TinyVision(torch.nn.Module):
+            config = SimpleNamespace(model_type="minicpmv4_7")
+
             def get_vision_embedding(self, pixel_values, image_bound=None, tgt_sizes=None):
                 return pixel_values
 
@@ -377,7 +407,7 @@ class MiniCPMTrainingTest(unittest.TestCase):
             processor = Mock()
             model = TinyVision()
 
-            def prepared(_processor, row, prompt_only=False):
+            def prepared(_processor, row, family, prompt_only=False):
                 feature = torch.tensor([[[float(row["feature"]), 1.0]]], dtype=torch.bfloat16)
                 return {"input_ids": torch.zeros((1, 1), dtype=torch.long), "pixel_values": feature}, 1
 
@@ -484,8 +514,27 @@ class MiniCPMTrainingTest(unittest.TestCase):
         self.assertFalse(any("vision" in name or "mlp" in name for name in targets))
         bad_model = copy.deepcopy(pristine)
         bad_model.config.model_type = "unsupported"
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "unsupported model architecture"):
             _language_attention_targets(bad_model, torch)
+        # Qwen3-VL: only text self-attention, never the vision blocks, MLP or mergers.
+        qwen = torch.nn.Module()
+        qwen.config = SimpleNamespace(model_type="qwen3_vl", text_config=SimpleNamespace(num_hidden_layers=2))
+        qwen.model = torch.nn.Module()
+        qwen.model.language_model = torch.nn.Module()
+        qwen.model.language_model.layers = torch.nn.ModuleList([torch.nn.Module(), torch.nn.Module()])
+        for layer in qwen.model.language_model.layers:
+            layer.self_attn = torch.nn.ModuleDict({name: torch.nn.Linear(2, 2) for name in ("q_proj", "k_proj", "v_proj", "o_proj")})
+            layer.mlp = torch.nn.ModuleDict({"gate_proj": torch.nn.Linear(2, 2)})
+        qwen.model.visual = torch.nn.Module()
+        qwen.model.visual.blocks = torch.nn.ModuleList([torch.nn.ModuleDict({"qkv": torch.nn.Linear(2, 2)})])
+        qwen.model.visual.merger = torch.nn.ModuleDict({"linear_fc1": torch.nn.Linear(2, 2)})
+        self.assertEqual(_language_attention_targets(qwen, torch), [
+            f"model.language_model.layers.{index}.self_attn.{name}"
+            for index in range(2) for name in ("q_proj", "k_proj", "v_proj", "o_proj")])
+        self.assertEqual(_top_layer_modules(qwen.config, 1), ["model.language_model.layers.1"])
+        del qwen.model.language_model.layers[1].self_attn
+        with self.assertRaisesRegex(ValueError, "Qwen3-VL language attention"):
+            _language_attention_targets(qwen, torch)
         features = torch.tensor([[[1., -1.], [.5, .5]]], dtype=torch.bfloat16)
         labels = torch.tensor([[-100, 0]])
         saved_models = []
@@ -758,16 +807,16 @@ class MiniCPMTrainingTest(unittest.TestCase):
         with patch("alvarezgui.minicpm_training.load_dataset", return_value=[]), patch(
             "alvarezgui.minicpm_training.train", return_value={}
         ) as trainer, patch("builtins.print"):
-            for options, expected in (([], (1, False, True)),
-                                      (["--batch-size", "4", "--cache-preprocessed", "--no-gradient-checkpointing"],
-                                       (4, True, False))):
+            for options, expected in (([], (1, False, True, False)),
+                                      (["--batch-size", "4", "--cache-preprocessed", "--no-gradient-checkpointing",
+                                        "--shuffle"], (4, True, False, True))):
                 with patch("sys.argv", arguments + options):
                     main()
                 self.assertEqual(tuple(trainer.call_args.kwargs[key] for key in (
-                    "batch_size", "cache_preprocessed", "gradient_checkpointing",
+                    "batch_size", "cache_preprocessed", "gradient_checkpointing", "shuffle",
                 )), expected)
             for algorithm in ("grpo", "gigpo", "perception"):
-                for option in (["--batch-size", "2"], ["--cache-preprocessed"]):
+                for option in (["--batch-size", "2"], ["--cache-preprocessed"], ["--shuffle"]):
                     with self.subTest(algorithm=algorithm, option=option), patch(
                         "sys.argv", arguments[:2] + [algorithm] + arguments[3:] + option
                     ), patch("sys.stderr"), self.assertRaises(SystemExit):
@@ -889,6 +938,7 @@ class MiniCPMTrainingTest(unittest.TestCase):
                 older.mkdir()  # Missing metadata here also proves that only the latest is read.
                 (root / ".epoch-00000003.incomplete").mkdir()
                 torch, model, processor = Mock(), Mock(), Mock()
+                model.config.model_type = "minicpmv4_7"
                 model.parameters.return_value = []
                 torch.utils.data.DataLoader.return_value = [0]
                 accelerator = Mock(num_processes=1, is_main_process=True)
@@ -934,6 +984,8 @@ class MiniCPMTrainingTest(unittest.TestCase):
             self.skipTest("requires torch and accelerate; runs on CPU without model downloads")
 
         class TinyModel(torch.nn.Module):
+            config = SimpleNamespace(model_type="minicpmv4_7")
+
             def __init__(self):
                 super().__init__()
                 self.weight = torch.nn.Parameter(torch.zeros(()))
@@ -1013,6 +1065,52 @@ class MiniCPMTrainingTest(unittest.TestCase):
             self.assertEqual(steps, [])
             self.assertEqual(finished_metrics["loss"], expected_metrics["loss"])
 
+    def test_save_every_publishes_intermediate_epoch_models(self) -> None:
+        try:
+            import torch
+            from accelerate import Accelerator
+        except ImportError:
+            self.skipTest("requires torch and accelerate; runs on CPU without model downloads")
+
+        class TinyModel(torch.nn.Module):
+            config = SimpleNamespace(model_type="minicpmv4_7")
+
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(()))
+
+            def forward(self, features, use_cache=False):
+                score = self.weight * features
+                return SimpleNamespace(logits=torch.stack((score, -score)).repeat(1, 2, 1))
+
+        def save(model, processor, accelerator, output_dir):
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "weight.txt").write_text(str(float(model.weight)))
+
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory, "screen.png")
+            image.write_bytes(b"image")
+            output = Path(directory, "run", "final")
+            (output.parent / ".epoch-2.incomplete").mkdir(parents=True)  # Left by an interrupted save.
+            with patch("alvarezgui.minicpm_training._imports", return_value=(
+                torch, lambda **kwargs: Accelerator(cpu=True, **kwargs),
+                SimpleNamespace(from_pretrained=Mock(return_value=TinyModel())),
+                SimpleNamespace(from_pretrained=Mock(return_value=Mock())),
+            )), patch("alvarezgui.minicpm_training._masked_batch", return_value=(
+                {"features": torch.tensor(1.)}, torch.tensor([[-100, 0]])
+            )), patch("alvarezgui.minicpm_training._checkpoint", side_effect=save):
+                train("sft", "unused-model", [self._row(image) for _ in range(3)], output, epochs=5,
+                      learning_rate=.01, save_every=2)
+            self.assertEqual(sorted(p.name for p in output.parent.iterdir()), ["epoch-2", "epoch-4", "final"])
+            weights = [float((output.parent / name / "weight.txt").read_text()) for name in ("epoch-2", "epoch-4", "final")]
+            self.assertTrue(weights[0] != weights[1] != weights[2])
+            metrics = json.loads((output.parent / "epoch-4/metrics.json").read_text())
+            self.assertEqual((metrics["epoch"], metrics["step_count"]), (4, 12))
+            self.assertEqual(json.loads((output.parent / "epoch-2/policy_config.json").read_text()),
+                             json.loads((output / "policy_config.json").read_text()))
+            with self.assertRaisesRegex(ValueError, "save_every"):
+                train("sft", "unused-model", [self._row(image)], output, save_every=0)
+
     def test_sft_microbatch_cache_recipe_resume_matches_model_optimizer_and_rng(self) -> None:
         try:
             import torch
@@ -1021,6 +1119,8 @@ class MiniCPMTrainingTest(unittest.TestCase):
             self.skipTest("requires torch and accelerate; runs on CPU")
 
         class TinyModel(torch.nn.Module):
+            config = SimpleNamespace(model_type="minicpmv4_7")
+
             def __init__(self):
                 super().__init__()
                 self.weight = torch.nn.Parameter(torch.tensor(.1))
@@ -1042,7 +1142,7 @@ class MiniCPMTrainingTest(unittest.TestCase):
                 optimizers.append(result)
                 return result
 
-            def masked(_processor, row, _torch):
+            def masked(_processor, row, _torch, **_kwargs):
                 ids = torch.ones((1, 3 + row["id"] % 3), dtype=torch.long)
                 labels = torch.zeros_like(ids)
                 labels[:, :2] = -100
@@ -1096,6 +1196,68 @@ class MiniCPMTrainingTest(unittest.TestCase):
             for key, value in expected[3]["state"][0].items():
                 torch.testing.assert_close(actual[3]["state"][0][key], value, rtol=0, atol=0)
 
+    def test_sft_shuffle_is_a_seeded_per_epoch_permutation_that_resumes(self) -> None:
+        try:
+            import torch
+            from accelerate import Accelerator
+        except ImportError:
+            self.skipTest("requires torch and accelerate; runs on CPU")
+
+        class TinyModel(torch.nn.Module):
+            config = SimpleNamespace(model_type="minicpmv4_7")
+
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor(.1))
+                self.seen = []
+
+            def forward(self, input_ids, use_cache=False, **_kwargs):
+                self.seen.append(int(input_ids[0, 0]) - 1)
+                scores = self.weight * input_ids.float()
+                return SimpleNamespace(logits=torch.stack((scores, -scores), dim=-1))
+
+        def masked(_processor, row, _torch, **_kwargs):
+            ids = torch.full((1, 4), row["id"] + 1, dtype=torch.long)
+            labels = torch.zeros_like(ids)
+            labels[:, :2] = -100
+            return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}, labels
+
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory, "image.png")
+            image.write_bytes(b"image")
+            rows = [dict(self._row(image), id=index) for index in range(7)]
+            root = Path(directory, "states")
+
+            def run(name, epochs, shuffle=True, seed=1, checkpoints=None):
+                output = Path(directory, name)
+                output.mkdir()
+                model = TinyModel()
+                with patch("alvarezgui.minicpm_training._imports", return_value=(
+                    torch, lambda **kwargs: Accelerator(cpu=True, **kwargs),
+                    SimpleNamespace(from_pretrained=Mock(return_value=model)),
+                    SimpleNamespace(from_pretrained=Mock(return_value=SimpleNamespace())),
+                )), patch("alvarezgui.minicpm_training._masked_batch", side_effect=masked), patch(
+                    "alvarezgui.minicpm_training._checkpoint"
+                ), patch("builtins.print"):
+                    metrics = train("sft", "unused-model", rows, output, epochs=epochs, seed=seed,
+                                    gradient_accumulation=2, shuffle=shuffle, checkpoint_dir=checkpoints)
+                self.assertEqual(metrics["shuffle"], shuffle)
+                return [model.seen[start:start + len(rows)] for start in range(0, len(model.seen), len(rows))]
+
+            self.assertEqual(run("plain", 2, shuffle=False), [list(range(7))] * 2)
+            epochs = run("shuffled", 3)
+            self.assertTrue(all(sorted(order) == list(range(7)) for order in epochs))
+            self.assertEqual(len({tuple(order) for order in epochs}), 3)
+            self.assertEqual(run("repeat", 3), epochs)
+            self.assertNotEqual(run("other-seed", 3, seed=2), epochs)
+            self.assertEqual(run("first", 1, checkpoints=root), epochs[:1])
+            with patch("alvarezgui.minicpm_training._imports") as imports, \
+                    self.assertRaisesRegex(ValueError, "recipe or dataset"):
+                train("sft", "unused-model", rows, directory, epochs=3, seed=1, gradient_accumulation=2,
+                      checkpoint_dir=root)
+            imports.assert_not_called()
+            self.assertEqual(run("resumed", 3, checkpoints=root), epochs[1:])
+
     def test_sft_microbatches_match_sample_mean_gradients_updates_and_cache(self) -> None:
         try:
             import torch
@@ -1105,6 +1267,8 @@ class MiniCPMTrainingTest(unittest.TestCase):
         test = self
 
         class TinyModel(torch.nn.Module):
+            config = SimpleNamespace(model_type="minicpmv4_7")
+
             def __init__(self, count):
                 super().__init__()
                 self.weight = torch.nn.Parameter(torch.tensor(.15))
@@ -1149,7 +1313,7 @@ class MiniCPMTrainingTest(unittest.TestCase):
                         optimizer.step = step
                         prepared = []
 
-                        def masked(_processor, row, _torch):
+                        def masked(_processor, row, _torch, **_kwargs):
                             index = row["id"]
                             prepared.append(index)
                             slices = 1 + index % 3
@@ -1212,6 +1376,8 @@ class MiniCPMTrainingTest(unittest.TestCase):
             self.skipTest("requires torch and accelerate; runs on CPU without model downloads")
 
         class TinyModel(torch.nn.Module):
+            config = SimpleNamespace(model_type="minicpmv4_7")
+
             def __init__(self):
                 super().__init__()
                 self.weight = torch.nn.Parameter(torch.zeros(()))
@@ -1232,7 +1398,7 @@ class MiniCPMTrainingTest(unittest.TestCase):
                          "old_logprob": -math.log(2), "advantage": 1.0}
                         for index in range(count)]
 
-                def masked_batch(_processor, row, _torch):
+                def masked_batch(_processor, row, _torch, **_kwargs):
                     # Only the last sample has a gradient: dropping the tail leaves weight at zero.
                     return {"features": torch.tensor(float(row["id"] == count - 1))}, torch.tensor([[-100, 0]])
 
@@ -1257,6 +1423,15 @@ class MiniCPMTrainingTest(unittest.TestCase):
                 self.assertEqual([step for step, _ in callbacks], list(range(1, count * epochs + 1)))
                 self.assertEqual(sum("train/grad_norm" in values for _, values in callbacks), expected_updates)
                 self.assertAlmostEqual(callbacks[count - 1][1]["train/grad_norm"], .5, places=6)
+                if algorithm == "sft":
+                    self.assertFalse(any("train/entropy" in values for _, values in callbacks))
+                    self.assertNotIn("entropy_mean", metrics)
+                else:
+                    # Every policy step reports entropy; logits [w*x, 0] start uniform over 2 tokens (w=0).
+                    self.assertTrue(all(values["train/entropy"] >= 0 for _, values in callbacks))
+                    self.assertAlmostEqual(callbacks[0][1]["train/entropy"], math.log(2), places=6)
+                    self.assertAlmostEqual(metrics["entropy_mean"], statistics.fmean(
+                        values["train/entropy"] for _, values in callbacks), places=9)
                 if epochs == 1:
                     self.assertAlmostEqual(model.weight.item(), .05, places=6)
                 self.assertEqual(json.loads(Path(directory, "metrics.json").read_text()), metrics)
@@ -1264,6 +1439,95 @@ class MiniCPMTrainingTest(unittest.TestCase):
                     "output_format": "action-v1", "max_tokens": 128, "finetuning_method": "full",
                     "train_merger_mlp": False, "visual_views": "full", "seed": 20261117,
                 })
+
+    def test_policy_training_uses_the_base_checkpoint_visual_views(self) -> None:
+        try:
+            import torch
+            from accelerate import Accelerator
+        except ImportError:
+            self.skipTest("requires torch and accelerate; runs on CPU without model downloads")
+
+        class TinyModel(torch.nn.Module):
+            config = SimpleNamespace(model_type="minicpmv4_7")
+
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(()))
+
+            def forward(self, features, use_cache=False):
+                score = self.weight * features
+                return SimpleNamespace(logits=torch.stack((score, score * 0)).repeat(1, 2, 1))
+
+        for views in ("full+board-crop", "full", None):
+            with self.subTest(views=views), tempfile.TemporaryDirectory() as directory:
+                base, output = Path(directory, "base"), Path(directory, "out")
+                base.mkdir()
+                output.mkdir()
+                if views:
+                    (base / "policy_config.json").write_text(json.dumps({"visual_views": views}))
+                rows = [{"id": index, "group_id": "g", "reward": {"total": index}, "advantage": index - .5,
+                         "conversations": self._row(Path("unused"))["conversations"]} for index in range(2)]
+                calls = []
+
+                def masked_batch(_processor, row, _torch, **kwargs):
+                    calls.append(kwargs["multiview"])
+                    return {"features": torch.tensor(1.)}, torch.tensor([[-100, 0]])
+
+                with patch("alvarezgui.minicpm_training._imports", return_value=(
+                    torch, lambda **kwargs: Accelerator(cpu=True, **kwargs),
+                    SimpleNamespace(from_pretrained=Mock(return_value=TinyModel())),
+                    SimpleNamespace(from_pretrained=Mock()),
+                )), patch("alvarezgui.minicpm_training._masked_batch", side_effect=masked_batch), patch(
+                    "alvarezgui.minicpm_training._checkpoint"
+                ):
+                    train("grpo", str(base), rows, output, compute_old_logprob=True, multiview=False)
+                multiview = views == "full+board-crop"
+                self.assertEqual(calls, [multiview] * 4)  # old logprobs, then the update, both like sampling
+                self.assertEqual(json.loads((output / "policy_config.json").read_text())["visual_views"],
+                                 views or "full")
+
+    def test_policy_logprobs_use_the_rollout_sampling_temperature(self) -> None:
+        try:
+            import torch
+            from accelerate import Accelerator
+        except ImportError:
+            self.skipTest("requires torch and accelerate; runs on CPU without model downloads")
+
+        class TinyModel(torch.nn.Module):
+            config = SimpleNamespace(model_type="minicpmv4_7")
+
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.ones(()))
+
+            def forward(self, features, use_cache=False):
+                score = self.weight * features  # Logits (2, 0) at the token being scored.
+                return SimpleNamespace(logits=torch.stack((score, score * 0)).repeat(1, 2, 1))
+
+        def old_logprob(temperature):
+            with tempfile.TemporaryDirectory() as directory:
+                base, output = Path(directory, "base"), Path(directory, "out")
+                base.mkdir()
+                output.mkdir()
+                rows = [{"id": index, "group_id": "g", "reward": {"total": index}, "advantage": index - .5,
+                         "conversations": self._row(Path("unused"))["conversations"]} for index in range(2)]
+                with patch("alvarezgui.minicpm_training._imports", return_value=(
+                    torch, lambda **kwargs: Accelerator(cpu=True, **kwargs),
+                    SimpleNamespace(from_pretrained=Mock(return_value=TinyModel())),
+                    SimpleNamespace(from_pretrained=Mock()),
+                )), patch("alvarezgui.minicpm_training._masked_batch", return_value=(
+                    {"features": torch.tensor(2.)}, torch.tensor([[-100, 0]])
+                )), patch("alvarezgui.minicpm_training._checkpoint"):
+                    train("grpo", str(base), rows, output, compute_old_logprob=True, learning_rate=1e-9,
+                          sampling_temperature=temperature)
+                return rows[0]["old_logprob"]
+
+        logprob = lambda t: float(torch.log_softmax(torch.tensor([2.0, 0.0]) / t, dim=-1)[0])
+        for temperature, expected in ((None, logprob(1)), (0, logprob(1)), (1.0, logprob(1)), (0.5, logprob(0.5))):
+            with self.subTest(temperature=temperature):
+                self.assertAlmostEqual(old_logprob(temperature), expected, places=2)  # bf16 autocast
+        with self.assertRaisesRegex(ValueError, "sampling_temperature"):
+            train("grpo", "unused", [self._row(Path("unused"))], "out", sampling_temperature=-1)
 
 
 if __name__ == "__main__":

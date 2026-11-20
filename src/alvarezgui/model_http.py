@@ -18,16 +18,20 @@ from alvarezgui.model import (
 class HttpModelService(ModelService):
     """HTTP client for the independently deployed MiniCPM-V service."""
 
-    def __init__(self, base_url: str, timeout: float = 30.0) -> None:
+    def __init__(self, base_url: str, timeout: float = 30.0, token: str | None = None) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.token = token
 
     def infer(self, request: InferenceRequest) -> InferenceResponse:
         payload = json.dumps(request.model_dump(mode="json")).encode()
+        headers = {"Content-Type": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
         http_request = Request(
             f"{self.base_url}/internal/v1/model/infer",
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         try:

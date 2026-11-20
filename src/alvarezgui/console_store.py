@@ -11,7 +11,7 @@ from urllib.request import url2pathname
 
 import psycopg
 from psycopg.types.json import Json
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from alvarezgui.node_agent.android_tasks import default_instruction
 from alvarezgui.registry import TaskSpec, VersionNotFoundError
@@ -35,9 +35,20 @@ ROLLOUT_PRIORITY = 5
 class NodeHeartbeat(BaseModel):
     role: str = Field(pattern="^(microvm|docker|gpu)$")
     address: str = Field(default="", max_length=200)
+    # ``{key: default}``; a ``max_<key>`` entry makes ``key`` adjustable in the console up to that value.
     capacity: dict[str, Any] = Field(default_factory=dict)
     resources: dict[str, Any] = Field(default_factory=dict)
     heartbeat_interval_seconds: int = Field(default=10, ge=1, le=600)
+
+
+def effective_capacity(capacity: dict[str, Any], limits: dict[str, Any]) -> dict[str, Any]:
+    """The node's reported capacity with console limits applied, never above its ``max_<key>``."""
+    merged = dict(capacity)
+    for key, value in limits.items():
+        ceiling = capacity.get(f"max_{key}")
+        if type(ceiling) is int and type(value) is int:
+            merged[key] = min(value, ceiling)
+    return merged
 
 
 class EvaluationRequest(BaseModel):
@@ -49,12 +60,36 @@ class EvaluationRequest(BaseModel):
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     seed: int = 0
     runtime_backend: Literal["firecracker", "docker"] = "firecracker"
+    # 4090: the resident model service; h800: the H800 launcher deploys the models for this evaluation.
+    accelerator: Literal["4090", "h800"] = "4090"
     run_id: str | None = None
+
+
+class ModelEndpointRequest(BaseModel):
+    """Both set to publish an H800 model service, both null to withdraw it."""
+
+    endpoint: str | None = Field(default=None, pattern=r"^http://[A-Za-z0-9.-]+:\d{1,5}$")
+    token: str | None = Field(default=None, min_length=16, max_length=200)
+
+    @model_validator(mode="after")
+    def _together(self) -> "ModelEndpointRequest":
+        if (self.endpoint is None) != (self.token is None):
+            raise ValueError("endpoint and token must be set together")
+        return self
+
+
+class ServingFailure(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
 
 
 class RolloutGroup(BaseModel):
     group_id: str = Field(min_length=1, max_length=200)
     task: TaskSpec
+
+
+class RolloutRetryRequest(BaseModel):
+    round: int = Field(ge=0)
+    max_attempts: int = Field(ge=1, le=10)
 
 
 class RolloutRequest(BaseModel):
@@ -134,9 +169,10 @@ class ConsoleStore:
 
     # --- nodes and sandboxes -------------------------------------------------
 
-    def heartbeat_node(self, node_id: str, beat: NodeHeartbeat) -> None:
+    def heartbeat_node(self, node_id: str, beat: NodeHeartbeat) -> dict[str, Any]:
+        """Record the beat; returns the node's effective capacity so it can apply console limits."""
         with self.connection.transaction():
-            self.connection.execute(
+            row = self.connection.execute(
                 """
                 INSERT INTO nodes (node_id, role, address, capacity, resources,
                                    heartbeat_interval_seconds, last_heartbeat_at)
@@ -146,6 +182,7 @@ class ConsoleStore:
                     capacity = EXCLUDED.capacity, resources = EXCLUDED.resources,
                     heartbeat_interval_seconds = EXCLUDED.heartbeat_interval_seconds,
                     last_heartbeat_at = CURRENT_TIMESTAMP
+                RETURNING capacity, limits
                 """,
                 (
                     node_id,
@@ -155,13 +192,37 @@ class ConsoleStore:
                     Json(beat.resources),
                     beat.heartbeat_interval_seconds,
                 ),
-            )
+            ).fetchone()
+        return effective_capacity(row["capacity"], row["limits"])
+
+    def set_node_limits(self, node_id: str, limits: dict[str, int]) -> dict[str, Any]:
+        """Store console concurrency limits; each must lie within the node's reported ``max_<key>``."""
+        if not limits:
+            raise ValueError("no limit given")
+        with self.connection.transaction():
+            row = self.connection.execute(
+                "SELECT capacity FROM nodes WHERE node_id = %s FOR UPDATE", (node_id,)
+            ).fetchone()
+            if row is None:
+                raise LookupError(node_id)
+            for key, value in limits.items():
+                ceiling = row["capacity"].get(f"max_{key}")
+                if type(ceiling) is not int:
+                    raise ValueError(f"{key} is not adjustable on {node_id}")
+                if not 1 <= value <= ceiling:
+                    raise ValueError(f"{key} must be between 1 and {ceiling}")
+            row = self.connection.execute(
+                "UPDATE nodes SET limits = limits || %s::jsonb WHERE node_id = %s RETURNING capacity, limits",
+                (Json(limits), node_id),
+            ).fetchone()
+        return {"node_id": node_id, "capacity": effective_capacity(row["capacity"], row["limits"]),
+                "limits": row["limits"]}
 
     def list_nodes(self) -> list[dict[str, Any]]:
         with self.connection.transaction():
-            return self.connection.execute(
+            rows = self.connection.execute(
                 """
-                SELECT n.node_id, n.role, n.address, n.capacity, n.resources,
+                SELECT n.node_id, n.role, n.address, n.capacity, n.limits, n.resources,
                        n.last_heartbeat_at,
                        CASE WHEN n.last_heartbeat_at
                                  < CURRENT_TIMESTAMP - 3 * n.heartbeat_interval_seconds * INTERVAL '1 second'
@@ -174,6 +235,9 @@ class ConsoleStore:
                 FROM nodes AS n ORDER BY n.role DESC, n.node_id
                 """
             ).fetchall()
+        for row in rows:
+            row["capacity"] = effective_capacity(row["capacity"], row["limits"])
+        return rows
 
     def list_sandboxes(self) -> list[dict[str, Any]]:
         with self.connection.transaction():
@@ -269,6 +333,8 @@ class ConsoleStore:
     def create_evaluation(self, request: EvaluationRequest, idempotency_key: str) -> tuple[dict[str, Any], bool]:
         values = request.model_dump(mode="json")
         fingerprint_values = dict(values)
+        if request.accelerator == "4090":  # Keep fingerprints of requests made before the field existed.
+            del fingerprint_values["accelerator"]
         fingerprint = hashlib.sha256(json.dumps(fingerprint_values, sort_keys=True).encode()).hexdigest()
         accepted_fingerprints = {fingerprint}
         if request.runtime_backend == "firecracker":
@@ -332,8 +398,9 @@ class ConsoleStore:
             self.connection.execute(
                 """
                 INSERT INTO evaluations (eval_id, name, run_id, model_versions, task_set, trials_per_task,
-                                         max_steps, temperature, seeds, idempotency_key, request_fingerprint)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                         max_steps, temperature, seeds, idempotency_key, request_fingerprint,
+                                         accelerator)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     eval_id,
@@ -347,6 +414,7 @@ class ConsoleStore:
                     Json(seeds),
                     idempotency_key,
                     fingerprint,
+                    request.accelerator,
                 ),
             )
             tasks = TaskStore(self.connection)
@@ -375,7 +443,7 @@ class ConsoleStore:
             rows = self.connection.execute(
                 """
                 SELECT ev.eval_id, ev.name, ev.run_id, ev.model_versions, ev.task_set, ev.trials_per_task,
-                       ev.temperature, ev.created_at,
+                       ev.temperature, ev.created_at, ev.accelerator, ev.model_endpoint IS NOT NULL AS model_ready,
                        min(t.runtime_backend) AS runtime_backend,
                        count(t.task_id) AS trials,
                        count(t.task_id) FILTER (WHERE t.status IN ('QUEUED','ALLOCATING','RUNNING_ENV','WAITING_MODEL'))
@@ -396,7 +464,7 @@ class ConsoleStore:
             evaluation = self.connection.execute(
                 """
                 SELECT ev.eval_id, ev.name, ev.run_id, ev.model_versions, ev.task_set, ev.trials_per_task, ev.max_steps,
-                       ev.temperature, ev.seeds, ev.created_at,
+                       ev.temperature, ev.seeds, ev.created_at, ev.accelerator, ev.model_endpoint IS NOT NULL AS model_ready,
                        (SELECT min(runtime_backend) FROM tasks WHERE eval_id = ev.eval_id) AS runtime_backend
                 FROM evaluations AS ev WHERE ev.eval_id = %s
                 """,
@@ -437,6 +505,28 @@ class ConsoleStore:
                     (eval_id, list(ACTIVE_STATUSES)),
                 ).fetchall()
             ]
+
+    def active_h800_evaluations(self) -> list[dict[str, Any]]:
+        """H800 evaluations with unfinished trials, for the launcher that deploys their models."""
+        with self.connection.transaction():
+            return self.connection.execute(
+                """
+                SELECT ev.eval_id, ev.model_versions, ev.model_endpoint
+                FROM evaluations AS ev
+                WHERE ev.accelerator = 'h800'
+                  AND EXISTS (SELECT 1 FROM tasks AS t WHERE t.eval_id = ev.eval_id AND t.status = ANY(%s))
+                ORDER BY ev.created_at
+                """,
+                (list(ACTIVE_STATUSES),),
+            ).fetchall()
+
+    def set_model_endpoint(self, eval_id: str, endpoint: str | None, token: str | None) -> bool:
+        """Publish (or withdraw, with None) an H800 evaluation's model service; queued trials wait for it."""
+        with self.connection.transaction():
+            return self.connection.execute(
+                "UPDATE evaluations SET model_endpoint = %s, model_token = %s WHERE eval_id = %s AND accelerator = 'h800'",
+                (endpoint, token, eval_id),
+            ).rowcount == 1
 
     def delete_evaluation(self, eval_id: str) -> bool:
         with self.connection.transaction():
@@ -518,11 +608,58 @@ class ConsoleStore:
         return created
 
     def list_rollouts(self, run_id: str, round_number: int | None = None) -> list[dict[str, Any]]:
+        """The latest attempt of each rollout slot, with ``attempts`` counting its runs."""
         where, params = "t.run_id = %s", (run_id,)
         if round_number is not None:
             where, params = where + " AND t.round = %s", params + (round_number,)
         with self.connection.transaction():
-            return self._trials(where, params, include_steps=True)
+            trials = self._trials(where, params, include_steps=True)
+        # A slot is (round, group, seed); _trials orders attempts by creation, so the last one wins.
+        latest: dict[tuple[Any, ...], dict[str, Any]] = {}
+        attempts: dict[tuple[Any, ...], int] = {}
+        for trial in trials:
+            slot = (trial["round"], trial["group_id"], trial["seed"])
+            latest[slot] = trial
+            attempts[slot] = attempts.get(slot, 0) + 1
+        return [{**trial, "attempts": attempts[slot]} for slot, trial in latest.items()]
+
+    def retry_rollouts(self, run_id: str, request: RolloutRetryRequest) -> list[dict[str, Any]]:
+        """Rerun, with the same seed, each slot whose latest attempt hit a runtime error; policy
+        outcomes (failure, max steps, invalid output) stay as they are."""
+        created = []
+        with self.connection.transaction():
+            rows = self.connection.execute(
+                """
+                SELECT t.task_type, t.instruction, t.app_image, t.policy_version, t.max_steps, t.temperature,
+                       t.seed, t.group_id, t.runtime_backend, t.status, e.result
+                FROM tasks AS t JOIN episodes AS e ON e.task_id = t.task_id
+                WHERE t.run_id = %s AND t.round = %s
+                ORDER BY t.group_id, t.seed, t.created_at
+                FOR UPDATE OF t
+                """,
+                (run_id, request.round),
+            ).fetchall()
+            latest: dict[tuple[Any, ...], dict[str, Any]] = {}
+            attempts: dict[tuple[Any, ...], int] = {}
+            for row in rows:
+                slot = (row["group_id"], row["seed"])
+                latest[slot] = row
+                attempts[slot] = attempts.get(slot, 0) + 1
+            tasks = TaskStore(self.connection)
+            for slot, row in latest.items():
+                if attempts[slot] >= request.max_attempts or trial_outcome(row["status"], row["result"]) != "error":
+                    continue
+                result, _ = tasks.create_task(
+                    TaskCreateRequest(
+                        task_type=row["task_type"], instruction=row["instruction"], app_image=row["app_image"],
+                        policy_version=row["policy_version"], max_steps=row["max_steps"], priority=ROLLOUT_PRIORITY,
+                        temperature=row["temperature"], seed=row["seed"], runtime_backend=row["runtime_backend"],
+                    ),
+                    f"{run_id}:round-{request.round}:{row['group_id']}:seed-{row['seed']}:attempt-{attempts[slot] + 1}",
+                    {"run_id": run_id, "round": request.round, "group_id": row["group_id"]},
+                )
+                created.append(result)
+        return created
 
     def run_evaluations(self, run_id: str) -> list[str]:
         with self.connection.transaction():

@@ -3,8 +3,11 @@ from __future__ import annotations
 import argparse
 import base64
 import gc
+import hmac
 import json
+import math
 import os
+import re
 import shutil
 import threading
 import time
@@ -19,6 +22,7 @@ from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 from alvarezgui.action import MODEL_SCREEN_HEIGHT, MODEL_SCREEN_WIDTH, validate_action
+from alvarezgui.model_families import model_family
 from alvarezgui.sokoban import ACTIONS
 from alvarezgui.policy_output import OUTPUT_FORMATS, parse_policy_output, policy_instruction
 from alvarezgui.model import (
@@ -61,6 +65,11 @@ def service_instruction(instruction: str) -> str:
     return policy_instruction(instruction)
 
 
+def token_entropies(torch: Any, logits: Any) -> Any:
+    """Entropy in nats of each row's next-token distribution; filtered (-inf) tokens contribute 0."""
+    return torch.special.entr(torch.softmax(logits.float(), dim=-1)).sum(dim=-1)
+
+
 def _parse_action(raw_output: str) -> dict[str, Any]:
     decoder = json.JSONDecoder()
     candidates = [raw_output.strip()]
@@ -78,7 +87,7 @@ def _parse_action(raw_output: str) -> dict[str, Any]:
         except (json.JSONDecodeError, TypeError, ValueError):
             continue
     raise InvalidActionOutputError(
-        "MiniCPM output did not contain a valid Android action; "
+        "model output did not contain a valid Android action; "
         f"raw_output_preview={raw_output[:160]!r}"
     )
 
@@ -95,10 +104,10 @@ def _has_routed_direction_head(config: dict[str, Any]) -> bool:
 def load_pretrained(model_path: str) -> tuple[Any, Any, Any]:
     try:
         import torch
-        from transformers import AutoModelForImageTextToText, AutoProcessor
+        from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
     except ImportError as exc:
         raise MiniCPMDependencyError(
-            "real MiniCPM serving requires torch, torchvision and transformers>=5.18"
+            "real model serving requires torch, torchvision and transformers>=5.18"
         ) from exc
     checkpoint = Path(model_path)
     policy_path = checkpoint / "policy_config.json"
@@ -123,12 +132,15 @@ def load_pretrained(model_path: str) -> tuple[Any, Any, Any]:
         base_path = PeftConfig.from_pretrained(model_path).base_model_name_or_path
         if not base_path or not Path(base_path).is_dir():
             raise ValueError("adapter requires its existing local base model")
+    family = model_family(AutoConfig.from_pretrained(base_path))  # Reject unknown architectures before loading.
     processor = AutoProcessor.from_pretrained(base_path if perception else model_path)
     model = AutoModelForImageTextToText.from_pretrained(
         base_path,
         torch_dtype="auto",
         device_map="auto",
     )
+    if family.prepare_model is not None:
+        family.prepare_model(model)
     if adapter.is_file():
         from peft import PeftModel
 
@@ -139,6 +151,35 @@ def load_pretrained(model_path: str) -> tuple[Any, Any, Any]:
             model = model.merge_and_unload(safe_merge=True)
     model.eval()
     return model, processor, torch
+
+
+def merge_adapter(checkpoint: Path, output: Path) -> None:
+    """Save a LoRA checkpoint merged into its base model as full weights at ``output``.
+
+    Loads like ``load_pretrained`` (base dtype, FP32 adapter) but on CPU, so a serving GPU is not needed.
+    BF16 rounding of the merged update can change outputs (it did for tiny4): compare the merged model
+    with the adapter before training or serving from it.
+    """
+    from peft import PeftConfig, PeftModel
+    from transformers import AutoConfig, AutoModelForImageTextToText
+
+    base_path = PeftConfig.from_pretrained(str(checkpoint)).base_model_name_or_path
+    if not base_path or not Path(base_path).is_dir():
+        raise ValueError("adapter requires its existing local base model")
+    model_family(AutoConfig.from_pretrained(base_path))  # Reject unknown architectures before loading.
+    model = AutoModelForImageTextToText.from_pretrained(base_path, torch_dtype="auto")
+    model = PeftModel.from_pretrained(model, str(checkpoint), autocast_adapter_dtype=True)
+    model = model.merge_and_unload(safe_merge=True)
+    pending = output.with_name(output.name + ".tmp")
+    shutil.rmtree(pending, ignore_errors=True)
+    # Processor, chat template and policy_config (output format, visual views) carry over byte for byte.
+    shutil.copytree(checkpoint, pending, ignore=shutil.ignore_patterns("adapter_*", "README.md", "metrics.json"))
+    model.save_pretrained(pending, safe_serialization=True)
+    policy_path = pending / "policy_config.json"
+    policy = json.loads(policy_path.read_text(encoding="utf-8")) if policy_path.is_file() else {}
+    policy_path.write_text(json.dumps({**policy, "finetuning_method": "full", "merged_from": str(checkpoint)},
+                                      indent=2), encoding="utf-8")
+    pending.rename(output)
 
 
 def control_plane_resolver(base_url: str, password: str, timeout: float = 5.0) -> Resolver:
@@ -186,6 +227,7 @@ class MiniCPMService:
         self.disabled_versions: set[str] = set()
         self.torch: Any = None
         self.generation_lock = threading.Lock()
+        self.merge_lock = threading.Lock()
         self.waiting = 0
         self.requests = 0
         self.rejected = 0
@@ -298,6 +340,24 @@ class MiniCPMService:
                 path.unlink()
             return True
 
+    def merge(self, version: str, target: str) -> str:
+        """Merge ``version``'s adapter into ``<checkpoint_root>/merged/<target>``; serving is not blocked."""
+        if self.checkpoint_root is None:
+            raise ValueError("checkpoint root is not configured")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", target):
+            raise ValueError("invalid target_version")
+        source = Path(self.resolver(version))
+        if not (source / "adapter_config.json").is_file():
+            raise ValueError(f"{version} is not a LoRA adapter checkpoint")
+        output = self.checkpoint_root / "merged" / target
+        # One merge at a time, so a leftover .tmp can only come from an interrupted earlier merge.
+        with self.merge_lock:
+            if output.exists():
+                raise ValueError(f"{output} already exists")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            merge_adapter(source, output)
+        return str(output)
+
     def unload_all(self) -> list[str]:
         with self.generation_lock:
             versions = list(self.models)
@@ -327,6 +387,7 @@ class MiniCPMService:
             model, processor = self._model(request.model_version)
             policy = self.policy_configs[request.model_version]
             output_format = policy["output_format"]
+            entropy = None
             if policy["inference_mode"] == "perception_direction":
                 direction = self._predict_direction(request.model_version, model, processor, image, request)
                 raw_output = json.dumps(ACTIONS[direction], separators=(",", ":"))
@@ -341,7 +402,7 @@ class MiniCPMService:
                 messages = [{"role": "user", "content": content}]
                 if request.max_tokens is None:
                     request = request.model_copy(update={"max_tokens": policy["max_tokens"]})
-                raw_output = self._generate(model, processor, messages, request)
+                raw_output, entropy = self._generate(model, processor, messages, request)
         self.requests += 1
         try:
             action = (_parse_action(raw_output) if output_format == "action-v1"
@@ -361,6 +422,7 @@ class MiniCPMService:
             model_version=request.model_version,
             latency_ms=latency_ms,
             output_format=output_format,
+            entropy=entropy,
         )
 
     def _predict_direction(
@@ -395,20 +457,21 @@ class MiniCPMService:
             prediction = self.perception_heads[version]["direction"](features["direction"])
         return DIRECTIONS[int(prediction.argmax(dim=-1).item())]
 
-    def _generate(self, model: Any, processor: Any, messages: list[dict[str, Any]], request: InferenceRequest) -> str:
+    def _generate(self, model: Any, processor: Any, messages: list[dict[str, Any]],
+                  request: InferenceRequest) -> tuple[str, float | None]:
+        """Returns the decoded output and its mean per-token sampling entropy (nats)."""
+        family = model_family(model.config)
         inputs = processor.apply_chat_template(
             messages,
             tokenize=True,
             add_generation_prompt=True,
             return_dict=True,
             return_tensors="pt",
-            downsample_mode="16x",
-            max_slice_nums=36,
-            enable_thinking=False,
+            **family.chat_template_kwargs,
         ).to(model.device)
         generation_args: dict[str, Any] = {
             "max_new_tokens": request.max_tokens,
-            "downsample_mode": "16x",
+            **family.generate_kwargs,
             "do_sample": request.temperature > 0,
         }
         if request.temperature > 0:
@@ -416,16 +479,21 @@ class MiniCPMService:
             if request.seed is not None:
                 self.torch.manual_seed(request.seed)
         with self.torch.inference_mode():
-            generated_ids = model.generate(**inputs, **generation_args)
+            generated = model.generate(**inputs, **generation_args, output_scores=True, return_dict_in_generate=True)
+            # Scores are what each token was drawn from: after temperature, top-k/top-p and other processors.
+            # Per step, so a 512-token plan never materializes a (tokens, vocab) softmax.
+            entropy = (float(sum(token_entropies(self.torch, step).sum() for step in generated.scores))
+                       / len(generated.scores) if generated.scores else None)
         trimmed = [
             output_ids[len(input_ids) :]
-            for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
+            for input_ids, output_ids in zip(inputs.input_ids, generated.sequences)
         ]
-        return processor.batch_decode(
+        text = processor.batch_decode(
             trimmed,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )[0]
+        return text, entropy if entropy is not None and math.isfinite(entropy) else None
 
 
 def _managed_checkpoint_path(path: str, root: Path) -> Path:
@@ -480,17 +548,29 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _authorized(self) -> bool:
+        token = self.server.token
+        if token and not hmac.compare_digest(self.headers.get("Authorization", ""), f"Bearer {token}"):
+            self._reply(401, {"detail": "authentication required"})
+            return False
+        return True
+
     def do_GET(self) -> None:
+        if not self._authorized():
+            return
         if self.path != "/health":
             self._reply(404, {"detail": "not found"})
             return
         self._reply(200, self.server.service.health())
 
     def do_POST(self) -> None:
+        if not self._authorized():
+            return
         if self.path in {
             "/internal/v1/model/load",
             "/internal/v1/model/unload",
             "/internal/v1/model/delete",
+            "/internal/v1/model/merge",
         }:
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -498,7 +578,12 @@ class _Handler(BaseHTTPRequestHandler):
                     raise ValueError("invalid request body")
                 body = json.loads(self.rfile.read(length))
                 version = body.get("model_version") if isinstance(body, dict) else None
-                if self.path.endswith("/load"):
+                if self.path.endswith("/merge"):
+                    target = body.get("target_version") if isinstance(body, dict) else None
+                    if not isinstance(version, str) or not version or not isinstance(target, str):
+                        raise ValueError("model_version and target_version are required")
+                    self._reply(200, {"checkpoint": self.server.service.merge(version, target)})
+                elif self.path.endswith("/load"):
                     if not isinstance(version, str) or not version:
                         raise ValueError("model_version is required")
                     self.server.service.load(version)
@@ -547,11 +632,19 @@ class _Handler(BaseHTTPRequestHandler):
 
 class _ModelServer(ThreadingHTTPServer):
     service: MiniCPMService
+    token: str | None = None
 
 
-def serve(service: MiniCPMService, host: str, port: int) -> None:
+def serve(service: MiniCPMService, host: str, port: int, *, token: str | None = None,
+          ready_file: Path | None = None) -> None:
+    """``token`` guards every POST (needed off loopback); ``ready_file`` receives the bound port."""
     server = _ModelServer((host, port), _Handler)
     server.service = service
+    server.token = token
+    if ready_file is not None:
+        pending = ready_file.with_name(ready_file.name + ".tmp")
+        pending.write_text(json.dumps({"port": server.server_address[1]}))
+        pending.replace(ready_file)
     try:
         server.serve_forever()
     finally:
@@ -567,8 +660,12 @@ def main() -> None:
     parser.add_argument("--max-loaded", type=int, default=2)
     parser.add_argument("--checkpoint-root", type=Path)
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=18081)
+    parser.add_argument("--port", type=int, default=18081, help="0 picks a free port; see --ready-file")
+    parser.add_argument("--ready-file", type=Path, help="write {\"port\": N} once listening")
     args = parser.parse_args()
+    token = os.environ.get("MODEL_SERVICE_TOKEN") or None
+    if args.host not in {"127.0.0.1", "localhost", "::1"} and not token:
+        raise SystemExit("MODEL_SERVICE_TOKEN is required when listening beyond loopback")
     static = dict(entry.split("=", 1) for entry in args.model)
     resolvers = [_static_resolver(static)]
     if args.control_plane_url:
@@ -584,6 +681,8 @@ def main() -> None:
         ),
         args.host,
         args.port,
+        token=token,
+        ready_file=args.ready_file,
     )
 
 

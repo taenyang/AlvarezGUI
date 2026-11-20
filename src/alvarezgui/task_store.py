@@ -173,6 +173,10 @@ class TaskStore:
             JOIN episodes AS e ON e.task_id = t.task_id
             WHERE t.status = 'QUEUED' AND e.status = 'QUEUED'
               AND t.runtime_backend IN ('firecracker', 'docker')
+              AND NOT EXISTS (
+                  SELECT 1 FROM evaluations AS ev
+                  WHERE ev.eval_id = t.eval_id AND ev.accelerator = 'h800' AND ev.model_endpoint IS NULL
+              )
         """
         params: tuple[Any, ...] = ()
         if runtime_backend is not None:
@@ -337,9 +341,10 @@ class TaskStore:
                 SELECT t.task_id, t.task_type, t.instruction, t.app_image, t.policy_version,
                        t.max_steps, t.current_step, t.status, t.temperature, t.seed,
                        t.runtime_backend, e.episode_id, e.status AS episode_status,
-                       e.actual_runtime_backend
+                       e.actual_runtime_backend, ev.accelerator, ev.model_endpoint, ev.model_token
                 FROM tasks AS t
                 JOIN episodes AS e ON e.task_id = t.task_id
+                LEFT JOIN evaluations AS ev ON ev.eval_id = t.eval_id
                 WHERE t.task_id = %s AND e.episode_id = %s
                 """,
                 (task_id, episode_id),
