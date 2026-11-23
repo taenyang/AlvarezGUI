@@ -103,7 +103,6 @@ class MiniCPMTrainingTest(unittest.TestCase):
     def test_unsupported_training_and_protocol_mismatch_fail_before_imports(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch("alvarezgui.minicpm_training._imports") as imports:
             cases = [
-                ("grpo", {"finetuning_method": "lora"}),
                 ("gigpo", {"output_format": "sokoban-plan-v1"}),
                 ("sft", {"finetuning_method": "other"}),
                 ("sft", {"output_format": "other"}),
@@ -607,6 +606,39 @@ class MiniCPMTrainingTest(unittest.TestCase):
             adapter_config_path.write_text(json.dumps(adapter_config))
             with self.assertRaisesRegex(ValueError, "supported LoRA recipe"):
                 real_lora_model(copy.deepcopy(pristine), torch, str(first_output))
+
+            # GRPO rounds: the first trains a new FP32 adapter, the next continues from it; base stays frozen.
+            source = base_path
+            for round_number in range(2):
+                output = Path(directory, f"grpo-round-{round_number}")
+                rows = [{"id": index, "group_id": "g", "reward": {"total": float(index)}, "advantage": index - .5,
+                         "conversations": self._row(Path("unused"))["conversations"]} for index in range(2)]
+                with patch("alvarezgui.minicpm_training._imports", return_value=imports), patch(
+                    "alvarezgui.minicpm_training._masked_batch", return_value=({"features": features}, labels)
+                ), patch("alvarezgui.minicpm_training._lora_model", side_effect=lora_model):
+                    metrics = train("grpo", source, rows, output, learning_rate=.01, finetuning_method="lora",
+                                    compute_old_logprob=True)
+                model = saved_models[-1]
+                self.assertEqual(metrics["update_count"], 2)
+                self.assertEqual(metrics["finetuning_method"], "lora")
+                self.assertTrue(all("old_logprob" in row for row in rows))
+                trainable = {name: value for name, value in model.named_parameters() if value.requires_grad}
+                self.assertTrue(all(value.dtype == torch.float32 for value in trainable.values()))
+                self.assertTrue(any(not torch.equal(value, initial_adapters[-1][name])
+                                    for name, value in trainable.items()))
+                for name, value in model.named_parameters():
+                    if not value.requires_grad:
+                        base_name = name.removeprefix("base_model.model.").replace(".base_layer.", ".")
+                        self.assertTrue(torch.equal(value, original_weights[base_name]), name)
+                self.assertEqual(_adapter_base_model(output), base_path)
+                self.assertFalse(Path(output, "model.safetensors").exists())
+                if round_number:  # Continued from the previous round's adapter, not a fresh one.
+                    previous = dict(saved_models[-2].named_parameters())
+                    for name, value in initial_adapters[-1].items():
+                        torch.testing.assert_close(value, previous[name].detach(), rtol=0, atol=0)
+                source = str(output)
+            with self.assertRaisesRegex(ValueError, "existing adapter requires finetuning_method='lora'"):
+                train("grpo", source, rows, Path(directory, "full-on-adapter"), compute_old_logprob=True)
 
     def test_top_layer_selection_and_bounds_before_loading_weights(self) -> None:
         config = SimpleNamespace(model_type="minicpmv4_7", text_config=SimpleNamespace(
@@ -1439,6 +1471,64 @@ class MiniCPMTrainingTest(unittest.TestCase):
                     "output_format": "action-v1", "max_tokens": 128, "finetuning_method": "full",
                     "train_merger_mlp": False, "visual_views": "full", "seed": 20261117,
                 })
+
+    def test_policy_loss_weights_and_clip_higher(self) -> None:
+        try:
+            import torch
+            from accelerate import Accelerator
+        except ImportError:
+            self.skipTest("requires torch and accelerate; runs on CPU without model downloads")
+
+        class TinyModel(torch.nn.Module):
+            config = SimpleNamespace(model_type="minicpmv4_7")
+
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(()))
+
+            def forward(self, features, use_cache=False):
+                score = self.weight * features
+                return SimpleNamespace(logits=torch.stack((score, score * 0)).repeat(1, 2, 1))
+
+        def run(rows, **options):
+            model = TinyModel()
+            callbacks = []
+            with tempfile.TemporaryDirectory() as directory, patch("alvarezgui.minicpm_training._imports", return_value=(
+                torch, lambda **kwargs: Accelerator(cpu=True, **kwargs),
+                SimpleNamespace(from_pretrained=Mock(return_value=model)),
+                SimpleNamespace(from_pretrained=Mock(return_value=Mock())),
+            )), patch("alvarezgui.minicpm_training._masked_batch", side_effect=lambda _p, row, _t, **_k: (
+                {"features": torch.tensor(float(row["feature"]))}, torch.tensor([[-100, 0]]))
+            ), patch("alvarezgui.minicpm_training._checkpoint"), patch.object(
+                torch.optim, "AdamW", side_effect=lambda params, lr: torch.optim.SGD(params, lr=lr)
+            ):
+                train("dapo", "unused-model", rows, directory, learning_rate=1.0, gradient_accumulation=len(rows),
+                      on_step=lambda step, values: callbacks.append(values), **options)
+            return model.weight.item(), callbacks
+
+        def row(feature, advantage, weight=None, old=-math.log(2)):
+            return {"id": feature, "group_id": "g", "reward": {"total": 1}, "feature": feature,
+                    "conversations": self._row(Path("unused"))["conversations"], "old_logprob": old,
+                    "advantage": advantage, **({"loss_weight": weight} if weight is not None else {})}
+
+        # One accumulated update; d logprob/d w = feature / 2 at w = 0, so the step is
+        # lr * mean(normalized_weight * advantage * feature / 2). Weights 1 and 3 normalize to 0.5 and 1.5.
+        weight, callbacks = run([row(1.0, 1.0, 1.0), row(-1.0, 1.0, 3.0)])
+        self.assertAlmostEqual(weight, (0.5 * 0.5 - 1.5 * 0.5) / 2, places=6)
+        self.assertEqual([values["train/loss_weight"] for values in callbacks], [0.5, 1.5])
+        unweighted, _ = run([row(1.0, 1.0), row(-1.0, 1.0)])
+        self.assertAlmostEqual(unweighted, 0.0, places=6)  # Missing weights are 1: the two rows cancel.
+        # ratio = exp(logprob - old) = 1.25 for A > 0: clipped (no gradient) at eps 0.2, not at eps_high 0.28.
+        stale = -math.log(2) - math.log(1.25)
+        clipped, callbacks = run([row(1.0, 1.0, old=stale)])
+        self.assertEqual((clipped, callbacks[0]["train/clipped"]), (0.0, 1.0))
+        higher, callbacks = run([row(1.0, 1.0, old=stale)], clip_epsilon_high=0.28)
+        self.assertGreater(higher, 0.0)
+        self.assertEqual(callbacks[0]["train/clipped"], 0.0)
+        with self.assertRaises(DatasetValidationError):
+            run([row(1.0, 1.0, 0.0)])
+        with self.assertRaises(ValueError):
+            run([row(1.0, 1.0)], clip_epsilon_high=1.5)
 
     def test_policy_training_uses_the_base_checkpoint_visual_views(self) -> None:
         try:

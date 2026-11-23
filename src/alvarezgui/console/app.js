@@ -1,4 +1,5 @@
 // AlvarezGUI console. All dynamic text goes through textContent (h()), never innerHTML.
+// Exception: the guide page parses the repo README (raw HTML escaped) with DOMParser.
 
 const view = document.getElementById("view");
 let pollTimer = null;
@@ -78,7 +79,7 @@ function modelBadge(status) {
   const [kind, label] = MODEL_STATUS[status] || ["", status];
   return h("span", { class: `badge ${kind}`, title: status }, label);
 }
-const ADAPTER_HINT = "只含 LoRA adapter 权重，加载时依赖基础模型；只能继续 LoRA SFT，GRPO / GIGPO 和全参数训练需先合并为完整权重";
+const ADAPTER_HINT = "只含 LoRA adapter 权重，加载时依赖基础模型；只能继续 LoRA SFT，在线策略算法 和全参数训练需先合并为完整权重";
 // <option>s grouped as the resources page shows them: models, LoRA adapters, checkpoints.
 function modelOptions(models, option) {
   const groups = [["模型", (m) => m.kind !== "checkpoint" && !m.adapter], ["LoRA", (m) => m.kind !== "checkpoint" && m.adapter],
@@ -371,7 +372,7 @@ function modelSections(versions, service) {
   ];
   const render = () => box.replaceChildren(
     ...section("模型", "每个训练实验只有一个正式模型，可在 Checkpoint 列切换", models.filter((m) => !m.adapter)),
-    ...section("LoRA", "只含 adapter 权重；GRPO / GIGPO 和全参数训练需先合并", models.filter((m) => m.adapter), { grouped: true }),
+    ...section("LoRA", "只含 adapter 权重；在线策略算法 和全参数训练需先合并", models.filter((m) => m.adapter), { grouped: true }),
     ...section("Checkpoint", "训练中按保存间隔保留的中间模型；可评测，设为正式模型后进入上方模型 / LoRA 栏",
       versions.filter((m) => m.kind === "checkpoint"), { checkpoints: true, grouped: true }),
   );
@@ -653,8 +654,9 @@ const METRIC_LABELS = {
   "gpu/memory_used_mib": ["显存 MiB", "秒", (v) => fmt.num(v, 0)],
 };
 
+const ALGORITHM_LABELS = { sft: "SFT", grpo: "GRPO", dapo: "DAPO", dr_grpo: "Dr. GRPO", gigpo: "GiGPO" };
 function algorithmLabel(algorithm) {
-  return algorithm === "gigpo" ? "GIGPO（GRPO 兼容版）" : algorithm.toUpperCase();
+  return ALGORITHM_LABELS[algorithm] || algorithm.toUpperCase();
 }
 
 // Config knobs each algorithm consumes; the form shows and submits only these.
@@ -663,7 +665,8 @@ const ALGORITHM_KNOBS = {
   sft: ["finetuning_method", "train_merger_mlp", "multiview", "output_format", "batch_size", "cache_preprocessed", ...SHARED_KNOBS],
   grpo: ["rounds", "tasks_per_round", "group_size", "temperature", "clip_epsilon", ...SHARED_KNOBS],
 };
-ALGORITHM_KNOBS.gigpo = ALGORITHM_KNOBS.grpo;
+ALGORITHM_KNOBS.dapo = [...ALGORITHM_KNOBS.grpo, "clip_epsilon_high"];
+ALGORITHM_KNOBS.dr_grpo = ALGORITHM_KNOBS.gigpo = ALGORITHM_KNOBS.grpo;
 
 // Set by "复用配置" on a run detail page and consumed by the next runs page render.
 let pendingRecipe = null;
@@ -722,7 +725,9 @@ function runForm(catalog) {
   const inputs = {
     algorithm: h("select", {},
       h("option", { value: "grpo" }, "GRPO（在线 rollout）"),
-      h("option", { value: "gigpo" }, "GIGPO（GRPO 兼容版）"),
+      h("option", { value: "dapo" }, "DAPO（动态采样 · clip-higher · 截断过滤）"),
+      h("option", { value: "dr_grpo" }, "Dr. GRPO（去掉 std 与长度归一）"),
+      h("option", { value: "gigpo" }, "GiGPO（episode + 相同状态步骤级优势）"),
       h("option", { value: "sft" }, "SFT（离线数据集）")),
     accelerator: h("select", {}, h("option", { value: "h800" }, "H800（按需创建 Pod，可并行）"), h("option", { value: "4090" }, "4090（常驻，单任务）")),
     finetuning_method: h("select", {}, h("option", { value: "full" }, "全参数"), h("option", { value: "lora" }, "LoRA（仅 SFT，FP32 adapter）")),
@@ -737,7 +742,7 @@ function runForm(catalog) {
     data: h("select", { required: true }, h("option", { value: "" }, "请选择"), onlineSets,
       h("optgroup", { label: "离线轨迹数据集" }, catalog.datasets.map((d) => h(
         "option", { value: `ds:${d.dataset_version}` }, `${d.dataset_version}（${d.sample_count} 条）`)))),
-    eval_set: h("select", {}, catalog.task_sets.filter((s) => s.tasks.length <= 8).map((s) => h(
+    eval_set: h("select", {}, catalog.task_sets.map((s) => h(
       "option", { value: s.name, selected: s.name === "sokoban-validation" }, taskSetLabel(s)))),
     rounds: h("input", { type: "number", min: 1, max: 20, value: 2 }),
     tasks_per_round: h("input", { type: "number", min: 1, max: 16, value: 4 }),
@@ -751,6 +756,7 @@ function runForm(catalog) {
     cache_preprocessed: h("input", { type: "checkbox" }),
     gradient_checkpointing: h("input", { type: "checkbox", checked: true }),
     clip_epsilon: h("input", { type: "number", min: 0.01, max: 1, step: 0.01, value: 0.2 }),
+    clip_epsilon_high: h("input", { type: "number", min: 0.01, max: 1, step: 0.01, value: 0.28 }),
     eval_trials: h("input", { type: "number", min: 0, max: 50, value: 4 }),
     checkpoint_every: h("input", { type: "number", min: 1, max: 100, value: 5, placeholder: "只保留正式模型" }),
     seed: h("input", { type: "number", value: 0 }),
@@ -784,27 +790,27 @@ function runForm(catalog) {
       message.replaceChildren(h("p", { class: "error-text" }, `创建失败：${error.message}`));
     } finally { submit.disabled = false; }
   } },
-  field("算法", inputs.algorithm, "GIGPO 当前复用 GRPO 更新，不含论文 GiGPO 的步骤级分组"),
+  field("算法", inputs.algorithm, "都用同一套在线 rollout，区别在 advantage 和每步在 loss 里的权重；对比见使用教程"),
   knob("accelerator", "训练资源", "H800 每个实验独立 Pod，可并行，checkpoint 复制到 4090；在线 GRPO 每轮在 H800 训练、同步到 4090 后采样"),
   field("Runtime", inputs.runtime_backend, "由当前服务配置的 runtime worker 执行；Docker 不支持快照"),
   field("基础模型", inputs.base_model, models.length ? "也可以选择 checkpoint 继续训练" : "尚未注册模型，请先运行 import_artifacts"),
   field("模型产物名称", inputs.model_name, "可选；只允许字母、数字、点、下划线和短横线，round 会自动追加版本后缀"),
-  field("数据集", inputs.data, "GRPO / GIGPO 选题目集时每轮抽题在线 rollout，选轨迹数据集时离线训练；SFT 只能选轨迹数据集。详见数据管理"),
+  field("数据集", inputs.data, "在线算法选题目集时每轮抽题在线 rollout，选轨迹数据集时离线训练；SFT 只能选轨迹数据集。详见数据管理"),
   knob("finetuning_method", "微调方式", "LoRA：rank=16 / alpha=32，语言侧注意力层"),
   knob("train_merger_mlp", "全量训练视觉 merger", "仅 LoRA；额外全量训练视觉-语言投影层（MiniCPM-V：model.merger.mlp.0，约 2,597 万参数；Qwen3-VL：model.visual.merger）"),
   knob("multiview", "双视图输入", "完整截图 + 棋盘裁剪；推理按 checkpoint 配置自动使用"),
   knob("output_format", "输出协议", "必须与数据集一致；执行器仍只执行 action"),
-  field("评测题目集", inputs.eval_set, "训练后自动评测用，最多 8 题；应与训练题目集不同，否则测不出泛化"),
+  field("评测题目集", inputs.eval_set, "训练后自动评测用，最多 48 题；应与训练题目集不同，否则测不出泛化"),
   knob("rounds", "轮数"),
   knob("tasks_per_round", "每轮题目数", "按 seed 洗牌后依次取题，全部做完一遍才会重复；每轮 rollout 数 = 题目数 × group size"),
   knob("group_size", "每组 rollout 数 (group size)"),
   knob("temperature", "采样 temperature", "组内需要 reward 差异，建议 ≥ 0.7"), knob("max_steps", "每条 rollout 最大步数"),
   knob("learning_rate", "学习率", "1e-5 曾破坏输出格式，默认 1e-7"), knob("epochs", "epochs"),
-  knob("gradient_accumulation", "梯度累积", "有效 batch = micro-batch × 梯度累积"), knob("clip_epsilon", "clip ε"),
+  knob("gradient_accumulation", "梯度累积", "有效 batch = micro-batch × 梯度累积"), knob("clip_epsilon", "clip ε"), knob("clip_epsilon_high", "clip ε 上界（DAPO）", "论文默认 0.28，下界仍用 clip ε"),
   knob("batch_size", "micro-batch", "H800 加速配置为 4（配合梯度累积 1）；需确认显存"),
   knob("cache_preprocessed", "缓存预处理输入", "CPU 内存换速度；333 条双视图约需 10 GiB 以上"),
   knob("gradient_checkpointing", "梯度检查点", "关闭更快但显存更高；H800 加速配置为关闭"),
-  knob("checkpoint_every", "checkpoint 保存间隔", "GRPO / GIGPO 每 N 轮、SFT 每 N 个 epoch 保留一个 checkpoint；最后一个总是正式模型；留空只保留正式模型"),
+  knob("checkpoint_every", "checkpoint 保存间隔", "在线算法每 N 轮、SFT 每 N 个 epoch 保留一个 checkpoint；最后一个总是正式模型；留空只保留正式模型"),
   knob("eval_trials", "训练后每任务评测次数", "0 表示不自动评测"), knob("seed", "随机 seed"),
   h("div", { class: "wide row" }, submit, message));
   const syncAlgorithm = () => {
@@ -935,7 +941,7 @@ function rolloutBrowser(rollouts) {
 async function dataPage() {
   const catalog = await api("/api/v1/catalog");
   view.replaceChildren(
-    pageHeading("DATA REGISTRY / 02", "数据管理", "SFT 使用离线轨迹数据集；GRPO / GIGPO 每轮从题目集抽题在线 rollout，训练后在评测题目集上自动评测。"),
+    pageHeading("DATA REGISTRY / 02", "数据管理", "SFT 使用离线轨迹数据集；在线策略算法 每轮从题目集抽题在线 rollout，训练后在评测题目集上自动评测。"),
     h("h3", {}, "离线轨迹数据集"),
     h("div", { class: "card" }, table([
       { label: "版本", render: (d) => h("span", { class: "mono" }, d.dataset_version) },
@@ -946,11 +952,11 @@ async function dataPage() {
     ], catalog.datasets)),
     h("h3", {}, "题目集"),
     h("div", { class: "card" },
-      h("p", { class: "muted" }, "单次评测最多 8 题，更大的题目集只能用于训练；训练和评测应选不同 split，避免在训练题上评测。"),
+      h("p", { class: "muted" }, "单次评测最多 48 题；训练和评测应选不同 split，避免在训练题上评测。"),
       table([
         { label: "名称", render: (s) => h("span", { class: "mono" }, s.name) },
         { label: "说明", key: "label" },
-        { label: "用途", render: (s) => (s.tasks.length <= 8 ? "训练 / 评测" : "训练") },
+        { label: "用途", render: () => "训练 / 评测" },
         { label: "题目", render: (s) => h("details", {}, h("summary", {}, `${s.tasks.length} 题`),
           h("div", { class: "mono" }, s.tasks.map((t) => t.app_image).join(", "))) },
       ], catalog.task_sets)),
@@ -996,8 +1002,7 @@ function evalForm(catalog) {
   const modelBoxes = models.map((m) => h("input", { type: "checkbox", value: m.version, checked: m === formal[formal.length - 1] }));
   const boxes = (rows) => h("div", { class: "checks" }, rows.map((m) => h("label", {}, modelBoxes[models.indexOf(m)], modelLabel(m))));
   const checkpoints = models.filter((m) => m.kind === "checkpoint");
-  // A single evaluation takes at most 8 tasks, so the 48-level training set is not offered.
-  const evalSets = catalog.task_sets.filter((s) => s.tasks.length <= 8);
+  const evalSets = catalog.task_sets;
   const taskSelect = h("select", {},
     h("optgroup", { label: "单个任务" }, catalog.tasks.map((t, i) => h("option", { value: `task:${i}` }, `${t.label}（${t.app_image}）`))),
     evalSets.length ? h("optgroup", { label: "题目集" }, evalSets.map((s) => h("option", { value: `set:${s.name}` }, taskSetLabel(s)))) : null);
@@ -1040,7 +1045,7 @@ function evalForm(catalog) {
   field("评测名称", name, "可选；不填写时自动生成名称"),
   field("Runtime", runtimeBackend, "Firecracker 使用 Android microVM；Docker 使用 Android 容器"),
   field("推理资源", accelerator, "H800 为本次评测单独创建 Pod 并预加载所选模型，加载完成后 trial 才开始；评测结束自动删除"),
-  field("任务 / 题目集", taskSelect, "题目集的每一题都会跑；训练关卡 48 题超过单次评测上限 8 题，不能选"),
+  field("任务 / 题目集", taskSelect, "题目集的每一题都会跑；单次评测最多 48 题、600 个 trial（模型数 × 题数 × 每题次数）"),
   field("每题 trial 次数", trials, "temperature 为 0 时同一题重复 trial 结果基本相同，要增加样本请用题目集；对比成功率建议总 trial ≥ 20"),
   field("最大步数", maxSteps), field("temperature", temperature, "0 为贪心解码"), field("起始 seed", seed),
   h("label", { class: "wide" }, "指令（可修改）", instruction),
@@ -1170,96 +1175,69 @@ function pageHeading(kicker, title, description) {
     h("p", {}, description));
 }
 
-function guideStep(number, title, description, meta) {
-  return h("article", { class: "guide-step card" },
-    h("div", { class: "step-number" }, number),
-    h("div", {}, h("h3", {}, title), h("p", {}, description), h("span", { class: "step-meta" }, meta)));
-}
-
-function architectureNode(x, y, width, height, title, details, kind = "") {
-  return h("g", { class: `arch-node ${kind}` },
-    h("rect", { x, y, width, height, rx: 12 }),
-    h("text", { x: x + 16, y: y + 29, class: "arch-title" }, title),
-    details.map((detail, index) => h("text", { x: x + 16, y: y + 53 + index * 18, class: "arch-detail" }, detail)));
-}
-
-function architectureArrow(x1, y1, x2, y2, kind = "") {
-  return h("line", { x1, y1, x2, y2, class: `arch-arrow ${kind}`, "marker-end": "url(#arch-arrow)" });
-}
-
-function architectureDiagram() {
-  const svg = h("svg", {
-    class: "architecture-svg",
-    viewBox: "0 0 1080 620",
-    role: "img",
-    "aria-label": "AlvarezGUI 从控制台到 Android sandbox 和训练服务的架构图",
+// The guide is the repository README (served by /console/readme), so the two stay in sync.
+// marked and mermaid are vendored under vendor/ and loaded only on this page.
+let guideLibs = null;
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    document.head.append(h("script", { src, onload: resolve, onerror: () => reject(new Error(`加载失败：${src}`)) }));
   });
-  svg.append(h("defs", {},
-    h("marker", { id: "arch-arrow", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" },
-      h("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: "context-stroke" }))));
-  svg.append(
-    architectureArrow(222, 112, 270, 112),
-    architectureArrow(510, 112, 570, 112),
-    architectureArrow(760, 112, 820, 112),
-    architectureArrow(390, 195, 390, 265, "secondary"),
-    architectureArrow(930, 195, 930, 270),
-    architectureArrow(820, 150, 260, 300, "model-link"),
-    architectureArrow(150, 410, 150, 500, "secondary"),
-    architectureArrow(260, 540, 300, 540, "secondary"),
-    architectureArrow(820, 340, 790, 410),
-    architectureArrow(820, 320, 490, 540, "secondary"),
-    architectureNode(30, 70, 192, 84, "实验控制台", ["创建实验 · 查看轨迹", "资源 / 训练 / 评测"], "user"),
-    architectureNode(270, 45, 240, 150, "Control Plane", ["FastAPI + Scheduler", "任务状态 · Lease · API", "runtime backend 路由"], "control"),
-    architectureNode(570, 45, 190, 90, "Redis Streams", ["任务队列 · Consumer Group"], "queue"),
-    architectureNode(820, 45, 220, 150, "Consumer Worker Pool", ["并发 sandbox worker", "XAUTOCLAIM · ACK", "动作与 reward 记录"], "worker"),
-    architectureNode(300, 265, 190, 90, "PostgreSQL", ["实验 · 任务 · 轨迹", "指标与 checkpoint 元数据"], "storage"),
-    architectureNode(30, 300, 230, 110, "Model Service", ["MiniCPM-V / Qwen3-VL HTTP API", "截图 → 结构化动作", "GPU / max-loaded=1"], "model"),
-    architectureNode(30, 500, 230, 80, "Training Agent", ["SFT / GRPO / GIGPO · 训练后评测"], "training"),
-    architectureNode(300, 500, 190, 80, "Artifacts", ["checkpoint · rollout", "可复现运行记录"], "storage"),
-    architectureNode(820, 270, 220, 100, "Runtime Layer", ["Firecracker / Docker Android", "sandbox 生命周期"], "runtime"),
-    architectureNode(560, 410, 230, 110, "Android sandbox", ["ADB · screenshot · input", "本地 fixture 应用", "backend 可配置"], "vm"),
-  );
-  return h("div", { class: "architecture card" },
-    h("div", { class: "section-kicker" }, "SYSTEM MAP"),
-    h("h3", {}, "AlvarezGUI 执行架构"),
-    h("p", { class: "section-lead" }, "一条 rollout 从控制台进入队列，经 Consumer 分配隔离 runtime，在 Android sandbox 中执行，再把轨迹送回模型和训练链路。"),
-    svg,
-    h("div", { class: "diagram-legend" },
-      h("span", {}, h("i", { class: "legend-dot cyan" }), "控制面"),
-      h("span", {}, h("i", { class: "legend-dot violet" }), "模型与训练"),
-      h("span", {}, h("i", { class: "legend-dot green" }), "Android runtime"),
-      h("span", {}, h("i", { class: "legend-dot gray" }), "持久化与队列")));
 }
 
-function guidePage() {
+function rewriteReadmeLinks(root) {
+  for (const img of root.querySelectorAll("img")) {
+    const src = img.getAttribute("src") || "";
+    if (src.startsWith("docs/images/")) img.src = `/console/${src}`;
+    img.loading = "lazy";
+  }
+  for (const a of root.querySelectorAll("a[href]")) {
+    const href = a.getAttribute("href");
+    if (href.startsWith("#")) {
+      // In-page anchors would collide with the hash router; scroll instead.
+      a.addEventListener("click", (event) => {
+        event.preventDefault();
+        document.getElementById(decodeURIComponent(href.slice(1)))?.scrollIntoView({ behavior: "smooth" });
+      });
+    } else if (!/^https?:/.test(href)) {
+      a.removeAttribute("href");  // repo-relative docs are not served by the console
+      a.title = "仓库内文档";
+    }
+  }
+}
+
+async function guidePage() {
+  const token = routeToken;
+  const [markdown] = await Promise.all([
+    fetch("/console/readme", { credentials: "same-origin", cache: "no-store" }).then((r) => {
+      if (!r.ok) throw new Error(`README 加载失败（${r.status}）`);
+      return r.text();
+    }),
+    guideLibs ||= Promise.all([loadScript("/console/static/vendor/marked.min.js"), loadScript("/console/static/vendor/mermaid.min.js")]),
+  ]);
+  if (token !== routeToken) return;
+  // README is repo-controlled, but still escape raw HTML so only Markdown-generated tags reach the DOM.
+  const slugs = new Map();
+  const escape = (text) => text.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+  const md = new window.marked.Marked({ gfm: true, renderer: {
+    html: ({ text }) => escape(text),
+    heading({ tokens, depth, text }) {
+      let slug = text.toLowerCase().trim().replace(/[^\p{L}\p{N}\s-]/gu, "").replace(/\s+/g, "-");
+      const seen = slugs.get(slug) || 0;
+      slugs.set(slug, seen + 1);
+      if (seen) slug += `-${seen}`;
+      return `<h${depth} id="${slug}">${this.parser.parseInline(tokens)}</h${depth}>`;
+    },
+    code: ({ text, lang }) => lang === "mermaid" ? `<div class="mermaid">${escape(text)}</div>` : false,
+  } });
+  const doc = new DOMParser().parseFromString(md.parse(markdown), "text/html");
+  const article = h("article", { class: "readme card" }, ...doc.body.childNodes);
+  rewriteReadmeLinks(article);
   view.replaceChildren(
-    pageHeading("PLAYBOOK / 05", "从实验到结果", "用 AlvarezGUI 管理模型、runtime、rollout 和评测。下面的流程图对应平台当前的真实执行链路。"),
-    h("div", { class: "guide-banner card" },
-      h("div", {}, h("div", { class: "eyebrow" }, "QUICK START"), h("h3", {}, "四步启动一次可复现实验"), h("p", {}, "先准备模型和数据，再选择 runtime。在线 rollout 会保留 seed、动作、截图和 reward，方便定位每一步发生了什么。")),
-      h("a", { class: "primary action-link", href: "#/runs" }, "创建训练实验 →")),
-    h("div", { class: "guide-steps" },
-      guideStep("01", "准备模型与数据", "在数据管理页查看轨迹数据集和题目集；训练实验页选择基础模型、训练数据和评测题目集。", "模型版本 · 数据集 · 题目集"),
-      guideStep("02", "使用 Runtime", "平台按配置选择 Firecracker 或 Docker，为每条 rollout 分配独立 Android sandbox。", "runtime_backend · sandbox capacity"),
-      guideStep("03", "观察 rollout", "Scheduler 将任务发布到对应 Redis Stream，Consumer worker 并发执行动作，并持续更新 lease 和轨迹。", "queue · worker pool · lease"),
-      guideStep("04", "分析训练结果", "训练 agent 汇总 reward 和指标，GRPO 只对有 reward 方差的 group 更新模型，训练后可自动发起评测。", "reward · metrics · checkpoint")),
-    architectureDiagram(),
-    h("div", { class: "guide-columns" },
-      h("section", { class: "card guide-section" },
-        h("div", { class: "section-kicker" }, "RUNTIME GUIDE"),
-        h("h3", {}, "Runtime Guide"),
-        h("div", { class: "runtime-choice" },
-          h("div", { class: "choice-card firecracker" }, h("span", { class: "choice-label" }, "DEFAULT PATH"), h("strong", {}, "Firecracker / Docker Android"), h("p", {}, "每条 rollout 使用独立 Android sandbox。Firecracker 提供 microVM 隔离与快照；Docker 适合 Windows Docker Desktop，本身不提供快照。"))),
-        h("div", { class: "callout" }, h("strong", {}, "运行原则"), " 新建训练、rollout 和评测统一进入配置的 backend stream；历史 fake 仅用于审计和回放。")),
-      h("section", { class: "card guide-section" },
-        h("div", { class: "section-kicker" }, "READ THE RUN"),
-        h("h3", {}, "看懂一次训练实验"),
-        h("ol", { class: "guide-list" },
-          h("li", {}, h("strong", {}, "状态"), "：QUEUED → RUNNING → SUCCEEDED / FAILED"),
-          h("li", {}, h("strong", {}, "Runtime"), "：请求 backend 与 actual backend 都会展示，便于确认实际执行环境"),
-          h("li", {}, h("strong", {}, "Reward"), "：同一 group 全部相同会显示零方差提示，不产生有效梯度"),
-          h("li", {}, h("strong", {}, "轨迹"), "：点击 rollout 可回放每一步截图、动作、模型原始输出和延迟"),
-          h("li", {}, h("strong", {}, "资源"), "：资源总览展示节点心跳、GPU、KVM、sandbox 和 lease")))),
-    h("div", { class: "guide-footer card" }, h("span", { class: "live-dot" }), "所有动态数据来自平台 API；页面每 3–5 秒自动刷新，教程内容本身不依赖后端状态。"));
+    pageHeading("PLAYBOOK / 05", "使用教程", "本页内容即仓库根目录 README.md，修改 README 后刷新即可同步。"),
+    article);
+  const dark = document.documentElement.dataset.theme !== "light";
+  window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: dark ? "dark" : "default" });
+  await window.mermaid.run({ nodes: article.querySelectorAll(".mermaid") });
 }
 
 // ---------------------------------------------------------------- router

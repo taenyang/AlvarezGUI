@@ -29,6 +29,9 @@ class RuntimeBackendRetiredError(Exception):
 
 
 EVAL_PRIORITY = 8
+# One evaluation covers a whole split (the 48 Sokoban training levels) but stays a bounded queue.
+MAX_EVALUATION_TASKS = 48
+MAX_EVALUATION_TRIALS = 600
 ROLLOUT_PRIORITY = 5
 
 
@@ -54,7 +57,7 @@ def effective_capacity(capacity: dict[str, Any], limits: dict[str, Any]) -> dict
 class EvaluationRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=100, pattern=r"(?s).*\S.*")
     model_versions: list[str] = Field(min_length=1, max_length=6)
-    tasks: list[TaskSpec] = Field(min_length=1, max_length=8)
+    tasks: list[TaskSpec] = Field(min_length=1, max_length=MAX_EVALUATION_TASKS)
     trials_per_task: int = Field(default=1, ge=1, le=50)
     max_steps: int = Field(default=5, ge=1, le=50)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
@@ -63,6 +66,13 @@ class EvaluationRequest(BaseModel):
     # 4090: the resident model service; h800: the H800 launcher deploys the models for this evaluation.
     accelerator: Literal["4090", "h800"] = "4090"
     run_id: str | None = None
+
+    @model_validator(mode="after")
+    def _bounded(self) -> "EvaluationRequest":
+        trials = len(self.model_versions) * len(self.tasks) * self.trials_per_task
+        if trials > MAX_EVALUATION_TRIALS:
+            raise ValueError(f"an evaluation runs at most {MAX_EVALUATION_TRIALS} trials; this one asks for {trials}")
+        return self
 
 
 class ModelEndpointRequest(BaseModel):
@@ -684,7 +694,7 @@ class ConsoleStore:
         if rows:
             for step in self.connection.execute(
                 """
-                SELECT episode_id, step_id, action, reward, done, model_output
+                SELECT episode_id, step_id, observation, action, reward, done, model_output
                 FROM steps WHERE episode_id = ANY(%s) ORDER BY episode_id, step_id
                 """,
                 ([row["episode_id"] for row in rows],),

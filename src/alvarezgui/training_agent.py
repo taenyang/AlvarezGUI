@@ -25,6 +25,7 @@ from urllib.request import Request, urlopen
 log = logging.getLogger("alvarezgui.training_agent")
 TERMINAL = {"SUCCEEDED", "FAILED", "CANCELED"}
 SCORED_OUTCOMES = {"success", "unsuccessful", "invalid_output", "max_steps"}
+POLICY_ALGORITHMS = {"grpo", "dapo", "dr_grpo", "gigpo"}
 # Runtime errors (sandbox, ADB, artifact storage) say nothing about the policy, so a slot is rerun
 # with its seed instead of being dropped from the group baseline.
 # ponytail: fixed attempt count, make it a TrainingConfig knob if runs need different budgets.
@@ -91,8 +92,10 @@ def gpu_snapshot() -> list[dict[str, Any]]:
     return gpus
 
 
-def episode_advantages(rollouts: list[dict[str, Any]]) -> dict[str, float]:
-    """Group-normalized episode reward; infrastructure errors are excluded from the baseline."""
+def episode_advantages(rollouts: list[dict[str, Any]], *, std: bool = True) -> dict[str, float]:
+    """Group-normalized episode reward; infrastructure errors are excluded from the baseline.
+
+    ``std=False`` keeps only the mean baseline (Dr. GRPO, GiGPO with F_norm = 1)."""
     groups: dict[str, list[dict[str, Any]]] = {}
     for rollout in rollouts:
         if rollout["outcome"] in SCORED_OUTCOMES:
@@ -101,10 +104,98 @@ def episode_advantages(rollouts: list[dict[str, Any]]) -> dict[str, float]:
     for members in groups.values():
         rewards = [member["reward_total"] for member in members]
         mean = statistics.fmean(rewards)
-        scale = statistics.pstdev(rewards) or 1.0
+        scale = (statistics.pstdev(rewards) or 1.0) if std else 1.0
         for member in members:
             advantages[member["episode_id"]] = (member["reward_total"] - mean) / scale
     return advantages
+
+
+# Policy algorithms share rollout collection and the clipped ratio; they differ in the advantage of
+# each step (one screenshot -> one action) and in how steps are weighted in the batch loss.
+#   grpo     DeepSeekMath GRPO: episode advantage (r - mean) / std, each rollout's steps averaged
+#            (1/|o_i|) so every rollout weighs the same, symmetric clip, no KL.
+#   dapo     DAPO: same advantage, mean over all steps of the batch (token-level loss, 1/sum|o_i|),
+#            clip [1-eps, 1+eps_high], rollouts truncated at max_steps masked out (overlong filtering),
+#            no KL. Its dynamic sampling refills the batch; that refill is not implemented.
+# Every algorithm skips zero-advantage steps (rows()), so groups with identical rewards never train
+# except under GiGPO, whose step advantage can still separate shorter and longer successes.
+#   dr_grpo  Dr. GRPO: advantage r - mean (no std), every step divided by the constant max_steps
+#            instead of its rollout length, symmetric clip, no KL.
+#   gigpo    GiGPO: A_E(episode) + omega * A_S(step); A_S groups steps of the same group by identical
+#            screen (anchor state) and compares discounted returns gamma^(T-t) * R. Paper defaults
+#            omega=1, gamma=0.95; F_norm=1 here. Steps averaged over the batch as in its Eq. 9.
+# ponytail: no KL term anywhere (beta=0, as DAPO/Dr. GRPO); add a reference model if drift appears.
+GIGPO_OMEGA = 1.0
+GIGPO_GAMMA = 0.95
+DAPO_CLIP_HIGH = 0.28
+
+
+def anchor_state(step: dict[str, Any]) -> str | None:
+    """GiGPO anchor key: the UI text the step started from (for Sokoban it includes the board).
+
+    Not the screenshot hash: the status-bar clock makes identical boards hash differently."""
+    ui_text = (step.get("observation") or {}).get("ui_text")
+    return json.dumps(sorted(ui_text), ensure_ascii=False) if ui_text else None
+
+
+def step_advantages(rollouts: list[dict[str, Any]], algorithm: str, max_steps: int,
+                    *, omega: float = GIGPO_OMEGA, gamma: float = GIGPO_GAMMA) -> dict[tuple[str, int], tuple[float, float]]:
+    """``(episode_id, step_id) -> (advantage, loss_weight)`` for every trainable model step.
+
+    The trainer minimizes ``sum(loss_weight * clipped_ratio_loss)`` over a round, so loss weights encode
+    each algorithm's normalization. Steps without model output (fixture setup) are not trainable."""
+    if algorithm not in POLICY_ALGORITHMS:
+        raise ValueError(f"unknown policy algorithm {algorithm!r}")
+    scored = [r for r in rollouts if r["outcome"] in SCORED_OUTCOMES]
+    if algorithm == "dapo":
+        # A group whose rewards are all equal has zero advantage; drop it before the step count so its
+        # steps do not dilute the 1/sum|o_i| weight of the rest (the other algorithms get this from rows()).
+        rewards: dict[str, set[float]] = {}
+        for rollout in scored:
+            rewards.setdefault(rollout["group_id"], set()).add(rollout["reward_total"])
+        scored = [r for r in scored if len(rewards[r["group_id"]]) > 1]
+        # Overlong filtering: a rollout cut off at max_steps is masked, not punished as a failure. It still
+        # counts in the baseline above (its reward is a real observation of the policy).
+        baseline = episode_advantages(scored)
+        scored = [r for r in scored if r["outcome"] != "max_steps"]
+    else:
+        baseline = episode_advantages(scored, std=algorithm == "grpo")
+    trainable = {r["episode_id"]: [s for s in r.get("step_records", []) if s.get("model_output")] for r in scored}
+    step_count = sum(len(steps) for steps in trainable.values())
+    if not step_count:
+        return {}
+    result: dict[tuple[str, int], tuple[float, float]] = {}
+    if algorithm == "gigpo":
+        # Discounted return of each step: the only reward is the episode's final one, at its last step.
+        returns: dict[tuple[str, int], float] = {}
+        anchors: dict[tuple[str, str], list[tuple[str, int]]] = {}
+        for rollout in scored:
+            steps = trainable[rollout["episode_id"]]
+            for position, step in enumerate(steps):
+                key = (rollout["episode_id"], step["step_id"])
+                returns[key] = gamma ** (len(steps) - 1 - position) * rollout["reward_total"]
+                if (state := anchor_state(step)) is not None:
+                    anchors.setdefault((rollout["group_id"], state), []).append(key)
+        step_relative: dict[tuple[str, int], float] = {}
+        for members in anchors.values():
+            if len(members) > 1:  # A singleton anchor has no peers to compare with: A_S = 0.
+                mean = statistics.fmean(returns[key] for key in members)
+                for key in members:
+                    step_relative[key] = returns[key] - mean
+        for rollout in scored:
+            for step in trainable[rollout["episode_id"]]:
+                key = (rollout["episode_id"], step["step_id"])
+                result[key] = (baseline[rollout["episode_id"]] + omega * step_relative.get(key, 0.0), 1 / step_count)
+        return result
+    rollout_count = sum(1 for steps in trainable.values() if steps)
+    for rollout in scored:
+        steps = trainable[rollout["episode_id"]]
+        for step in steps:
+            weight = {"grpo": 1 / (len(steps) * rollout_count),
+                      "dapo": 1 / step_count,
+                      "dr_grpo": 1 / (max_steps * rollout_count)}[algorithm]
+            result[(rollout["episode_id"], step["step_id"])] = (baseline[rollout["episode_id"]], weight)
+    return result
 
 
 def rollout_metrics(rollouts: list[dict[str, Any]]) -> dict[str, float]:
@@ -250,15 +341,9 @@ class TrainingAgent:
         run_dir = self.checkpoint_root / run["run_id"]
         policy_path = Path(base_path) / "policy_config.json"
         policy = json.loads(policy_path.read_text()) if policy_path.is_file() else {}
-        if run["algorithm"] != "sft" and (
-            (Path(base_path) / "adapter_config.json").is_file()
-            or policy.get("output_format", "action-v1") != "action-v1"
-        ):
-            raise ValueError("adapter and structured checkpoints currently require SFT")
-        if run["algorithm"] == "gigpo":
-            self.log(run["run_id"], "GIGPO compatibility mode: GRPO episode advantages and clipped policy loss; "
-                     "no step-level state grouping")
-        if run["algorithm"] == "sft" or (run["algorithm"] in {"grpo", "gigpo"} and run.get("dataset_version")):
+        if run["algorithm"] != "sft" and policy.get("output_format", "action-v1") != "action-v1":
+            raise ValueError("structured checkpoints currently require SFT")
+        if run["algorithm"] == "sft" or (run["algorithm"] in POLICY_ALGORITHMS and run.get("dataset_version")):
             rows = load_dataset(_local_path(run.get("dataset_source"), "dataset"))
             self.log(run["run_id"], f"offline {run['algorithm']} on {len(rows)} rows")
             output_dir = run_dir / "final"
@@ -270,7 +355,7 @@ class TrainingAgent:
                 self.release_training_memory()
             self.register_epochs(run, run_dir)
             version = self.register(run, output_dir, metrics, "final")
-        elif run["algorithm"] in {"grpo", "gigpo"}:
+        elif run["algorithm"] in POLICY_ALGORITHMS:
             version, output_dir, metrics = self.online_grpo(run, base_path, run_dir)
         else:
             raise RuntimeError(f"algorithm {run['algorithm']} is not supported by this agent")
@@ -420,17 +505,16 @@ class TrainingAgent:
     def rows(self, run: dict[str, Any], round_number: int, rollouts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         from alvarezgui.minicpm_service import service_instruction
 
-        advantages = episode_advantages(rollouts)
+        algorithm = run["algorithm"]
+        advantages = step_advantages(rollouts, algorithm, run["config"]["max_steps"])
         image_dir = self.work_root / run["run_id"] / f"round-{round_number}"
         rows = []
         for rollout in rollouts:
-            advantage = advantages.get(rollout["episode_id"], 0.0)
-            if advantage == 0.0:
-                continue
-            for step in rollout["step_records"]:
-                output = step.get("model_output")
-                if not output:
+            for step in rollout.get("step_records", []):
+                advantage, loss_weight = advantages.get((rollout["episode_id"], step["step_id"]), (0.0, 0.0))
+                if advantage == 0.0:  # No gradient; skip the screenshot download and forward pass.
                     continue
+                output = step["model_output"]
                 image = image_dir / f"{rollout['episode_id']}-{step['step_id']}.png"
                 self.cp.download(
                     f"/api/v1/episodes/{rollout['episode_id']}/steps/{step['step_id']}/screenshot", image
@@ -447,6 +531,7 @@ class TrainingAgent:
                     ],
                     "reward": {"total": rollout["reward_total"]},
                     "advantage": advantage,
+                    "loss_weight": loss_weight,
                     "done": step["done"],
                 })
         self.log(run["run_id"], f"round {round_number}: {len(rows)} training rows from {len(rollouts)} rollouts")
@@ -555,6 +640,7 @@ def train_options(config: dict[str, Any]) -> dict[str, Any]:
         "output_format": config.get("output_format", "action-v1"),
         "seed": config.get("seed", 0),
         "clip_epsilon": config["clip_epsilon"],
+        "clip_epsilon_high": config.get("clip_epsilon_high"),
         "group_size": config["group_size"],
     }
 

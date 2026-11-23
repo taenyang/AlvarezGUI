@@ -3,8 +3,9 @@
 ``serve`` claims ``accelerator=h800`` runs, stages the base model and dataset on CFS, starts one
 Kubernetes Deployment per run (copied from a template), relays CFS metrics/logs to the control plane,
 then copies the checkpoint to the 4090 serving host, registers it and deletes the Deployment.
-Online GRPO repeats this per round: rollouts are sampled through the 4090 serving host with the last
-published policy, then a fresh Deployment trains the next policy on H800.
+Online GRPO repeats this per round on H800 only: a serving Deployment answers that round's rollouts
+with the current policy, then a fresh Deployment trains the next policy. Checkpoints are still copied
+to the 4090 serving host so evaluations there can load them.
 ``pod`` is the in-pod entry point. CFS holds all run state, so a restarted launcher resumes its runs.
 H800 evaluations (``accelerator=h800``) get one Deployment that preloads their models and serves them
 on a free port of the pod's host network behind a per-evaluation token; the launcher publishes that
@@ -310,14 +311,14 @@ class H800Launcher:
     def stage_online(self, run: dict[str, Any], run_dir: Path) -> None:
         base = self.stage_model(_uri_path(run.get("base_model_checkpoint_uri"), "base model"))
         policy = base / "policy_config.json"
-        if (base / "adapter_config.json").is_file() or (
-                policy.is_file() and json.loads(policy.read_text()).get("output_format", "action-v1") != "action-v1"):
-            raise ValueError("adapter and structured checkpoints currently require SFT")
+        # A LoRA base continues training its adapter; the trainer rejects it for full fine-tuning.
+        if policy.is_file() and json.loads(policy.read_text()).get("output_format", "action-v1") != "action-v1":
+            raise ValueError("structured checkpoints currently require SFT")
         state = {"round": 0, "policy_version": run["base_model"], "policy_path": str(base), "step_offset": 0,
                  "metrics": {}, "source_sha256": self.snapshot_source(run_dir)}
         (run_dir / "online.json").write_text(json.dumps(state, indent=2))
         self.agent.log(run["run_id"], f"online {run['algorithm']}: {run['config']['rounds']} rounds, "
-                                      f"sampling on the 4090 serving host, training on H800; base {base}")
+                                      f"sampling and training on H800; base {base}")
 
     def stage_model(self, path: str) -> Path:
         target = to_cfs(path, self.root)
@@ -391,14 +392,18 @@ class H800Launcher:
         work = run_dir / f"round-{number}"
         if not (work / "spec.json").exists():
             if not (work / "REQUESTED").exists():
+                if not self.rollout_service_ready(run, state, work):
+                    return
                 self.agent.log(run_id, f"round {number}: {run['algorithm']} sampling with {state['policy_version']}")
                 self.agent.request_rollouts(run, number, state["policy_version"])
-                work.mkdir(parents=True, exist_ok=True)
                 (work / "REQUESTED").write_text(state["policy_version"])
                 return
+            if not self.rollout_service_ready(run, state, work):
+                return  # Queued and running rollouts wait for the replacement pod.
             rollouts = self.agent.finished_rollouts(run, number)
             if rollouts is None:
                 return
+            self.stop_rollout_service(run_id, work)
             summary = rollout_metrics(rollouts)
             self.agent.metrics(run_id, number, summary)
             rows = self.agent.rows(run, number, rollouts)  # Screenshots land in this round's CFS directory.
@@ -428,6 +433,51 @@ class H800Launcher:
         state.update(round=number + 1, policy_version=version, policy_path=str(output), checkpoint_uri=uri,
                      step_offset=state["step_offset"] + metrics["step_count"], metrics=metrics)
         state_path.write_text(json.dumps(state, indent=2))
+
+    # --- H800 rollout serving -------------------------------------------------------
+    # One Deployment per round serves that round's policy; it shares the run's alvarez-run label, so
+    # fail() and cancellation remove it with the training pod.
+
+    def rollout_service_name(self, run_id: str, work: Path) -> str:
+        return self.deployment_name(run_id, work.name).replace("alvarez-train-", "alvarez-roll-", 1)
+
+    def rollout_service_ready(self, run: dict[str, Any], state: dict[str, Any], work: Path) -> bool:
+        """Start, watch and publish this round's H800 policy service; True while it answers."""
+        run_id, serve = run["run_id"], work / "serve"
+        name = self.rollout_service_name(run_id, work)
+        if not (serve / "spec.json").exists():
+            serve.mkdir(parents=True, exist_ok=True)
+            token = serve / "token"
+            token.touch(mode=0o600)
+            token.write_text(secrets.token_urlsafe(32))
+            (serve / "pod.sh").write_text(SERVE_POD_SCRIPT.format(work=serve, root=self.root, src=run_dir_src(work)))
+            (serve / "spec.json").write_text(json.dumps(
+                {"run_id": run_id, "models": {state["policy_version"]: state["policy_path"]}}, indent=2))
+            self.apply_rollout_service(run_id, name, serve)
+            self.agent.log(run_id, f"{work.name}: created rollout service {name} for {state['policy_version']}")
+            return False
+        if (serve / "FAILED").exists():
+            self.fail(run_id, work.parent, "H800 rollout service failed: " + (serve / "FAILED").read_text()[-1500:])
+            return False
+        if not self.kube("get", "deployment", name, "--ignore-not-found", "-o", "name").strip():
+            self.agent.log(run_id, f"{work.name}: recreated missing rollout service {name}")
+            self.apply_rollout_service(run_id, name, serve)
+        token = (serve / "token").read_text().strip()
+        endpoint = self.serving_endpoint(f"gpu-be-label={name}", serve)
+        target = endpoint if endpoint is not None and self.healthy(endpoint, token) else None
+        # ponytail: published every tick (15 s); compare with the stored value if this gets noisy.
+        self.cp.call("PUT", f"/internal/v1/training/runs/{run_id}/model-endpoint",
+                     {"endpoint": target, "token": token if target else None})
+        return target is not None
+
+    def apply_rollout_service(self, run_id: str, name: str, serve: Path) -> None:
+        self.kube("apply", "-f", "-", stdin=json.dumps(deployment_manifest(self.template(), name, run_id, serve / "pod.sh")))
+
+    def stop_rollout_service(self, run_id: str, work: Path) -> None:
+        name = self.rollout_service_name(run_id, work)
+        self.cp.call("PUT", f"/internal/v1/training/runs/{run_id}/model-endpoint", {"endpoint": None, "token": None})
+        self.kube("delete", "deployment", name, "--ignore-not-found", "--wait=false")
+        (work / "serve" / "token").unlink(missing_ok=True)
 
     def relay(self, run_id: str, work: Path) -> None:
         offsets_path = work / "relay-offsets.json"
@@ -556,7 +606,7 @@ class H800Launcher:
             log.info("evaluation %s: recreated missing deployment %s", eval_id, self.apply_serving(eval_id, work))
             return
         token = (work / "token").read_text().strip()
-        endpoint = self.serving_endpoint(eval_id, work)
+        endpoint = self.serving_endpoint(f"alvarez-run={eval_id}", work)
         target = endpoint if endpoint is not None and self.healthy(endpoint, token) else None
         if target != evaluation["model_endpoint"]:
             # ponytail: trials already waiting on a pod that just died fail; queued ones wait for the next pod.
@@ -564,11 +614,11 @@ class H800Launcher:
                          {"endpoint": target, "token": token if target else None})
             log.info("evaluation %s: model endpoint %s", eval_id, target or "withdrawn")
 
-    def serving_endpoint(self, eval_id: str, work: Path) -> str | None:
+    def serving_endpoint(self, selector: str, work: Path) -> str | None:
         ready = work / "ready.json"
         if not ready.exists():
             return None
-        pods = json.loads(self.kube("get", "pods", "-l", f"alvarez-run={eval_id}", "-o", "json"))["items"]
+        pods = json.loads(self.kube("get", "pods", "-l", selector, "-o", "json"))["items"]
         addresses = [pod["status"].get("podIP") for pod in pods
                      if pod["status"].get("phase") == "Running" and not pod["metadata"].get("deletionTimestamp")]
         if len(addresses) != 1 or not addresses[0]:
@@ -602,6 +652,11 @@ class H800Launcher:
         except HTTPError as exc:
             if exc.code != 404:  # The evaluation was deleted meanwhile.
                 raise
+
+
+def run_dir_src(work: Path) -> Path:
+    """The run's source snapshot, for a pod started from one of its round directories."""
+    return work.parent / "src"
 
 
 def _read_complete_lines(path: Path, offset: int) -> tuple[list[str], int]:

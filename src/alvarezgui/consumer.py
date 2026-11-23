@@ -19,7 +19,7 @@ from alvarezgui.action import validate_action
 from alvarezgui.artifacts import get as get_artifact, local_file, put_png, remove_local_screenshot
 from alvarezgui.config import MAX_SANDBOXES, Settings
 from alvarezgui.db import connect
-from alvarezgui.model import InferenceRequest, ModelService
+from alvarezgui.model import InferenceRequest, ModelService, ModelUnavailableError
 from alvarezgui.model_http import HttpModelService
 from alvarezgui.node_agent.factory import runtime_from_settings
 from alvarezgui.node_agent.runtime import (
@@ -43,6 +43,10 @@ from alvarezgui.task_store import TaskStore
 
 
 log = logging.getLogger("alvarezgui.consumer")
+
+# ponytail: fixed budget; a replacement H800 serving pod took ~3 minutes on 2026-11-23.
+H800_MODEL_WAIT_SECONDS = 900
+H800_MODEL_POLL_SECONDS = 10
 
 
 class Consumer:
@@ -383,14 +387,28 @@ class Consumer:
         sandbox_id: str,
         lease_id: str,
     ) -> None:
+        model_lost_at: float | None = None
         while True:
             if not self._store_call("heartbeat_lease", lease_id, sandbox_id, self.lease_ttl):
                 raise RuntimeOperationError("sandbox lease expired")
             context = self._store_call("get_execution_context", task_id, episode_id)
             if context is None or context["status"] != "RUNNING_ENV":
                 return
-            observation = self.runtime.observe(sandbox_id)
-            action, model_output = self._next_action(context, observation, sandbox_id, lease_id)
+            try:
+                observation = self.runtime.observe(sandbox_id)
+                action, model_output = self._next_action(context, observation, sandbox_id, lease_id)
+            except ModelUnavailableError as exc:
+                # The H800 serving pod is preemptible: wait for the launcher to publish its replacement.
+                if context.get("accelerator") != "h800":
+                    raise
+                model_lost_at = model_lost_at or time.monotonic()
+                if time.monotonic() - model_lost_at > H800_MODEL_WAIT_SECONDS:
+                    raise RuntimeOperationError(
+                        f"H800 model service for this evaluation was unavailable for {H800_MODEL_WAIT_SECONDS}s"
+                    ) from exc
+                time.sleep(H800_MODEL_POLL_SECONDS)
+                continue
+            model_lost_at = None
             result = self.runtime.execute(sandbox_id, action)
             final_observation = self._final_observation(sandbox_id) if result["done"] else None
             recorded_observation = self._upload_observation(observation, sandbox_id)
@@ -427,7 +445,7 @@ class Consumer:
         if context.get("accelerator") == "h800":
             # The H800 launcher publishes an on-demand model service; never fall back to the 4090 one.
             if not context.get("model_endpoint"):
-                raise RuntimeOperationError("H800 model service for this evaluation is not available")
+                raise ModelUnavailableError("H800 model service for this evaluation is not available")
             model_service = HttpModelService(
                 context["model_endpoint"], self.settings.model_request_timeout_seconds, context.get("model_token")
             )

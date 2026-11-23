@@ -17,16 +17,16 @@ class Action(BaseModel):
 
 class TapAction(Action):
     type: Literal["tap"] = "tap"
-    x: int = Field(ge=0)
-    y: int = Field(ge=0)
+    x: int = Field(ge=0, lt=MODEL_SCREEN_WIDTH)
+    y: int = Field(ge=0, lt=MODEL_SCREEN_HEIGHT)
 
 
 class SwipeAction(Action):
     type: Literal["swipe"] = "swipe"
-    x1: int = Field(ge=0)
-    y1: int = Field(ge=0)
-    x2: int = Field(ge=0)
-    y2: int = Field(ge=0)
+    x1: int = Field(ge=0, lt=MODEL_SCREEN_WIDTH)
+    y1: int = Field(ge=0, lt=MODEL_SCREEN_HEIGHT)
+    x2: int = Field(ge=0, lt=MODEL_SCREEN_WIDTH)
+    y2: int = Field(ge=0, lt=MODEL_SCREEN_HEIGHT)
     duration_ms: int = Field(default=300, ge=1, le=60_000)
 
 

@@ -231,52 +231,21 @@ details summary { color: var(--text-secondary); cursor: pointer; }
 .tooltip strong { font-variant-numeric: tabular-nums; }
 .tick { fill: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 
-/* guide */
-.guide-banner { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 22px; background: var(--surface-2); border-color: #31556a; }
-.guide-banner h3 { margin: 6px 0 4px; font-size: 20px; }
-.guide-banner p { margin: 0; color: var(--text-secondary); }
-.action-link { display: inline-flex; align-items: center; padding: 9px 14px; white-space: nowrap; border-radius: 7px; }
-.guide-steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 14px; }
-.guide-step { display: grid; grid-template-columns: auto 1fr; gap: 13px; min-height: 154px; margin: 0; }
-.step-number { color: var(--series-1); font: 15px ui-monospace, SFMono-Regular, Menlo, monospace; }
-.guide-step h3 { margin: 0 0 7px; font-size: 15px; }
-.guide-step p { margin: 0 0 16px; color: var(--text-secondary); font-size: 13px; }
-.step-meta { color: var(--text-muted); font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
-.architecture { overflow-x: auto; padding: 22px; }
-.architecture h3 { margin: 6px 0 4px; }
-.architecture-svg { display: block; width: 100%; min-width: 850px; margin-top: 18px; }
-.arch-node rect { fill: #172434; stroke: #385169; stroke-width: 1.2; }
-.arch-node .arch-title { fill: var(--text-primary); font-size: 16px; font-weight: 700; }
-.arch-node .arch-detail { fill: var(--text-secondary); font-size: 12px; }
-.arch-node.control rect, .arch-node.worker rect { fill: #163143; stroke: #4b9ab5; }
-.arch-node.model rect, .arch-node.training rect { fill: #292641; stroke: #766db0; }
-.arch-node.runtime rect, .arch-node.vm rect { fill: #193631; stroke: #4c9d81; }
-.arch-node.user rect { fill: #3a3426; stroke: #a88e52; }
-.arch-arrow { fill: none; stroke: var(--series-1); stroke-width: 2; opacity: 0.86; }
-.arch-arrow.secondary { stroke: var(--text-muted); stroke-dasharray: 6 5; }
-.arch-arrow.model-link { stroke: var(--violet); }
-.diagram-legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 10px; color: var(--text-secondary); font-size: 12px; }
-.diagram-legend span { display: inline-flex; align-items: center; gap: 7px; }
-.legend-dot { display: inline-block; width: 8px; height: 8px; background: var(--text-muted); border-radius: 50%; }
-.legend-dot.cyan { background: var(--series-1); }
-.legend-dot.violet { background: var(--violet); }
-.legend-dot.green { background: var(--good); }
-.guide-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-.guide-section { margin-bottom: 14px; }
-.guide-section h3 { margin: 6px 0 16px; }
-.runtime-choice { display: grid; gap: 10px; }
-.choice-card { padding: 13px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; }
-.choice-card.fake { border-left: 3px solid var(--series-1); }
-.choice-card.firecracker { border-left: 3px solid var(--good); }
-.choice-label { display: block; color: var(--text-muted); font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 0.1em; }
-.choice-card strong { display: block; margin: 4px 0; }
-.choice-card p { margin: 0; color: var(--text-secondary); font-size: 13px; }
-.callout { margin-top: 14px; padding: 11px 13px; color: var(--text-secondary); font-size: 13px; background: var(--wash); border: 1px solid #31556a; border-radius: 7px; }
-.callout strong { color: var(--series-1); }
-.guide-list { margin: 0; padding-left: 20px; color: var(--text-secondary); }
-.guide-list li { margin: 10px 0; padding-left: 4px; }
-.guide-list strong { color: var(--text-primary); }
-.guide-footer { display: flex; align-items: center; gap: 10px; margin-bottom: 0; color: var(--text-muted); font-size: 12px; }
+/* guide: rendered README */
+.readme { padding: 26px 30px; line-height: 1.7; overflow-wrap: anywhere; }
+.readme h1 { margin: 0 0 12px; font-size: 26px; }
+.readme h2 { margin: 34px 0 12px; padding-top: 18px; font-size: 20px; border-top: 1px solid var(--border); }
+.readme h3 { margin: 24px 0 8px; font-size: 16px; }
+.readme p, .readme li { color: var(--text-secondary); }
+.readme strong { color: var(--text-primary); }
+.readme a { color: var(--series-1); }
+.readme code { padding: 1px 5px; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--surface-2); border-radius: 4px; }
+.readme pre { overflow-x: auto; padding: 12px 14px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 7px; }
+.readme pre code { padding: 0; background: none; }
+.readme table { margin: 12px 0; border-collapse: collapse; }
+.readme th, .readme td { padding: 6px 10px; vertical-align: top; border: 1px solid var(--border); }
+.readme td img { display: block; width: 100%; max-width: 220px; border-radius: 6px; }
+.readme .mermaid { overflow-x: auto; margin: 14px 0; padding: 14px; text-align: center; background: var(--surface-2); border-radius: 8px; }
 
 .login-page {
   display: grid;
@@ -309,17 +278,9 @@ details summary { color: var(--text-secondary); cursor: pointer; }
 :root[data-theme="light"] .brand-mark { background: #e5f2f7; border-color: #8dbbca; }
 :root[data-theme="light"] header nav a.active { background: #e5f2f7; border-color: #b5d5df; }
 :root[data-theme="light"] .meter { background: #d9e4ec; }
-:root[data-theme="light"] .guide-banner { border-color: #b5d5df; }
-:root[data-theme="light"] .arch-node rect { fill: #e9f0f5; stroke: #9eb6c8; }
-:root[data-theme="light"] .arch-node.control rect, :root[data-theme="light"] .arch-node.worker rect { fill: #e1f1f6; stroke: #65aabd; }
-:root[data-theme="light"] .arch-node.model rect, :root[data-theme="light"] .arch-node.training rect { fill: #eeeafb; stroke: #9a8ed2; }
-:root[data-theme="light"] .arch-node.runtime rect, :root[data-theme="light"] .arch-node.vm rect { fill: #e5f3ed; stroke: #72b79c; }
-:root[data-theme="light"] .arch-node.user rect { fill: #f5efdf; stroke: #c4a965; }
-:root[data-theme="light"] .callout { border-color: #b5d5df; }
 
 @media (max-width: 1000px) {
   .header-status { display: none; }
-  .guide-steps { grid-template-columns: repeat(2, 1fr); }
 }
 @media (max-width: 680px) {
   .login-page { padding: 20px 14px; }
@@ -333,9 +294,6 @@ details summary { color: var(--text-secondary); cursor: pointer; }
   header nav { order: 3; flex-basis: 100%; overflow-x: auto; }
   header nav a { flex: 0 0 auto; }
   main { width: min(100% - 24px, 1400px); padding-top: 24px; }
-  .guide-banner, .guide-footer { align-items: flex-start; flex-direction: column; }
-  .guide-steps, .guide-columns { grid-template-columns: 1fr; }
-  .guide-step { min-height: auto; }
   .step { grid-template-columns: 100px 1fr; }
   .shot, .shot img { width: 100px; }
   table { display: block; overflow-x: auto; }

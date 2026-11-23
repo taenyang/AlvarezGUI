@@ -1,3 +1,4 @@
+import itertools
 import json
 import math
 import tempfile
@@ -146,6 +147,40 @@ class MiniCPMServiceTest(unittest.TestCase):
         self.assertIn('raw_output_preview=\'{"command":"shell","value":"id"}\'', str(caught.exception))
         with self.assertRaises(InvalidActionOutputError):
             _parse_action('{"type":"back"} trailing output')
+
+    def test_parse_action_rejects_coordinates_outside_the_model_screen(self) -> None:
+        # Seen in run_f630a6de round 8: accepted by serving, then rejected by the trainer's dataset check.
+        for raw in ('{"type":"tap","x":836,"y":360}', '{"type":"tap","x":10,"y":1280}',
+                    '{"type":"swipe","x1":0,"y1":0,"x2":720,"y2":0}'):
+            with self.subTest(raw=raw), self.assertRaises(InvalidActionOutputError):
+                _parse_action(raw)
+        self.assertEqual(_parse_action('{"type":"tap","x":719,"y":1279}'), {"type": "tap", "x": 719, "y": 1279})
+
+    def test_h800_trial_waits_for_a_replacement_model_service(self) -> None:
+        from alvarezgui.consumer import Consumer
+        from alvarezgui.model import ModelUnavailableError
+
+        consumer = Consumer.__new__(Consumer)
+        consumer.lease_ttl = None
+        consumer.runtime = Mock()
+        consumer.runtime.execute.return_value = {"reward": {}, "done": True}
+        context = {"status": "RUNNING_ENV", "accelerator": "h800", "current_step": 0, "max_steps": 10}
+        consumer._store_call = lambda method, *args: context if method == "get_execution_context" else True
+        consumer._next_action = Mock(side_effect=[ModelUnavailableError("gone"), ModelUnavailableError("gone"),
+                                                  ({"type": "terminate"}, None)])
+        consumer._final_observation = consumer._upload_observation = consumer._destroy_if_lease_owner = Mock()
+        with patch("alvarezgui.consumer.time.sleep") as sleep:
+            consumer._run_episode("t", "e", "s", "l")
+        self.assertEqual((sleep.call_count, consumer._next_action.call_count), (2, 3))
+
+        consumer._next_action = Mock(side_effect=ModelUnavailableError("gone"))
+        with patch("alvarezgui.consumer.time.sleep"), \
+                patch("alvarezgui.consumer.time.monotonic", side_effect=itertools.count(0, 500)), \
+                self.assertRaisesRegex(Exception, "unavailable for 900s"):
+            consumer._run_episode("t", "e", "s", "l")
+        context["accelerator"] = "4090"
+        with self.assertRaises(ModelUnavailableError):
+            consumer._run_episode("t", "e", "s", "l")
 
     def test_replayed_invalid_outputs_remain_rejected_with_evidence(self) -> None:
         for raw in (

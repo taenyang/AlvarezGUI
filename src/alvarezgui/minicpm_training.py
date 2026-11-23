@@ -19,7 +19,7 @@ from alvarezgui.model_families import MINICPM_V_4_7, ModelFamily, model_family, 
 from alvarezgui.policy_output import PLAN_INSTRUCTION_MARKER, parse_policy_output, policy_instruction
 from alvarezgui.sokoban import parse_board
 
-POLICY_ALGORITHMS = {"grpo", "gigpo"}
+POLICY_ALGORITHMS = {"grpo", "dapo", "dr_grpo", "gigpo"}
 POLICY_MAX_TOKENS = {"action-v1": 128, "sokoban-plan-v1": 512}
 PERCEPTION_CLASSES = 48
 DIRECTION_CLASSES = 4
@@ -950,6 +950,7 @@ def train(
     epochs: int = 1,
     gradient_accumulation: int = 1,
     clip_epsilon: float = 0.2,
+    clip_epsilon_high: float | None = None,
     group_size: int = 2,
     on_step: Callable[[int, dict[str, float]], None] | None = None,
     compute_old_logprob: bool = False,
@@ -997,12 +998,19 @@ def train(
 
     ``compute_old_logprob`` fills missing policy ``old_logprob`` values with the loaded base policy
     before any update, which matches on-policy rollouts sampled from that same checkpoint.
-    GIGPO currently uses this same GRPO-compatible clipped policy objective.
+    Policy rows may carry ``loss_weight`` (set by ``training_agent.step_advantages``): the algorithm's
+    per-step normalization (GRPO 1/|o_i|, DAPO and GiGPO 1/sum|o_i|, Dr. GRPO 1/max_steps). Weights are
+    rescaled to mean 1 over the rows, so relative weighting is exact while the update size per optimizer
+    step stays comparable across algorithms; the constant is absorbed by the learning rate. Rows without
+    it weigh 1. ``clip_epsilon_high`` (DAPO clip-higher) bounds the ratio at 1 + clip_epsilon_high;
+    None keeps the symmetric clip.
     Policy algorithms ignore ``multiview`` and use the base checkpoint's ``visual_views``.
     """
-    # ponytail: GIGPO is a GRPO alias; paper GiGPO needs step-level state grouping.
     if algorithm != "sft" and algorithm not in POLICY_ALGORITHMS:
-        raise ValueError("algorithm must be sft, grpo or gigpo")
+        raise ValueError(f"algorithm must be sft or one of {sorted(POLICY_ALGORITHMS)}")
+    if clip_epsilon_high is not None and (isinstance(clip_epsilon_high, bool) or not isinstance(clip_epsilon_high, (int, float))
+                                          or not 0 < clip_epsilon_high <= 1):
+        raise ValueError("clip_epsilon_high must be in (0, 1]")
     if checkpoint_dir is not None and algorithm != "sft":
         raise ValueError("checkpoint_dir is supported only for SFT")
     if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
@@ -1025,8 +1033,8 @@ def train(
             raise ValueError("top_layer_learning_rate must be finite and positive")
     if output_format not in POLICY_MAX_TOKENS:
         raise ValueError("output_format must be action-v1 or sokoban-plan-v1")
-    if algorithm in POLICY_ALGORITHMS and (finetuning_method != "full" or output_format != "action-v1"):
-        raise ValueError("LoRA and structured output training are supported only for SFT")
+    if algorithm in POLICY_ALGORITHMS and output_format != "action-v1":
+        raise ValueError("structured output training is supported only for SFT")
     adapter_base = _adapter_base_model(base_model)
     if adapter_base is not None and finetuning_method != "lora":
         raise ValueError("an existing adapter requires finetuning_method='lora'; full training cannot merge adapters")
@@ -1169,13 +1177,19 @@ def train(
     if on_cuda:
         torch.cuda.reset_peak_memory_stats(accelerator.device)
     advantages: list[float] = []
+    loss_weights: list[float] = []
     entropies: list[float] = []
     if algorithm in POLICY_ALGORITHMS:
-        # Multi-step rollouts carry an episode-level advantage; single-step rows are grouped here.
+        # Multi-step rollouts carry a per-step advantage; single-step rows are grouped here.
         if all("advantage" in row for row in rows):
             advantages = [float(row["advantage"]) for row in rows]
         else:
             advantages = group_advantages(rows)
+        raw_weights = [float(row.get("loss_weight", 1.0)) for row in rows]
+        if not all(math.isfinite(weight) and weight > 0 for weight in raw_weights):
+            raise DatasetValidationError("policy loss_weight must be finite and positive")
+        loss_weights = [weight * len(raw_weights) / sum(raw_weights) for weight in raw_weights]
+    upper_clip = 1 + (clip_epsilon if clip_epsilon_high is None else clip_epsilon_high)
     if algorithm in POLICY_ALGORITHMS and compute_old_logprob:
         model.eval()
         with torch.no_grad():
@@ -1226,7 +1240,8 @@ def train(
                         old_logprob = torch.as_tensor(float(row["old_logprob"]), device=accelerator.device)
                         ratio = torch.exp(current_logprob - old_logprob)
                         advantage = torch.as_tensor(advantages[index], device=accelerator.device)
-                        loss = -torch.minimum(ratio * advantage, ratio.clamp(1 - clip_epsilon, 1 + clip_epsilon) * advantage)
+                        loss = -loss_weights[index] * torch.minimum(
+                            ratio * advantage, ratio.clamp(1 - clip_epsilon, upper_clip) * advantage)
                 # Accelerate divides by the configured microbatch count. Weight by actual
                 # samples in this window, including a short microbatch and/or final window.
                 if batch_size == 1:
@@ -1260,7 +1275,8 @@ def train(
                         ratio_value = float(ratio.detach().cpu())
                         step_metrics["train/ratio"] = ratio_value
                         step_metrics["train/advantage"] = advantages[index]
-                        step_metrics["train/clipped"] = float(abs(ratio_value - 1) > clip_epsilon)
+                        step_metrics["train/clipped"] = float(not 1 - clip_epsilon <= ratio_value <= upper_clip)
+                        step_metrics["train/loss_weight"] = loss_weights[index]
                         if math.isfinite(entropy):
                             step_metrics["train/entropy"] = entropy
                             entropies.append(entropy)
@@ -1315,7 +1331,7 @@ def train(
         "implementation": (
             "sft-cross-entropy"
             if algorithm == "sft"
-            else "grpo-compatible-clipped-policy"
+            else f"{algorithm}-clipped-policy"
         ),
     }
     if checkpoint_dir is not None:
@@ -1349,7 +1365,7 @@ def _sequence_logprob(torch: Any, logits: Any, labels: Any) -> Any:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--algorithm", choices=("sft", "grpo", "gigpo", "perception"), required=True)
+    parser.add_argument("--algorithm", choices=("sft", *sorted(POLICY_ALGORITHMS), "perception"), required=True)
     parser.add_argument("--base-model", required=True)
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--output-dir", required=True)

@@ -124,13 +124,15 @@ class TrainingConfig(BaseModel):
     epochs: int = Field(default=1, ge=1, le=10)
     gradient_accumulation: int = Field(default=1, ge=1, le=64)
     clip_epsilon: float = Field(default=0.2, gt=0, le=1)
+    # DAPO clip-higher upper bound (paper 0.28); None means the symmetric clip_epsilon.
+    clip_epsilon_high: float | None = Field(default=None, gt=0, le=1)
     group_size: int = Field(default=4, ge=2, le=16)
     rounds: int = Field(default=1, ge=1, le=20)
     # Online RL pool; SFT and runs without eval_tasks also evaluate on it.
     tasks: list[TaskSpec] = Field(default_factory=list, max_length=64)
     # Online RL draws this many pool tasks per round (seeded, every task once before repeats); None = all.
     tasks_per_round: int | None = Field(default=None, ge=1, le=16)
-    eval_tasks: list[TaskSpec] = Field(default_factory=list, max_length=8)
+    eval_tasks: list[TaskSpec] = Field(default_factory=list, max_length=48)
     # Names from TASK_SETS, expanded into tasks / eval_tasks at creation.
     train_set: str | None = None
     eval_set: str | None = None
@@ -155,13 +157,13 @@ class TrainingConfig(BaseModel):
         # Limits of one rollout request (16 groups) and one evaluation (8 tasks).
         if self.tasks_per_round is None and len(self.tasks) > 16:
             raise ValueError("tasks_per_round is required for more than 16 tasks")
-        if self.eval_trials and len(self.eval_tasks or self.tasks) > 8:
-            raise ValueError("automatic evaluation takes at most 8 tasks; set eval_set or eval_tasks")
+        if self.eval_trials and len(self.eval_tasks or self.tasks) > 48:
+            raise ValueError("automatic evaluation takes at most 48 tasks; set eval_set or eval_tasks")
         return self
 
 
 class TrainingRunRequest(BaseModel):
-    algorithm: str = Field(pattern="^(sft|grpo|gigpo)$")
+    algorithm: str = Field(pattern="^(sft|grpo|dapo|dr_grpo|gigpo)$")
     base_model: str = Field(min_length=1)
     dataset_version: str | None = Field(default=None, min_length=1)
     environment_version: str = Field(min_length=1)
@@ -171,17 +173,18 @@ class TrainingRunRequest(BaseModel):
 
     @model_validator(mode="after")
     def _data_source(self) -> "TrainingRunRequest":
+        # Policy algorithms may use language LoRA (FP32 adapter); the rest of the recipe stays SFT-only.
         if self.algorithm != "sft" and (
-            self.config.finetuning_method != "full" or self.config.output_format != "action-v1"
+            self.config.output_format != "action-v1"
             or self.config.train_merger_mlp or self.config.multiview
             or self.config.batch_size > 1 or self.config.cache_preprocessed or self.config.shuffle
         ):
-            raise ValueError("LoRA, merger, multiview, batching, caching, shuffling and structured output currently require SFT")
+            raise ValueError("merger, multiview, batching, caching, shuffling and structured output currently require SFT")
         if self.config.train_merger_mlp and self.config.finetuning_method != "lora":
             raise ValueError("train_merger_mlp requires LoRA")
         if self.algorithm == "sft" and self.dataset_version is None:
             raise ValueError("sft requires dataset_version")
-        if self.algorithm in {"grpo", "gigpo"} and self.dataset_version is None and not self.config.tasks:
+        if self.algorithm != "sft" and self.dataset_version is None and not self.config.tasks:
             raise ValueError(f"{self.algorithm} requires dataset_version or config.tasks for online rollouts")
         return self
 
@@ -447,6 +450,15 @@ class RegistryStore:
                     "SELECT status FROM training_runs WHERE run_id = %s", (run_id,)
                 ).fetchone()
             return None if row is None else row["status"]
+
+    def set_model_endpoint(self, run_id: str, endpoint: str | None, token: str | None) -> bool:
+        """Publish (or withdraw, with None) an H800 run's rollout policy service; its rollouts wait for it."""
+        with self.connection.transaction():
+            return self.connection.execute(
+                "UPDATE training_runs SET model_endpoint = %s, model_token = %s "
+                "WHERE run_id = %s AND config->>'accelerator' = 'h800'",
+                (endpoint, token, run_id),
+            ).rowcount == 1
 
     def run_status(self, run_id: str) -> str | None:
         with self.connection.transaction():

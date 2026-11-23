@@ -83,7 +83,7 @@ class TrainingRoundResult:
 
 
 class TrainingRound:
-    """Run the CPU-side, deterministic part of one SFT, GRPO, or compatible GIGPO round."""
+    """Run the CPU-side, deterministic part of one SFT or policy-algorithm round."""
 
     def __init__(self) -> None:
         self.collector = RolloutCollector()
@@ -93,7 +93,7 @@ class TrainingRound:
         self.checkpoints = CheckpointEvaluator()
 
     def run(self, algorithm: str, episodes: Iterable[dict[str, Any]]) -> TrainingRoundResult:
-        if algorithm not in {"sft", "grpo", "gigpo"}:
+        if algorithm not in {"sft", "grpo", "dapo", "dr_grpo", "gigpo"}:
             raise InvalidTrainingInputError(f"unsupported algorithm: {algorithm}")
         rollout = self.collector.collect(episodes)
         if not rollout:
@@ -105,7 +105,7 @@ class TrainingRound:
                 validate_action(step.get("action"))
                 action_count += 1
             rewards.append((str(episode.get("group_id", episode.get("episode_id", ""))), self.rewards.evaluate(episode.get("reward", {}))))
-        advantages = self.advantages.estimate(rewards) if algorithm in {"grpo", "gigpo"} else []
+        advantages = self.advantages.estimate(rewards) if algorithm != "sft" else []
         self.updater.update(rollout, advantages)
         metrics = {
             "action_format_rate": 1.0 if action_count else 0.0,

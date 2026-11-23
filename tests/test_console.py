@@ -28,7 +28,7 @@ from alvarezgui.registry import DatasetRequest, ModelVersionRequest, RegistrySto
 from alvarezgui.scheduler import Scheduler
 from alvarezgui.task_store import TaskStore
 from alvarezgui.training_agent import (
-    TrainingAgent, checkpoint_retained, episode_advantages, round_tasks, rollout_metrics,
+    TrainingAgent, checkpoint_retained, episode_advantages, round_tasks, rollout_metrics, step_advantages,
 )
 
 PASSWORD = "test-console-password"
@@ -185,6 +185,11 @@ class ConsoleApiTest(unittest.TestCase):
         self.assertTrue(session.startswith(f"{SESSION_COOKIE}="))
         self.assertEqual(call(self.app, "GET", "/console/", headers={"Cookie": session})[0], 200)
         self.assertEqual(call(self.app, "GET", "/console/static/app.js", headers={"Cookie": session})[0], 200)
+        self.assertEqual(call(self.app, "GET", "/console/readme")[0], 303)
+        status, _, readme = call(self.app, "GET", "/console/readme", headers={"Cookie": session})
+        self.assertEqual((status, readme.startswith("# AlvarezGUI".encode())), (200, True))
+        self.assertEqual(call(self.app, "GET", "/console/docs/images/sokoban-v006-step0.png", headers={"Cookie": session})[0], 200)
+        self.assertEqual(call(self.app, "GET", "/console/docs/images/..%2F..%2FREADME.md", headers={"Cookie": session})[0], 404)
         self.assertEqual(call(self.app, "GET", "/api/v1/overview", headers={"Cookie": session})[0], 200)
         self.assertEqual(call(self.app, "GET", "/api/v1/overview", headers=bearer())[0], 200)
 
@@ -548,6 +553,38 @@ class ConsoleApiTest(unittest.TestCase):
             reasons = {r["cancel_reason"] for r in connection.execute(
                 "SELECT cancel_reason FROM episodes JOIN tasks USING (task_id) WHERE eval_id = %s", (eval_id,)).fetchall()}
         self.assertEqual(reasons, {"h800_model_service_failed: CUDA error"})
+
+    def test_h800_training_rollouts_wait_for_the_runs_published_policy_service(self) -> None:
+        run_body = {
+            "algorithm": "grpo", "base_model": "base-v1", "environment_version": "env", "reward_version": "r",
+            "config": {"tasks": [{"task_type": "shopping", "app_image": "android-shop-v1"}], "group_size": 2,
+                       "accelerator": "h800"},
+        }
+        run_id = json.loads(call(self.app, "POST", "/api/v1/training/runs", run_body,
+                                 bearer(**{"Idempotency-Key": "h800-run"}))[2])["run_id"]
+        claimed = json.loads(call(self.app, "POST", "/internal/v1/training/claim?accelerator=h800", headers=bearer())[2])
+        self.assertEqual(claimed["run"]["run_id"], run_id)
+        rollout = {"round": 0, "policy_version": "base-v1", "group_size": 2, "max_steps": 2, "temperature": 1.0,
+                   "groups": [{"group_id": "r0-t0", "task": {"task_type": "shopping", "app_image": "android-shop-v1"}}]}
+        self.assertEqual(call(self.app, "POST", f"/internal/v1/training/runs/{run_id}/rollouts", rollout, bearer())[0], 200)
+        with connect(self.settings) as connection:
+            self.assertIsNone(TaskStore(connection).claim_next_queued())  # No H800 policy service yet.
+
+        endpoint = {"endpoint": "http://10.0.0.6:4321", "token": "t" * 32}
+        self.assertEqual(call(self.app, "PUT", "/internal/v1/training/runs/run_missing/model-endpoint",
+                              endpoint, bearer())[0], 404)
+        self.assertEqual(call(self.app, "PUT", f"/internal/v1/training/runs/{run_id}/model-endpoint",
+                              endpoint, bearer())[0], 200)
+        with connect(self.settings) as connection:
+            store = TaskStore(connection)
+            row = store.claim_next_queued()
+            context = store.get_execution_context(row["task_id"], row["episode_id"])
+        self.assertEqual((context["accelerator"], context["model_endpoint"], context["model_token"]),
+                         ("h800", "http://10.0.0.6:4321", "t" * 32))
+        self.assertEqual(call(self.app, "PUT", f"/internal/v1/training/runs/{run_id}/model-endpoint",
+                              {"endpoint": None, "token": None}, bearer())[0], 200)
+        with connect(self.settings) as connection:
+            self.assertIsNone(TaskStore(connection).claim_next_queued())  # Withdrawn: the other rollout waits.
 
     def test_training_agent_protocol_rollouts_metrics_cancel(self) -> None:
         run_body = {
@@ -1161,7 +1198,7 @@ class ConsolePureTest(unittest.TestCase):
         self.assertEqual(len(seeds), 250)
         self.assertIsNone(_step_seed(None, 3))
 
-    def test_gigpo_training_agent_uses_online_policy_path(self) -> None:
+    def test_policy_algorithms_use_online_policy_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory) / "base"
             base.mkdir()
@@ -1172,24 +1209,25 @@ class ConsolePureTest(unittest.TestCase):
                 work_root=Path(directory) / "work",
                 model_service_url=None,
             )
-            output = Path(directory) / "gigpo-round"
-            with patch.object(
-                agent,
-                "online_grpo",
-                return_value=("run-gigpo-r0", output, {"algorithm": "gigpo", "implementation": "grpo-compatible-clipped-policy"}),
-            ) as online:
-                result = agent.execute({
-                    "run_id": "run-gigpo",
-                    "algorithm": "gigpo",
-                    "base_model": "base-v1",
-                    "base_model_checkpoint_uri": base.as_uri(),
-                    "config": {"rounds": 1, "tasks": []},
-                })
-            online.assert_called_once()
-            self.assertEqual(online.call_args.args[0]["algorithm"], "gigpo")
-            self.assertEqual(online.call_args.args[1:], (str(base), Path(directory) / "checkpoints" / "run-gigpo"))
-            self.assertEqual(result["metrics"]["algorithm"], "gigpo")
-            self.assertEqual(result["metrics"]["implementation"], "grpo-compatible-clipped-policy")
+            for algorithm in ("grpo", "dapo", "dr_grpo", "gigpo"):
+                output = Path(directory) / f"{algorithm}-round"
+                with self.subTest(algorithm=algorithm), patch.object(
+                    agent,
+                    "online_grpo",
+                    return_value=(f"run-{algorithm}-r0", output,
+                                  {"algorithm": algorithm, "implementation": f"{algorithm}-clipped-policy"}),
+                ) as online:
+                    result = agent.execute({
+                        "run_id": f"run-{algorithm}",
+                        "algorithm": algorithm,
+                        "base_model": "base-v1",
+                        "base_model_checkpoint_uri": base.as_uri(),
+                        "config": {"rounds": 1, "tasks": []},
+                    })
+                    online.assert_called_once()
+                    self.assertEqual(online.call_args.args[0]["algorithm"], algorithm)
+                    self.assertEqual(online.call_args.args[1:], (str(base), Path(directory) / "checkpoints" / f"run-{algorithm}"))
+                    self.assertEqual(result["metrics"]["implementation"], f"{algorithm}-clipped-policy")
 
     def test_sft_automatic_evaluation_preserves_runtime_backend(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1329,13 +1367,19 @@ class ConsolePureTest(unittest.TestCase):
     def test_task_sets_expand_into_training_and_evaluation_tasks(self) -> None:
         config = TrainingConfig(train_set="sokoban-train", eval_set="sokoban-validation", tasks_per_round=4)
         self.assertEqual(len(config.tasks), 48)
+        # The 48 training levels can be evaluated as a whole, within the trial bound.
+        self.assertEqual(len(TrainingConfig(eval_set="sokoban-train").eval_tasks), 48)
+        train_tasks = [t.model_dump() for t in config.tasks]
+        EvaluationRequest(model_versions=["base"], tasks=train_tasks, trials_per_task=8)
+        with self.assertRaisesRegex(ValidationError, "at most 600 trials"):
+            EvaluationRequest(model_versions=["base", "candidate"], tasks=train_tasks, trials_per_task=8)
         self.assertEqual(config.eval_tasks[0].app_image, "android-sokoban-v1:validation-000")
         # A stored, already-expanded config can be submitted again.
         TrainingConfig(**config.model_dump())
         for bad, message in (
             ({"train_set": "sokoban-train", "eval_set": "sokoban-test"}, "tasks_per_round is required"),
-            ({"train_set": "sokoban-train", "tasks_per_round": 4}, "at most 8 tasks"),
-            ({"eval_set": "sokoban-train"}, "at most 8 tasks"),
+            ({"tasks": [{"task_type": "sokoban", "app_image": f"android-sokoban-v1:train-{i % 48:03d}"}
+                        for i in range(49)], "tasks_per_round": 4}, "at most 48 tasks"),
             ({"train_set": "nope"}, "unknown task set"),
             ({"eval_set": "sokoban-test", "eval_tasks": [{"task_type": "shopping", "app_image": "android-shop-v1"}]},
              "conflicts"),
@@ -1408,6 +1452,10 @@ class ConsolePureTest(unittest.TestCase):
         for algorithm in ("grpo", "gigpo"):
             with self.assertRaises(ValidationError):
                 TrainingRunRequest(**{**request, "algorithm": algorithm})
+            policy_lora = TrainingRunRequest(**{**request, "algorithm": algorithm, "dataset_version": None,
+                                                "config": TrainingConfig(finetuning_method="lora", train_set="sokoban-train",
+                                                                         tasks_per_round=4, eval_set="sokoban-validation")})
+            self.assertEqual(policy_lora.config.finetuning_method, "lora")
         with self.assertRaisesRegex(ValidationError, "requires LoRA"):
             TrainingRunRequest(**{**request, "config": config.model_copy(update={"finetuning_method": "full"})})
         with tempfile.TemporaryDirectory() as directory:
@@ -1428,6 +1476,7 @@ class ConsolePureTest(unittest.TestCase):
             self.assertTrue(train.call_args.kwargs["shuffle"])
             (root / "adapter_config.json").write_text("{}")
             self.assertEqual(agent.register({"run_id": "r", "base_model": "base"}, root, {}, "final"), "r-final")
+            (root / "policy_config.json").write_text('{"output_format": "sokoban-plan-v1"}')
             with self.assertRaisesRegex(ValueError, "currently require SFT"):
                 agent.execute({"run_id": "r", "algorithm": "grpo", "base_model_checkpoint_uri": root.as_uri(), "config": {}})
 
@@ -1476,6 +1525,56 @@ class ConsolePureTest(unittest.TestCase):
         rollouts[1]["step_records"] = [{"model_output": {"entropy": 0.1}}, {"model_output": None}]
         rollouts[2]["step_records"] = [{"model_output": {"entropy": 9.0}}]  # error rollouts are not scored
         self.assertAlmostEqual(rollout_metrics(rollouts)["rollout/entropy"], 0.3)
+
+    def test_step_advantages_per_algorithm(self) -> None:
+        def step(step_id, board):
+            return {"step_id": step_id, "model_output": {"raw_output": "{}"},
+                    "observation": {"ui_text": [f"Sokoban board: {board}"]}}
+
+        # Group g: a wins in 2 steps; b revisits a's first state, wanders and hits max_steps (3).
+        # Group h: both fail, so its advantages are zero. A setup step without model output never trains.
+        rollouts = [
+            {"episode_id": "a", "group_id": "g", "outcome": "success", "reward_total": 1.0,
+             "step_records": [step(0, "S0"), step(1, "S1")]},
+            {"episode_id": "b", "group_id": "g", "outcome": "max_steps", "reward_total": 0.0,
+             "step_records": [{"step_id": 0, "model_output": None}, step(1, "S0"), step(2, "S2"), step(3, "S3")]},
+            {"episode_id": "c", "group_id": "h", "outcome": "unsuccessful", "reward_total": 0.0,
+             "step_records": [step(0, "S9")]},
+            {"episode_id": "d", "group_id": "h", "outcome": "unsuccessful", "reward_total": 0.0,
+             "step_records": [step(0, "S9")]},
+            {"episode_id": "e", "group_id": "g", "outcome": "error", "reward_total": 0.0,
+             "step_records": [step(0, "S0")]},
+        ]
+
+        grpo = step_advantages(rollouts, "grpo", max_steps=3)
+        self.assertNotIn(("e", 0), grpo)  # runtime errors are not scored
+        self.assertNotIn(("b", 0), grpo)  # no model output
+        self.assertEqual(grpo[("a", 0)], (1.0, 1 / (2 * 4)))  # (r - mean) / std; 1/|o_i| per rollout, 4 rollouts
+        self.assertEqual(grpo[("b", 3)], (-1.0, 1 / (3 * 4)))
+        self.assertEqual(grpo[("c", 0)][0], 0.0)
+        self.assertAlmostEqual(sum(weight for _, weight in grpo.values()), 1.0)  # every rollout weighs 1/4
+
+        dr = step_advantages(rollouts, "dr_grpo", max_steps=3)
+        self.assertEqual(dr[("a", 0)], (0.5, 1 / (3 * 4)))  # r - mean, constant max_steps for every rollout
+        self.assertEqual(dr[("b", 1)], (-0.5, 1 / (3 * 4)))
+
+        dapo = step_advantages(rollouts, "dapo", max_steps=3)
+        # Dynamic sampling drops zero-variance group h; overlong filtering masks b, but b stays in the baseline.
+        self.assertEqual(set(dapo), {("a", 0), ("a", 1)})
+        self.assertEqual(dapo[("a", 0)], (1.0, 1 / 2))
+
+        gigpo = step_advantages(rollouts, "gigpo", max_steps=3)
+        # Anchor S0 holds a step 0 (return 0.95^1 * 1) and b step 1 (return 0): A_S = +-0.475.
+        self.assertAlmostEqual(gigpo[("a", 0)][0], 0.5 + 0.475)
+        self.assertAlmostEqual(gigpo[("b", 1)][0], -0.5 - 0.475)
+        self.assertAlmostEqual(gigpo[("a", 1)][0], 0.5)  # singleton anchor: episode advantage only
+        self.assertAlmostEqual(gigpo[("b", 2)][0], -0.5)
+        self.assertEqual(gigpo[("a", 0)][1], 1 / 7)  # mean over the round's 7 trainable steps
+        self.assertEqual(gigpo[("c", 0)][0], 0.0)  # c and d share S9 with equal returns
+
+        self.assertEqual(step_advantages([], "grpo", 3), {})
+        with self.assertRaises(ValueError):
+            step_advantages(rollouts, "ppo", 3)
 
     def test_minicpm_service_loads_on_demand_and_evicts_lru(self) -> None:
         loads: list[str] = []

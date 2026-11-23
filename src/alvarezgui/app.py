@@ -121,6 +121,8 @@ MERGE_TIMEOUT_SECONDS = 900
 
 
 CONSOLE_DIR = Path(__file__).parent / "console"
+REPO_DIR = Path(__file__).resolve().parents[2]
+DOC_IMAGES_DIR = REPO_DIR / "docs" / "images"
 PUBLIC_PATHS = {"/console/login"}
 MAX_SCREENSHOT_BYTES = 10 * 1024 * 1024
 
@@ -256,6 +258,19 @@ def create_app(
         return FileResponse(CONSOLE_DIR / "index.html", headers={"Cache-Control": "no-store"})
 
     app.mount("/console/static", StaticFiles(directory=CONSOLE_DIR), name="console-static")
+
+    # The console guide page renders the repository README, so the two never drift apart.
+    @app.get("/console/readme", include_in_schema=False)
+    def console_readme() -> FileResponse:
+        if not (REPO_DIR / "README.md").is_file():
+            raise HTTPException(status_code=404)
+        return FileResponse(REPO_DIR / "README.md", media_type="text/markdown; charset=utf-8")
+
+    @app.get("/console/docs/images/{name}", include_in_schema=False)
+    def console_doc_image(name: str) -> FileResponse:
+        if name not in {path.name for path in DOC_IMAGES_DIR.glob("*.png")}:
+            raise HTTPException(status_code=404)
+        return FileResponse(DOC_IMAGES_DIR / name)
 
     @app.post("/api/v1/tasks")
     def create_task(
@@ -998,6 +1013,14 @@ def create_app(
         if not ConsoleStore(connection).set_model_endpoint(eval_id, request.endpoint, request.token):
             raise HTTPException(status_code=404, detail="H800 evaluation not found")
         return {"eval_id": eval_id, "model_ready": request.endpoint is not None}
+
+    @app.put("/internal/v1/training/runs/{run_id}/model-endpoint")
+    def publish_training_model_endpoint(
+        run_id: str, request: ModelEndpointRequest, connection: psycopg.Connection = Depends(database)
+    ) -> dict:
+        if not RegistryStore(connection).set_model_endpoint(run_id, request.endpoint, request.token):
+            raise HTTPException(status_code=404, detail="H800 training run not found")
+        return {"run_id": run_id, "model_ready": request.endpoint is not None}
 
     @app.post("/internal/v1/evaluations/{eval_id}/serving-failed")
     def h800_serving_failed(

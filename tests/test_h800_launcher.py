@@ -45,16 +45,21 @@ class FakeLauncher(H800Launcher):
             manifest = json.loads(stdin)
             self.deployments[manifest["metadata"]["name"]] = manifest
             return ""
+        if args[0] == "delete" and args[2] != "-l":  # By name.
+            self.deployments.pop(args[2], None)
+            return ""
         if args[0] == "delete":
             run_id = args[3].split("=", 1)[1]
             self.deployments = {name: m for name, m in self.deployments.items()
                                 if m["metadata"]["labels"]["alvarez-run"] != run_id}
             return ""
         if args[0] == "get" and args[1] == "pods":
-            run_id = args[3].split("=", 1)[1]
+            key, value = args[3].split("=", 1)
             return json.dumps({"items": [
                 {"metadata": {}, "status": {"phase": "Running", "podIP": "10.0.0.5"}}
-                for m in self.deployments.values() if m["metadata"]["labels"]["alvarez-run"] == run_id]})
+                for m in self.deployments.values() if m["spec"]["template"]["metadata"]["labels"][key] == value]})
+        if args[0] == "get" and args[2] != "-l":  # By name.
+            return f"deployment/{args[2]}\n" if args[2] in self.deployments else ""
         if args[0] == "get":
             run_id = args[3].split("=", 1)[1]
             return "".join(f"deployment/{name}\n" for name, m in self.deployments.items()
@@ -210,12 +215,16 @@ class H800LauncherTest(unittest.TestCase):
             run = {"run_id": "run_abc", "algorithm": "grpo", "base_model": "base", "dataset_version": None,
                    "base_model_checkpoint_uri": "file:///home/alvarez-models/M",
                    "config": {"rounds": 3, "temperature": 0.7, "tasks": [{"task_type": "sokoban", "app_image": "a"}]}}
-            claims = iter([{"run": run}])
+            claims, calls = iter([{"run": run}]), []
+
+            def call(method, path, body=None, *args, **kwargs):
+                calls.append((method, path, body))
+                return (next(claims, {"run": None}) if path.startswith("/internal/v1/training/claim")
+                        else [] if path == "/internal/v1/evaluations/h800"
+                        else {"status": "RUNNING"} if method == "GET" else {})
+
             cp = MagicMock()
-            cp.call.side_effect = lambda method, path, *a, **k: (
-                next(claims, {"run": None}) if path.startswith("/internal/v1/training/claim")
-                else [] if path == "/internal/v1/evaluations/h800"
-                else {"status": "RUNNING"} if method == "GET" else {})
+            cp.call.side_effect = call
             launcher = FakeLauncher(root, serving, cp)
             agent = launcher.agent
             agent.register.side_effect = lambda run, output, metrics, suffix, checkpoint_uri: f"abc-{suffix}"
@@ -235,10 +244,31 @@ class H800LauncherTest(unittest.TestCase):
                 (output / "metrics.json").write_text(json.dumps({"loss": 0.1, "step_count": 5}))
                 (work / "COMPLETE").write_text("{}")
 
+            launcher.healthy = MagicMock(return_value=True)
+            endpoints = lambda: [body for method, path, body in calls if path == "/internal/v1/training/runs/run_abc/model-endpoint"]
+
+            def serve_round(number: int, policy: str) -> None:
+                """Start the round's H800 rollout service, let it answer, then sample with it."""
+                launcher.tick()
+                serve = run_dir / f"round-{number}/serve"
+                self.assertEqual(json.loads((serve / "spec.json").read_text())["models"],
+                                 {policy: str(launcher.root / ("alvarez-models/M" if number == 0 else "alvarez-checkpoints/run_abc/round-0"))})
+                self.assertEqual(list(launcher.deployments), [f"alvarez-roll-abc-{number}"])
+                self.assertIn("h800_launcher serve-pod", (serve / "pod.sh").read_text())
+                agent.request_rollouts.reset_mock()
+                launcher.tick()  # Pod not listening yet: nothing is sampled.
+                agent.request_rollouts.assert_not_called()
+                self.assertEqual(endpoints()[-1], {"endpoint": None, "token": None})
+                (serve / "ready.json").write_text(json.dumps({"port": 4321}))
+                launcher.tick()
+                token = (serve / "token").read_text()
+                self.assertEqual(endpoints()[-1], {"endpoint": "http://10.0.0.5:4321", "token": token})
+                self.assertEqual(agent.request_rollouts.call_args.args[1:], (number, policy))
+
             launcher.tick()  # Claim and stage.
-            launcher.tick()  # Request round 0 with the base policy.
-            self.assertEqual(agent.request_rollouts.call_args.args[1:], (0, "base"))
-            launcher.tick()  # Rollouts done: stage round 0 training pod.
+            serve_round(0, "base")
+            launcher.tick()  # Rollouts done: stop the rollout service, stage round 0 training pod.
+            self.assertEqual(endpoints()[-1], {"endpoint": None, "token": None})
             spec = json.loads((run_dir / "round-0/spec.json").read_text())
             self.assertEqual((spec["base_model"], spec["step_offset"]), (str(root / "alvarez-models/M"), 0))
             self.assertEqual(spec["sampling_temperature"], 0.7)
@@ -249,11 +279,10 @@ class H800LauncherTest(unittest.TestCase):
             self.assertEqual(launcher.deployments, {})
             self.assertEqual((serving / "home/alvarez-checkpoints/run_abc/round-0/model.safetensors").read_bytes(),
                              b"round-0")
-            launcher.tick()  # Round 1 sampled with the round-0 policy...
-            self.assertEqual(agent.request_rollouts.call_args.args[1:], (1, "abc-r0"))
+            serve_round(1, "abc-r0")  # Round 1 sampled with the round-0 policy...
             launcher.tick()  # ...and skipped.
-            launcher.tick()
-            self.assertEqual(agent.request_rollouts.call_args.args[1:], (2, "abc-r0"))
+            self.assertEqual(launcher.deployments, {})
+            serve_round(2, "abc-r0")
             launcher.tick()
             spec = json.loads((run_dir / "round-2/spec.json").read_text())
             self.assertEqual((spec["base_model"], spec["step_offset"]),
