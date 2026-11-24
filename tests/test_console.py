@@ -1370,9 +1370,10 @@ class ConsolePureTest(unittest.TestCase):
         # The 48 training levels can be evaluated as a whole, within the trial bound.
         self.assertEqual(len(TrainingConfig(eval_set="sokoban-train").eval_tasks), 48)
         train_tasks = [t.model_dump() for t in config.tasks]
-        EvaluationRequest(model_versions=["base"], tasks=train_tasks, trials_per_task=8)
-        with self.assertRaisesRegex(ValidationError, "at most 600 trials"):
-            EvaluationRequest(model_versions=["base", "candidate"], tasks=train_tasks, trials_per_task=8)
+        versions = [f"v{index}" for index in range(6)]
+        EvaluationRequest(model_versions=versions, tasks=train_tasks, trials_per_task=8)
+        with self.assertRaisesRegex(ValidationError, "at most 2304 trials"):
+            EvaluationRequest(model_versions=versions, tasks=train_tasks, trials_per_task=9)
         self.assertEqual(config.eval_tasks[0].app_image, "android-sokoban-v1:validation-000")
         # A stored, already-expanded config can be submitted again.
         TrainingConfig(**config.model_dump())
@@ -1456,6 +1457,10 @@ class ConsolePureTest(unittest.TestCase):
                                                 "config": TrainingConfig(finetuning_method="lora", train_set="sokoban-train",
                                                                          tasks_per_round=4, eval_set="sokoban-validation")})
             self.assertEqual(policy_lora.config.finetuning_method, "lora")
+            fast = TrainingConfig(train_set="sokoban-train", tasks_per_round=4, eval_set="sokoban-validation",
+                                  batch_size=4, cache_preprocessed=True, gradient_checkpointing=False)
+            self.assertEqual(TrainingRunRequest(**{**request, "algorithm": algorithm, "dataset_version": None,
+                                                   "config": fast}).config.batch_size, 4)
         with self.assertRaisesRegex(ValidationError, "requires LoRA"):
             TrainingRunRequest(**{**request, "config": config.model_copy(update={"finetuning_method": "full"})})
         with tempfile.TemporaryDirectory() as directory:

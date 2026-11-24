@@ -31,7 +31,8 @@ class RuntimeBackendRetiredError(Exception):
 EVAL_PRIORITY = 8
 # One evaluation covers a whole split (the 48 Sokoban training levels) but stays a bounded queue.
 MAX_EVALUATION_TASKS = 48
-MAX_EVALUATION_TRIALS = 600
+# Six model versions (the request maximum) over the 48 training levels at 8 trials each.
+MAX_EVALUATION_TRIALS = 6 * MAX_EVALUATION_TASKS * 8
 ROLLOUT_PRIORITY = 5
 
 

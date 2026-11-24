@@ -24,3 +24,6 @@ IMPLEMENTATION_PLAN.md
 
 # Local tool state
 .DS_Store
+
+# kubectl HTTP cache (kubectl run with HOME at the repo)
+.kube/

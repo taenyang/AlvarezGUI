@@ -156,6 +156,18 @@ class MiniCPMServiceTest(unittest.TestCase):
                 _parse_action(raw)
         self.assertEqual(_parse_action('{"type":"tap","x":719,"y":1279}'), {"type": "tap", "x": 719, "y": 1279})
 
+    def test_parse_action_rejects_non_integer_coordinates_like_the_trainer(self) -> None:
+        # Seen in run_6190bbd3 round 0: serving coerced "360" to 360, then the trainer rejected the row.
+        from alvarezgui.policy_output import parse_policy_output
+
+        for raw in ('{"type":"tap","x":"360","y":"836"}', '{"type":"tap","x":360.0,"y":836}',
+                    '{"type":"wait","duration_ms":"500"}', '{"type":"tap","x":true,"y":836}'):
+            with self.subTest(raw=raw):
+                with self.assertRaises(InvalidActionOutputError):
+                    _parse_action(raw)
+                with self.assertRaises(ValueError):
+                    parse_policy_output(raw)
+
     def test_h800_trial_waits_for_a_replacement_model_service(self) -> None:
         from alvarezgui.consumer import Consumer
         from alvarezgui.model import ModelUnavailableError

@@ -1017,8 +1017,8 @@ def train(
         raise ValueError("batch_size must be a positive integer")
     if not all(isinstance(value, bool) for value in (cache_preprocessed, gradient_checkpointing, shuffle)):
         raise ValueError("cache_preprocessed, gradient_checkpointing and shuffle must be booleans")
-    if algorithm != "sft" and (batch_size > 1 or cache_preprocessed or shuffle):
-        raise ValueError("batch_size > 1, cache_preprocessed and shuffle are supported only for SFT")
+    if algorithm != "sft" and shuffle:
+        raise ValueError("shuffle is supported only for SFT")
     if finetuning_method not in ("full", "lora"):
         raise ValueError("finetuning_method must be full or lora")
     if train_merger_mlp and finetuning_method != "lora":
@@ -1112,7 +1112,7 @@ def train(
         raise ValueError("SFT checkpoint_dir currently requires a single Accelerate process")
     if batch_size > 1 and accelerator.num_processes != 1:
         # ponytail: distributed tail weighting needs rank-local sample counts before enabling microbatches.
-        raise ValueError("SFT batch_size > 1 currently requires a single Accelerate process")
+        raise ValueError("batch_size > 1 currently requires a single Accelerate process")
     top_modules = []
     if train_top_layers:
         from transformers import AutoConfig
@@ -1193,14 +1193,14 @@ def train(
     if algorithm in POLICY_ALGORITHMS and compute_old_logprob:
         model.eval()
         with torch.no_grad():
-            for row in rows:
+            for index, row in enumerate(rows):
                 if "old_logprob" in row:
                     continue
-                batch, labels = masked_batch(row)
+                batch, labels = sample_batch(index)
                 batch = _move(batch, accelerator.device)
                 with accelerator.autocast():
                     logits = model(**batch, use_cache=False).logits
-                row["old_logprob"] = float(_sequence_logprob(torch, logits / logit_scale, labels.to(accelerator.device)))
+                row["old_logprob"] = float(_sample_logprobs(torch, logits / logit_scale, labels.to(accelerator.device))[0])
         model.train()
     remainder = len(dataloader) % gradient_accumulation
     for epoch in range(completed_epochs, epochs):
@@ -1209,8 +1209,6 @@ def train(
             random.Random(f"{seed}:{epoch}").shuffle(order)
         for batch_index, indices in enumerate(dataloader):
             indices = [order[int(index)] for index in indices]
-            index = indices[0]
-            row = rows[index]
             samples = [sample_batch(index) for index in indices]
             batch, labels = samples[0] if len(samples) == 1 else _collate_sft(samples, processor, torch, family=family)
             before_training = time.monotonic()
@@ -1233,15 +1231,19 @@ def train(
                             sample_losses = _sft_sample_losses(torch, outputs.logits, labels)
                             loss = sample_losses.mean()
                     else:
-                        current_logprob = _sequence_logprob(torch, outputs.logits / logit_scale, labels)
+                        current_logprob = _sample_logprobs(torch, outputs.logits / logit_scale, labels)
                         with torch.no_grad():  # Monitoring only; the objective has no entropy term.
                             completion = labels[..., 1:] != -100
-                            entropy = float(token_entropies(torch, outputs.logits[..., :-1, :][completion]).mean())
-                        old_logprob = torch.as_tensor(float(row["old_logprob"]), device=accelerator.device)
+                            sample_entropies = [
+                                float(token_entropies(torch, outputs.logits[sample, :-1, :][completion[sample]]).mean())
+                                for sample in range(len(indices))]
+                        per_sample = lambda values: torch.tensor(values, device=accelerator.device, dtype=torch.float32)
+                        old_logprob = per_sample([float(rows[i]["old_logprob"]) for i in indices])
                         ratio = torch.exp(current_logprob - old_logprob)
-                        advantage = torch.as_tensor(advantages[index], device=accelerator.device)
-                        loss = -loss_weights[index] * torch.minimum(
+                        advantage = per_sample([advantages[i] for i in indices])
+                        sample_losses = -per_sample([loss_weights[i] for i in indices]) * torch.minimum(
                             ratio * advantage, ratio.clamp(1 - clip_epsilon, upper_clip) * advantage)
+                        loss = sample_losses.mean()
                 # Accelerate divides by the configured microbatch count. Weight by actual
                 # samples in this window, including a short microbatch and/or final window.
                 if batch_size == 1:
@@ -1260,8 +1262,7 @@ def train(
                 optimizer.zero_grad(set_to_none=True)
                 if accelerator.sync_gradients and not accelerator.optimizer_step_was_skipped:
                     updates += 1
-            batch_losses = (sample_losses.detach().cpu().tolist() if algorithm == "sft"
-                            else [float(loss.detach().cpu())])
+            batch_losses = sample_losses.detach().cpu().tolist()
             training_seconds += time.monotonic() - before_training
             for sample_index, sample_loss in enumerate(batch_losses):
                 losses.append(sample_loss)
@@ -1272,11 +1273,13 @@ def train(
                     if sample_index == len(batch_losses) - 1 and grad_norm is not None and math.isfinite(grad_norm):
                         step_metrics["train/grad_norm"] = grad_norm
                     if algorithm in POLICY_ALGORITHMS:
-                        ratio_value = float(ratio.detach().cpu())
+                        sample = indices[sample_index]
+                        ratio_value = float(ratio[sample_index].detach().cpu())
+                        entropy = sample_entropies[sample_index]
                         step_metrics["train/ratio"] = ratio_value
-                        step_metrics["train/advantage"] = advantages[index]
+                        step_metrics["train/advantage"] = advantages[sample]
                         step_metrics["train/clipped"] = float(not 1 - clip_epsilon <= ratio_value <= upper_clip)
-                        step_metrics["train/loss_weight"] = loss_weights[index]
+                        step_metrics["train/loss_weight"] = loss_weights[sample]
                         if math.isfinite(entropy):
                             step_metrics["train/entropy"] = entropy
                             entropies.append(entropy)
@@ -1355,12 +1358,17 @@ def _sft_sample_losses(torch: Any, logits: Any, labels: Any) -> Any:
     return token_losses.sum(dim=-1) / counts
 
 
-def _sequence_logprob(torch: Any, logits: Any, labels: Any) -> Any:
-    """Sum of completion-token log-probabilities; prompt tokens are masked with -100."""
+def _sample_logprobs(torch: Any, logits: Any, labels: Any) -> Any:
+    """Per-sample sum of completion-token log-probabilities, shape (batch,); masked/padded tokens add 0.
+
+    Only completion positions go through the fp32 log_softmax: over the whole ~1300-token prompt that
+    tensor is ~1.3 GB per row (248k vocabulary) and autograd keeps it, which exhausted 80 GB at batch 4.
+    """
     mask = labels[..., 1:] != -100
-    log_probs = torch.log_softmax(logits[..., :-1, :].float(), dim=-1)
-    token_log_probs = log_probs.gather(-1, labels[..., 1:].clamp_min(0).unsqueeze(-1)).squeeze(-1)
-    return token_log_probs.masked_select(mask).sum()
+    selected = logits[..., :-1, :][mask].float()
+    token_log_probs = torch.log_softmax(selected, dim=-1).gather(-1, labels[..., 1:][mask].unsqueeze(-1)).squeeze(-1)
+    rows = mask.nonzero()[:, 0]
+    return torch.zeros(mask.shape[0], device=logits.device, dtype=token_log_probs.dtype).index_add(0, rows, token_log_probs)
 
 
 def main() -> None:
@@ -1394,8 +1402,10 @@ def main() -> None:
         parser.error("--checkpoint-dir is supported only for SFT")
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
-    if args.algorithm != "sft" and (args.batch_size > 1 or args.cache_preprocessed or args.shuffle):
-        parser.error("--batch-size > 1, --cache-preprocessed and --shuffle are supported only for SFT")
+    if args.algorithm != "sft" and args.shuffle:
+        parser.error("--shuffle is supported only for SFT")
+    if args.algorithm == "perception" and (args.batch_size > 1 or args.cache_preprocessed):
+        parser.error("--batch-size > 1 and --cache-preprocessed are not supported for perception")
     if args.train_top_layers < 0:
         parser.error("--train-top-layers must be non-negative")
     if args.train_top_layers and (args.algorithm != "sft" or args.finetuning_method != "lora"):

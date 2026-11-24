@@ -25,6 +25,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -41,10 +42,22 @@ SERVING_HOST = "root@10.157.155.124"
 # Same content on the 4090 serving host and on CFS.
 PATH_MAP = (("/home/alvarez-models", "alvarez-models"), ("/home/alvarez-datasets", "alvarez-data"),
             ("/home/alvarez-checkpoints", "alvarez-checkpoints"))
-POD_ENV = """export PYTHONPATH="{src}:$root/alvarez-runtime/deps"
+# Every H800 pod (training, rollout, evaluation) runs this image's Python: torch 2.14, transformers 5.19,
+# peft and accelerate preinstalled, so only the source snapshot goes on PYTHONPATH.
+H800_IMAGE = "iregistry.baidu-int.com/sglang-public/sglang_v0.5.23:base"
+H800_PYTHON = "/opt/sglang/bin/python3"
+# Some H800 nodes still run driver 535 (CUDA 12.2); the image's CUDA 13 forward-compat libraries let its
+# cu130 torch run there. Only below 580: the compat package must not shadow a newer driver.
+H800_COMPAT = """if [ "$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | cut -d. -f1)" -lt 580 ]; then
+    export LD_LIBRARY_PATH="/usr/local/cuda-13.0/compat:$LD_LIBRARY_PATH"
+fi
+"""
+# kernels/: flash-linear-attention 0.6.0 and causal-conv1d 1.7.0 (built for this image's torch) give MiniCPM-V 4.7's
+# linear-attention layers their fast path in transformers; sglang has its own kernels and does not get it.
+POD_ENV = """export PYTHONPATH="{src}:$root/alvarez-runtime/kernels"
 export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export HF_HOME="$root/alvarez-runtime/cache/huggingface" TORCH_HOME="$root/alvarez-runtime/cache/torch"
-"""
+""" + H800_COMPAT
 POD_SCRIPT = """#!/bin/bash
 run={run}
 root={root}
@@ -53,7 +66,7 @@ mkdir -p "$TMPDIR"
 if [ ! -f "$run/COMPLETE" ] && [ ! -f "$run/FAILED" ]; then
     printf '\\npod %s started: %s\\n' "$(hostname)" "$(date -Is)" >> "$run/run.log"
     # Forward SIGTERM so a deleted/preempted pod's trainer stops before its replacement resumes.
-    /opt/nemo_rl_venv/bin/python -m alvarezgui.h800_launcher pod "$run" >> "$run/run.log" 2>&1 &
+    """ + H800_PYTHON + """ -m alvarezgui.h800_launcher pod "$run" >> "$run/run.log" 2>&1 &
     trainer=$!
     trap 'kill -TERM "$trainer"' TERM
     wait "$trainer" || status=$?
@@ -75,7 +88,7 @@ mkdir -p "$TMPDIR"
 rm -f "$work/ready.json"  # A replacement pod announces its own port.
 if [ ! -f "$work/FAILED" ]; then
     printf '\\npod %s started: %s\\n' "$(hostname)" "$(date -Is)" >> "$work/run.log"
-    /opt/nemo_rl_venv/bin/python -m alvarezgui.h800_launcher serve-pod "$work" >> "$work/run.log" 2>&1 &
+    """ + H800_PYTHON + """ -m alvarezgui.h800_launcher serve-pod "$work" >> "$work/run.log" 2>&1 &
     server=$!
     trap 'kill -TERM "$server"' TERM
     wait "$server" || status=$?
@@ -85,6 +98,100 @@ if [ ! -f "$work/FAILED" ]; then
 fi
 exec sleep infinity
 """
+# Resident online-RL training worker (docs/h800-resident-pods.md): one process trains every round of a run.
+# Not a signal exit -> FAILED is written per round by the worker, so the container itself never ends.
+WORKER_POD_SCRIPT = """#!/bin/bash
+run={run}
+root={root}
+""" + POD_ENV + """export TRITON_CACHE_DIR="$root/alvarez-runtime/cache/triton"
+printf '\\nresident worker pod %s started: %s\\n' "$(hostname)" "$(date -Is)" >> "$run/worker.log"
+""" + H800_PYTHON + """ -m alvarezgui.train_worker "$run" >> "$run/worker.log" 2>&1 &
+worker=$!
+trap 'kill -TERM "$worker"' TERM
+wait "$worker" || status=$?
+trap - TERM
+# Any exit (crash, kill) restarts the container: the worker resumes the round that has no COMPLETE yet.
+exit "${{status:-1}}"
+"""
+# Restarts in one round beyond this fail the run instead of looping on a broken pod.
+MAX_CONTAINER_RESTARTS = 5
+# Container-local heartbeats (never on CFS). Startup covers image pull, imports and the first model load.
+WORKER_PROBES = {
+    "startupProbe": {"exec": {"command": ["test", "-f", "/tmp/alive"]},
+                     "periodSeconds": 10, "failureThreshold": 60},
+    "livenessProbe": {"exec": {"command": ["bash", "-c", "[ $(( $(date +%s) - $(stat -c %Y /tmp/alive) )) -lt 60 ]"]},
+                      "periodSeconds": 10, "failureThreshold": 3},
+}
+# The adapter writes its port to ready.json and checks the token on every request, /health included,
+# so the probe reads both from the pod's work directory. CFS is read here; a hung mount fails the probe.
+ROLLOUT_PROBE_COMMAND = (
+    'p=$(sed -n \'s/.*"port": *\\([0-9]*\\).*/\\1/p\' {work}/ready.json) && '
+    'curl -sf -m 5 -H "Authorization: Bearer $(cat {work}/token)" "http://127.0.0.1:$p/health" >/dev/null'
+)
+
+
+def rollout_probes(work: Path) -> dict[str, Any]:
+    command = ["bash", "-c", ROLLOUT_PROBE_COMMAND.format(work=work)]
+    return {"startupProbe": {"exec": {"command": command}, "periodSeconds": 10, "failureThreshold": 90},
+            "livenessProbe": {"exec": {"command": command}, "periodSeconds": 10, "failureThreshold": 3,
+                              "timeoutSeconds": 10}}
+
+
+# Rollout services for full MiniCPM-V 4.7 weights run sglang (docs/h800-sglang-rollout.md).
+SGLANG_POD_SCRIPT = """#!/bin/bash
+work={work}
+root={root}
+export PYTHONPATH="{src}" PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+# Without this torch starts one thread per visible CPU and image preprocessing on a busy node takes ~1.4 s.
+export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8
+export HF_HOME="$root/alvarez-runtime/cache/huggingface" TRITON_CACHE_DIR="$root/alvarez-runtime/cache/triton-sglang"
+export TMPDIR="$work/tmp"
+""" + H800_COMPAT + """mkdir -p "$TMPDIR"
+rm -f "$work/ready.json"
+if [ ! -f "$work/FAILED" ]; then
+    printf '\\npod %s started: %s\\n' "$(hostname)" "$(date -Is)" >> "$work/run.log"
+    """ + H800_PYTHON + """ -m alvarezgui.h800_launcher sglang-adapter "$work" >> "$work/run.log" 2>&1 &
+    server=$!
+    trap 'kill -TERM "$server"' TERM
+    wait "$server" || status=$?
+    trap - TERM
+    if [ "${{status:-0}}" -ge 128 ]; then exit "$status"; fi
+    [ -f "$work/FAILED" ] || echo "sglang adapter exited with status ${{status:-0}}" > "$work/FAILED"
+fi
+exec sleep infinity
+"""
+
+
+def rollout_weights(policy_path: str) -> str:
+    """Where the training pod leaves a LoRA round merged into full weights for sglang."""
+    return policy_path.rstrip("/") + "-merged"
+
+
+def sglang_servable(path: str | Path) -> bool:
+    """Full MiniCPM-V 4.7 weights with a plain generation policy; everything else stays on HF serving."""
+    checkpoint = Path(path)
+    if (checkpoint / "adapter_config.json").is_file() or not (checkpoint / "config.json").is_file():
+        return False
+    if json.loads((checkpoint / "config.json").read_text()).get("model_type") != "minicpmv4_7":
+        return False
+    return _plain_policy(checkpoint)
+
+
+def sglang_mergeable(path: str | Path) -> bool:
+    """A LoRA adapter over servable MiniCPM-V 4.7 weights: merged in the pod, then served by sglang."""
+    checkpoint = Path(path)
+    adapter = checkpoint / "adapter_config.json"
+    if not adapter.is_file():
+        return False
+    base = json.loads(adapter.read_text()).get("base_model_name_or_path")
+    return bool(base) and sglang_servable(base) and _plain_policy(checkpoint)
+
+
+def _plain_policy(checkpoint: Path) -> bool:
+    policy_path = checkpoint / "policy_config.json"
+    policy = json.loads(policy_path.read_text()) if policy_path.is_file() else {}
+    return (policy.get("inference_mode") is None and not (checkpoint / "perception_config.json").is_file()
+            and policy.get("visual_views", "full") in ("full", "full+board-crop"))
 
 
 def is_online(run: dict[str, Any]) -> bool:
@@ -143,8 +250,9 @@ def sha256_tree(directory: Path) -> dict[str, str]:
     return result
 
 
-def deployment_manifest(template: dict[str, Any], name: str, run_id: str, script: Path) -> dict[str, Any]:
-    """Copy the template Deployment under a new name and selector, running ``script`` with one replica."""
+def deployment_manifest(template: dict[str, Any], name: str, run_id: str, script: Path,
+                        probes: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Copy the template Deployment under a new name and selector, running ``script`` on H800_IMAGE."""
     manifest = copy.deepcopy(template)
     meta = manifest["metadata"]
     labels = {key: value for key, value in meta.get("labels", {}).items() if key not in {"gpu-be-label", "manager"}}
@@ -159,6 +267,8 @@ def deployment_manifest(template: dict[str, Any], name: str, run_id: str, script
     spec["selector"] = {"matchLabels": {"gpu-be-label": name}}
     spec["template"]["metadata"]["labels"] = {"gpu-be-label": name, "alvarez-run": run_id}
     spec["template"]["spec"]["containers"][0]["command"] = ["/bin/bash", str(script)]
+    spec["template"]["spec"]["containers"][0]["image"] = H800_IMAGE
+    spec["template"]["spec"]["containers"][0].update(probes or {})
     return manifest
 
 
@@ -176,6 +286,7 @@ class H800Launcher:
         self.serving_host, self.node_id, self.source_dir = serving_host, node_id, source_dir
         self.poll_seconds = poll_seconds
         self._template: dict[str, Any] | None = None
+        self.copy_threads: dict[str, CopyThread] = {}
 
     # --- commands ---------------------------------------------------------------
 
@@ -204,6 +315,8 @@ class H800Launcher:
 
     def delete_deployment(self, run_id: str) -> None:
         self.kube("delete", "deployment", "-l", f"alvarez-run={run_id}", "--ignore-not-found", "--wait=false")
+        if (self.runs_root / run_id / "serve" / "merged-copies.json").exists():
+            self.delete_merged_copies(self.runs_root / run_id)
 
     def apply_deployment(self, run_id: str, work: Path) -> str:
         name = self.deployment_name(run_id, work.name)
@@ -315,7 +428,7 @@ class H800Launcher:
         if policy.is_file() and json.loads(policy.read_text()).get("output_format", "action-v1") != "action-v1":
             raise ValueError("structured checkpoints currently require SFT")
         state = {"round": 0, "policy_version": run["base_model"], "policy_path": str(base), "step_offset": 0,
-                 "metrics": {}, "source_sha256": self.snapshot_source(run_dir)}
+                 "metrics": {}, "source_sha256": self.snapshot_source(run_dir), "resident": True}
         (run_dir / "online.json").write_text(json.dumps(state, indent=2))
         self.agent.log(run["run_id"], f"online {run['algorithm']}: {run['config']['rounds']} rounds, "
                                       f"sampling and training on H800; base {base}")
@@ -376,12 +489,101 @@ class H800Launcher:
             self.agent.log(run_id, f"recreated missing deployment {self.apply_deployment(run_id, work)}")
         return False
 
+    # --- background checkpoint copies (resident runs) ----------------------------------
+
+    @staticmethod
+    def pending_copies(run_dir: Path) -> list[dict[str, Any]]:
+        path = run_dir / "copies.json"
+        return json.loads(path.read_text()) if path.exists() else []
+
+    def queue_copy(self, run_dir: Path, entry: dict[str, Any]) -> None:
+        pending = self.pending_copies(run_dir)
+        if all(item["round"] != entry["round"] for item in pending):
+            (run_dir / "copies.json").write_text(json.dumps(pending + [entry], indent=2))
+
+    def publish_copies(self, run: dict[str, Any], run_dir: Path) -> bool:
+        """Copy finished rounds to the 4090 in a background thread, then register them in order.
+
+        False only when the run failed: a copy whose SHA-256 check fails fails the run, as it did inline.
+        """
+        run_id = run["run_id"]
+        thread = self.copy_threads.get(run_id)
+        if thread is not None and thread.is_alive():
+            return True
+        if thread is not None:
+            del self.copy_threads[run_id]
+            if thread.error is not None:
+                self.fail(run_id, run_dir, f"H800 checkpoint copy failed: {thread.error}")
+                return False
+            entry = self.pending_copies(run_dir)[0]
+            self.agent.register(run, Path(entry["output"]), entry["metrics"], f"r{entry['round']}",
+                                checkpoint_uri=thread.uri)
+            (run_dir / "copies.json").write_text(json.dumps(self.pending_copies(run_dir)[1:], indent=2))
+        pending = self.pending_copies(run_dir)
+        if pending:
+            thread = CopyThread(self, run_id, Path(pending[0]["output"]))
+            self.copy_threads[run_id] = thread
+            thread.start()
+        return True
+
+    def worker_name(self, run_id: str) -> str:
+        return self.deployment_name(run_id) + "-w"
+
+    def ensure_worker(self, run_id: str, run_dir: Path) -> None:
+        """Keep the run's resident training worker deployed (created on first use, recreated if lost)."""
+        name = self.worker_name(run_id)
+        if self.kube("get", "deployment", name, "--ignore-not-found", "-o", "name").strip():
+            return
+        script = run_dir / "worker.sh"
+        script.write_text(WORKER_POD_SCRIPT.format(run=run_dir, root=self.root, src=run_dir / "src"))
+        self.kube("apply", "-f", "-", stdin=json.dumps(
+            deployment_manifest(self.template(), name, run_id, script, WORKER_PROBES)))
+        self.agent.log(run_id, f"created resident training worker {name}")
+
+    def restarts(self, name: str) -> int:
+        """Container restarts of the deployment's live pod (kubelet's liveness/crash restarts)."""
+        pods = json.loads(self.kube("get", "pods", "-l", f"gpu-be-label={name}", "-o", "json"))["items"]
+        return max((status.get("restartCount", 0) for pod in pods if not pod["metadata"].get("deletionTimestamp")
+                    for status in pod["status"].get("containerStatuses", [])), default=0)
+
+    def check_restarts(self, run_id: str, run_dir: Path, work: Path, name: str, what: str) -> bool:
+        """False (and the run failed) once a pod restarted too often within this round."""
+        work.mkdir(parents=True, exist_ok=True)  # A round's rollout service runs before its spec exists.
+        marker = work / f"restarts-{what.replace(' ', '-')}.json"
+        count = self.restarts(name)
+        seen = json.loads(marker.read_text()) if marker.exists() else {"start": count}
+        if count < seen["start"]:  # A new pod (recreated deployment) counts from zero again.
+            seen = {"start": count}
+        marker.write_text(json.dumps(seen))
+        if count - seen["start"] > MAX_CONTAINER_RESTARTS:
+            self.fail(run_id, run_dir, f"H800 {what} restarted {count - seen['start']} times in {work.name}; "
+                                       f"see {work}/run.log and {run_dir}/worker.log")
+            return False
+        return True
+
+    def trained_resident(self, run_id: str, run_dir: Path, work: Path) -> bool:
+        """Like ``trained`` for the resident worker, which stays up for the next round."""
+        self.relay(run_id, work)
+        if (work / "COMPLETE").exists():
+            return True
+        if (work / "FAILED").exists():
+            self.fail(run_id, run_dir, "H800 training failed: " + (work / "FAILED").read_text()[-1500:])
+            return False
+        self.ensure_worker(run_id, run_dir)
+        self.check_restarts(run_id, run_dir, work, self.worker_name(run_id), "training worker")
+        return False
+
     def advance_online(self, run: dict[str, Any], run_dir: Path) -> None:
         """One step of a per-round state machine kept in online.json, so a restarted launcher resumes."""
         run_id, config = run["run_id"], run["config"]
         state_path = run_dir / "online.json"
         state = json.loads(state_path.read_text())
         number = state["round"]
+        if state.get("resident"):
+            if not self.publish_copies(run, run_dir):
+                return
+            if number >= config["rounds"] and self.pending_copies(run_dir):
+                return  # The run succeeds only once every round is on the 4090 and registered.
         if number >= config["rounds"]:
             if state["policy_version"] == run["base_model"]:
                 self.fail(run_id, run_dir, "no round produced a policy update (all groups had zero reward variance)")
@@ -420,16 +622,30 @@ class H800Launcher:
                 "output_dir": str(self.root / "alvarez-checkpoints" / run_id / work.name),
                 "step_offset": state["step_offset"],
                 "sampling_temperature": run["config"].get("temperature"),
+                # The next round's sglang rollout service needs full weights; the last round has none.
+                "merge_for_rollout": number + 1 < config["rounds"],
             })
-            self.agent.log(run_id, f"round {number}: created deployment {self.apply_deployment(run_id, work)}")
+            if state.get("resident"):
+                self.agent.log(run_id, f"round {number}: queued for the resident trainer")
+            else:
+                self.agent.log(run_id, f"round {number}: created deployment {self.apply_deployment(run_id, work)}")
             return
-        if not self.trained(run_id, run_dir, work):
+        if not (self.trained_resident(run_id, run_dir, work) if state.get("resident")
+                else self.trained(run_id, run_dir, work)):
             return
         output = Path(json.loads((work / "spec.json").read_text())["output_dir"])
         metrics = {**json.loads((work / "rollout-summary.json").read_text()),
                    **json.loads((output / "metrics.json").read_text())}
-        uri = self.copy_to_serving(run_id, output)
-        version = self.agent.register(run, output, metrics, f"r{number}", checkpoint_uri=uri)
+        if state.get("resident"):
+            # The 4090 copy is only for serving and evaluation there; the next round samples from CFS.
+            # Registration waits for the verified copy (see publish_copies), so the version name is known now.
+            uri = Path(from_cfs(str(output), self.root)).as_uri()
+            version = f"{run['config'].get('model_name') or run_id}-r{number}"
+            self.queue_copy(run_dir, {"round": number, "output": str(output), "metrics": metrics})
+            self.publish_copies(run, run_dir)  # Start it now rather than on the next tick.
+        else:
+            uri = self.copy_to_serving(run_id, output)
+            version = self.agent.register(run, output, metrics, f"r{number}", checkpoint_uri=uri)
         state.update(round=number + 1, policy_version=version, policy_path=str(output), checkpoint_uri=uri,
                      step_offset=state["step_offset"] + metrics["step_count"], metrics=metrics)
         state_path.write_text(json.dumps(state, indent=2))
@@ -441,8 +657,21 @@ class H800Launcher:
     def rollout_service_name(self, run_id: str, work: Path) -> str:
         return self.deployment_name(run_id, work.name).replace("alvarez-train-", "alvarez-roll-", 1)
 
+    def rollout_weights_for(self, state: dict[str, Any]) -> tuple[str, str | None]:
+        """(weights to serve, merged copy to delete afterwards or None) for the round's policy."""
+        merged = rollout_weights(state["policy_path"])
+        if Path(merged).is_dir() and sglang_servable(merged):
+            return merged, merged
+        return state["policy_path"], None
+
     def rollout_service_ready(self, run: dict[str, Any], state: dict[str, Any], work: Path) -> bool:
         """Start, watch and publish this round's H800 policy service; True while it answers."""
+        if state.get("resident"):
+            weights, _ = self.rollout_weights_for(state)
+            if sglang_servable(weights):
+                return self.resident_rollout_ready(run, state, work)
+            # ponytail: e.g. a LoRA round whose merge failed; that round falls back to a per-round HF pod.
+            self.stop_resident_rollout(run["run_id"], work.parent)
         run_id, serve = run["run_id"], work / "serve"
         name = self.rollout_service_name(run_id, work)
         if not (serve / "spec.json").exists():
@@ -450,11 +679,19 @@ class H800Launcher:
             token = serve / "token"
             token.touch(mode=0o600)
             token.write_text(secrets.token_urlsafe(32))
-            (serve / "pod.sh").write_text(SERVE_POD_SCRIPT.format(work=serve, root=self.root, src=run_dir_src(work)))
-            (serve / "spec.json").write_text(json.dumps(
-                {"run_id": run_id, "models": {state["policy_version"]: state["policy_path"]}}, indent=2))
+            merged = rollout_weights(state["policy_path"])
+            weights = merged if Path(merged).is_dir() else state["policy_path"]
+            backend = "sglang" if sglang_servable(weights) else "hf"
+            script = SGLANG_POD_SCRIPT if backend == "sglang" else SERVE_POD_SCRIPT
+            if backend == "hf":
+                weights = state["policy_path"]
+            (serve / "pod.sh").write_text(script.format(work=serve, root=self.root, src=run_dir_src(work)))
+            spec = {"run_id": run_id, "backend": backend, "models": {state["policy_version"]: weights}}
+            if weights == merged:
+                spec["merged_copy"] = merged  # The only path stop_rollout_service may delete.
+            (serve / "spec.json").write_text(json.dumps(spec, indent=2))
             self.apply_rollout_service(run_id, name, serve)
-            self.agent.log(run_id, f"{work.name}: created rollout service {name} for {state['policy_version']}")
+            self.agent.log(run_id, f"{work.name}: created {backend} rollout service {name} for {state['policy_version']}")
             return False
         if (serve / "FAILED").exists():
             self.fail(run_id, work.parent, "H800 rollout service failed: " + (serve / "FAILED").read_text()[-1500:])
@@ -470,14 +707,102 @@ class H800Launcher:
                      {"endpoint": target, "token": token if target else None})
         return target is not None
 
+    # --- resident rollout service (docs/h800-resident-pods.md) ---------------------------
+    # One sglang Deployment per run under <run>/serve; each round's policy is swapped in through next.json.
+
+    def resident_rollout_name(self, run_id: str) -> str:
+        return self.deployment_name(run_id).replace("alvarez-train-", "alvarez-roll-", 1)
+
+    def resident_rollout_ready(self, run: dict[str, Any], state: dict[str, Any], work: Path) -> bool:
+        run_id, run_dir = run["run_id"], work.parent
+        serve, name = run_dir / "serve", self.resident_rollout_name(run_id)
+        weights, merged = self.rollout_weights_for(state)
+        wanted = {"version": state["policy_version"], "path": weights}
+        if not (serve / "spec.json").exists():
+            serve.mkdir(parents=True, exist_ok=True)
+            token = serve / "token"
+            token.touch(mode=0o600)
+            token.write_text(secrets.token_urlsafe(32))
+            (serve / "pod.sh").write_text(SGLANG_POD_SCRIPT.format(work=serve, root=self.root, src=run_dir / "src"))
+            (serve / "next.json").write_text(json.dumps(wanted))
+            (serve / "spec.json").write_text(json.dumps(
+                {"run_id": run_id, "backend": "sglang", "resident": True, "models": {wanted["version"]: weights}},
+                indent=2))
+            self.apply_resident_rollout(run_id, name, serve)
+            self.agent.log(run_id, f"{work.name}: created resident sglang rollout service {name} for {wanted['version']}")
+            return False
+        if (serve / "FAILED").exists():
+            self.fail(run_id, run_dir, "H800 rollout service failed: " + (serve / "FAILED").read_text()[-1500:])
+            return False
+        if not self.kube("get", "deployment", name, "--ignore-not-found", "-o", "name").strip():
+            self.agent.log(run_id, f"{work.name}: recreated missing resident rollout service {name}")
+            self.apply_resident_rollout(run_id, name, serve)
+        if not self.check_restarts(run_id, run_dir, work, name, "rollout service"):
+            return False
+        if not (serve / "next.json").exists() or json.loads((serve / "next.json").read_text()) != wanted:
+            pending = serve / "next.json.tmp"
+            pending.write_text(json.dumps(wanted))
+            pending.replace(serve / "next.json")
+            self.agent.log(run_id, f"{work.name}: swapping the resident rollout service to {wanted['version']}")
+        copies = self.merged_copies(run_dir)
+        if merged and merged not in copies:
+            (serve / "merged-copies.json").write_text(json.dumps(copies + [merged]))
+        current = json.loads((serve / "current.json").read_text()) if (serve / "current.json").exists() else None
+        if current == wanted:
+            # A restarted container reloads current.json's path, so only copies it has swapped off may go.
+            self.delete_merged_copies(run_dir, keep=current["path"])
+        token = (serve / "token").read_text().strip()
+        endpoint = self.serving_endpoint(f"gpu-be-label={name}", serve)
+        # Publish only once it serves this round's policy: rollouts must never sample the previous one.
+        target = (endpoint if current == wanted and endpoint is not None and self.healthy(endpoint, token)
+                  else None)
+        self.cp.call("PUT", f"/internal/v1/training/runs/{run_id}/model-endpoint",
+                     {"endpoint": target, "token": token if target else None})
+        return target is not None
+
+    @staticmethod
+    def merged_copies(run_dir: Path) -> list[str]:
+        path = run_dir / "serve" / "merged-copies.json"
+        return json.loads(path.read_text()) if path.exists() else []
+
+    def delete_merged_copies(self, run_dir: Path, keep: str | None = None) -> None:
+        """Delete merged copies the resident service made for earlier rounds (only ever these recorded paths)."""
+        copies = self.merged_copies(run_dir)
+        for path in copies:
+            if path != keep:
+                shutil.rmtree(path, ignore_errors=True)
+        if copies:
+            (run_dir / "serve" / "merged-copies.json").write_text(json.dumps([path for path in copies if path == keep]))
+
+    def apply_resident_rollout(self, run_id: str, name: str, serve: Path) -> None:
+        (serve / "ready.json").unlink(missing_ok=True)  # The new pod announces its own port.
+        self.kube("apply", "-f", "-", stdin=json.dumps(deployment_manifest(
+            self.template(), name, run_id, serve / "pod.sh", rollout_probes(serve))))
+
+    def stop_resident_rollout(self, run_id: str, run_dir: Path) -> None:
+        """Remove the run's resident rollout service (fallback rounds start fresh from round state)."""
+        serve = run_dir / "serve"
+        if not (serve / "spec.json").exists():
+            return
+        self.kube("delete", "deployment", self.resident_rollout_name(run_id), "--ignore-not-found", "--wait=false")
+        for name in ("spec.json", "next.json", "current.json", "ready.json", "token"):
+            (serve / name).unlink(missing_ok=True)
+
     def apply_rollout_service(self, run_id: str, name: str, serve: Path) -> None:
         self.kube("apply", "-f", "-", stdin=json.dumps(deployment_manifest(self.template(), name, run_id, serve / "pod.sh")))
 
     def stop_rollout_service(self, run_id: str, work: Path) -> None:
         name = self.rollout_service_name(run_id, work)
         self.cp.call("PUT", f"/internal/v1/training/runs/{run_id}/model-endpoint", {"endpoint": None, "token": None})
+        if not (work / "serve" / "spec.json").exists():
+            return  # The run's resident service: it stays up, withdrawn, until the next round's swap.
         self.kube("delete", "deployment", name, "--ignore-not-found", "--wait=false")
         (work / "serve" / "token").unlink(missing_ok=True)
+        # The merged copy (3 GB) only fed this round's sglang rollouts; the adapter stays the checkpoint.
+        # Never match served paths by name: a registered base model can itself be called "*-merged".
+        merged = json.loads((work / "serve" / "spec.json").read_text()).get("merged_copy")
+        if merged:
+            shutil.rmtree(merged, ignore_errors=True)
 
     def relay(self, run_id: str, work: Path) -> None:
         offsets_path = work / "relay-offsets.json"
@@ -519,6 +844,7 @@ class H800Launcher:
     def succeed(self, run: dict[str, Any], run_dir: Path, version: str, metrics: dict[str, Any],
                 output: Path, uri: str) -> None:
         run_id = run["run_id"]
+        self.delete_deployment(run_id)  # Resident pods outlive the last round; free their GPUs first.
         self.agent.publish(run, version)
         self.agent.finish(run_id, True, {**metrics, "model_version": version, "accelerator": "h800",
                                          "cfs_checkpoint": str(output)}, uri)
@@ -570,20 +896,35 @@ class H800Launcher:
         work = self.serving_root / eval_id
         work.mkdir(parents=True)
         try:
-            models = {version: str(self.serving_model(version)) for version in evaluation["model_versions"]}
+            # Per model: sglang for full MiniCPM-V 4.7 weights or a LoRA over them (merged in the pod), else HF.
+            # See docs/h800-sglang-evaluation.md.
+            models: dict[str, dict[str, str]] = {}
+            for version in evaluation["model_versions"]:
+                path = self.serving_model(version)
+                entry = {"path": str(path), "backend": "sglang" if sglang_servable(path) else "hf"}
+                if sglang_mergeable(path):
+                    entry = {"path": str(path), "backend": "sglang",
+                             "merged_copy": str(work / "merged" / quote(version, safe=""))}
+                models[version] = entry
+            sglang = any(entry["backend"] == "sglang" for entry in models.values())
             token = work / "token"
             token.touch(mode=0o600)
             token.write_text(secrets.token_urlsafe(32))
             self.snapshot_source(work)
-            (work / "pod.sh").write_text(SERVE_POD_SCRIPT.format(work=work, root=self.root, src=work / "src"))
+            script = SGLANG_POD_SCRIPT if sglang else SERVE_POD_SCRIPT
+            (work / "pod.sh").write_text(script.format(work=work, root=self.root, src=work / "src"))
             # Written last: a directory without spec.json is an interrupted start (see tick_evaluations).
-            (work / "spec.json").write_text(json.dumps({"eval_id": eval_id, "models": models}, indent=2))
+            (work / "spec.json").write_text(json.dumps(
+                {"eval_id": eval_id, "models": models, "sglang_memory": 0.8,
+                 # Greedy reruns agree 97.9% by default, 100% with this at 11.4 req/s vs 13.9 (sglang-eval-parity-20261124).
+                 "sglang_args": ["--enable-deterministic-inference"]}, indent=2))
             name = self.apply_serving(eval_id, work)
         except Exception as exc:
             log.exception("evaluation %s: staging failed", eval_id)
             self.serving_failed(eval_id, work, f"H800 model staging failed: {exc}")
             return
-        log.info("evaluation %s: created deployment %s for %s", eval_id, name, sorted(models))
+        log.info("evaluation %s: created deployment %s for %s", eval_id, name,
+                 {version: entry["backend"] for version, entry in models.items()})
 
     def serving_model(self, version: str) -> Path:
         """CFS path of a registered model: the launcher's own original, else a copy from the 4090."""
@@ -623,7 +964,10 @@ class H800Launcher:
                      if pod["status"].get("phase") == "Running" and not pod["metadata"].get("deletionTimestamp")]
         if len(addresses) != 1 or not addresses[0]:
             return None
-        return f"http://{addresses[0]}:{json.loads(ready.read_text())['port']}"
+        try:  # A replacement pod's start removes ready.json; it may go between the check above and here.
+            return f"http://{addresses[0]}:{json.loads(ready.read_text())['port']}"
+        except FileNotFoundError:
+            return None
 
     def healthy(self, endpoint: str, token: str) -> bool:
         request = Request(f"{endpoint}/health", headers={"Authorization": f"Bearer {token}"})
@@ -643,6 +987,12 @@ class H800Launcher:
         self._ignore_missing("PUT", f"/internal/v1/evaluations/{eval_id}/model-endpoint",
                              {"endpoint": None, "token": None})
         (work / "token").unlink(missing_ok=True)
+        spec_path = work / "spec.json"
+        # Only the merged copies spec.json records; registered checkpoints are never touched.
+        for entry in (json.loads(spec_path.read_text())["models"].values() if spec_path.exists() else ()):
+            if isinstance(entry, dict) and entry.get("merged_copy"):
+                for path in (entry["merged_copy"], entry["merged_copy"] + ".tmp"):  # .tmp: an interrupted merge.
+                    shutil.rmtree(path, ignore_errors=True)
         (work / "DONE").write_text(reason + "\n")
         log.info("evaluation %s: serving stopped (%s); deployment deleted", eval_id, reason)
 
@@ -652,6 +1002,23 @@ class H800Launcher:
         except HTTPError as exc:
             if exc.code != 404:  # The evaluation was deleted meanwhile.
                 raise
+
+
+class CopyThread(threading.Thread):
+    """One ``copy_to_serving`` off the launcher's tick; the tick reads ``uri`` / ``error`` once it ends."""
+
+    def __init__(self, launcher: "H800Launcher", run_id: str, output: Path) -> None:
+        super().__init__(daemon=True, name=f"copy-{run_id}")
+        self.launcher, self.run_id, self.output = launcher, run_id, output
+        self.uri: str | None = None
+        self.error: str | None = None
+
+    def run(self) -> None:
+        try:
+            self.uri = self.launcher.copy_to_serving(self.run_id, self.output)
+        except Exception as exc:
+            log.exception("run %s: copying %s to the serving host failed", self.run_id, self.output)
+            self.error = str(exc)[:500]
 
 
 def run_dir_src(work: Path) -> Path:
@@ -709,6 +1076,19 @@ def run_pod(run_dir: Path) -> None:
     except Exception:
         (run_dir / "FAILED").write_text(traceback.format_exc())
         raise
+    output = Path(spec["output_dir"])
+    if spec.get("merge_for_rollout") and (output / "adapter_config.json").is_file():
+        from alvarezgui.minicpm_service import merge_adapter
+
+        merged = Path(rollout_weights(str(output)))
+        shutil.rmtree(merged, ignore_errors=True)  # A preempted earlier attempt.
+        try:
+            merge_adapter(output, merged)
+        except Exception:
+            # ponytail: the next rollout falls back to HF serving of the adapter instead of failing the run.
+            traceback.print_exc()
+        else:
+            print(f"merged adapter for sglang rollout: {merged}", flush=True)
     (run_dir / "COMPLETE").write_text(json.dumps(metrics))
     print(f"completed: {json.dumps(metrics)}", flush=True)
 
@@ -718,7 +1098,8 @@ def serve_pod(work: Path) -> None:
     from alvarezgui.minicpm_service import MiniCPMService, _static_resolver, serve
 
     spec = json.loads((work / "spec.json").read_text())
-    service = MiniCPMService(_static_resolver(spec["models"]), max_loaded=len(spec["models"]))
+    paths = {version: entry if isinstance(entry, str) else entry["path"] for version, entry in spec["models"].items()}
+    service = MiniCPMService(_static_resolver(paths), max_loaded=len(paths))
     try:
         for version in spec["models"]:
             service.load(version)  # No trial should wait for a checkpoint load.
@@ -744,7 +1125,13 @@ def main() -> None:
     pod.add_argument("run_dir", type=Path)
     serve_pod_parser = commands.add_parser("serve-pod")
     serve_pod_parser.add_argument("work", type=Path)
+    commands.add_parser("sglang-adapter").add_argument("work", type=Path)
     args = parser.parse_args()
+    if args.command == "sglang-adapter":
+        from alvarezgui.sglang_adapter import run
+
+        run(args.work)
+        return
     if args.command == "pod":
         run_pod(args.run_dir)
         return

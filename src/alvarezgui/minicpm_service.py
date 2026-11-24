@@ -83,6 +83,12 @@ def _parse_action(raw_output: str) -> dict[str, Any]:
             value, end = decoder.raw_decode(candidate)
             if candidate[end:].strip():
                 continue
+            # Same rule as training rows (parse_policy_output): "360" or 360.0 is not an integer coordinate,
+            # so a rollout never executes an output the trainer would reject.
+            if isinstance(value, dict) and any(
+                    key in value and type(value[key]) is not int
+                    for key in ("x", "y", "x1", "y1", "x2", "y2", "duration_ms")):
+                continue
             return validate_action(value)
         except (json.JSONDecodeError, TypeError, ValueError):
             continue
@@ -633,6 +639,9 @@ class _Handler(BaseHTTPRequestHandler):
 class _ModelServer(ThreadingHTTPServer):
     service: MiniCPMService
     token: str | None = None
+    # socketserver's default backlog of 5 overflows under 16+ concurrent clients (sglang adapter); with
+    # SYN cookies the client's connect succeeds and its first send gets "Connection reset by peer".
+    request_queue_size = 256
 
 
 def serve(service: MiniCPMService, host: str, port: int, *, token: str | None = None,

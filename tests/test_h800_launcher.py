@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from alvarezgui.h800_launcher import (
+    WORKER_PROBES,
     H800Launcher,
     _read_complete_lines,
     cfs_checkpoint,
@@ -266,6 +267,9 @@ class H800LauncherTest(unittest.TestCase):
                 self.assertEqual(agent.request_rollouts.call_args.args[1:], (number, policy))
 
             launcher.tick()  # Claim and stage.
+            # Runs staged before resident pods keep the per-round pods they were started with.
+            state_path = run_dir / "online.json"
+            state_path.write_text(json.dumps({**json.loads(state_path.read_text()), "resident": False}))
             serve_round(0, "base")
             launcher.tick()  # Rollouts done: stop the rollout service, stage round 0 training pod.
             self.assertEqual(endpoints()[-1], {"endpoint": None, "token": None})
@@ -297,6 +301,126 @@ class H800LauncherTest(unittest.TestCase):
             self.assertEqual(agent.finish.call_args.args[3], "file:///home/alvarez-checkpoints/run_abc/round-2")
             agent.publish.assert_called_once_with(run | {"run_id": "run_abc"}, "abc-r2")
             self.assertTrue((run_dir / "DONE").exists())
+
+    def test_resident_online_run_keeps_one_worker_and_one_rollout_service(self) -> None:
+        """docs/h800-resident-pods.md: one worker and one sglang service for the whole run, weights swapped
+        per round, endpoint published only for the round's own policy, 4090 copies off the critical path."""
+        with tempfile.TemporaryDirectory() as directory:
+            root, serving = Path(directory, "cfs"), Path(directory, "gpu")
+            model = serving / "home/alvarez-models/M"
+            model.mkdir(parents=True)
+            (model / "config.json").write_text(json.dumps({"model_type": "minicpmv4_7"}))
+            run = {"run_id": "run_abc", "algorithm": "grpo", "base_model": "base", "dataset_version": None,
+                   "base_model_checkpoint_uri": "file:///home/alvarez-models/M",
+                   "config": {"rounds": 2, "temperature": 1.0, "tasks": [{"task_type": "sokoban", "app_image": "a"}]}}
+            claims, calls = iter([{"run": run}]), []
+
+            def call(method, path, body=None, *args, **kwargs):
+                calls.append((method, path, body))
+                return (next(claims, {"run": None}) if path.startswith("/internal/v1/training/claim")
+                        else [] if path == "/internal/v1/evaluations/h800"
+                        else {"status": "RUNNING"} if method == "GET" else {})
+
+            cp = MagicMock()
+            cp.call.side_effect = call
+            launcher = FakeLauncher(root, serving, cp)
+            launcher.healthy = MagicMock(return_value=True)
+            agent = launcher.agent
+            agent.register.side_effect = lambda run, output, metrics, suffix, checkpoint_uri: f"run_abc-{suffix}"
+            agent.finished_rollouts.side_effect = lambda run, number: [
+                {"outcome": "success", "group_id": "g", "reward_total": 1.0, "steps": 1, "episode_id": "e"}]
+            agent.rows.side_effect = lambda run, number, rollouts: [{"id": number}]
+            run_dir = root / "alvarez-runs/run_abc"
+            serve = run_dir / "serve"
+            endpoints = lambda: [body for method, path, body in calls
+                                 if path == "/internal/v1/training/runs/run_abc/model-endpoint"]
+            copied = []
+            launcher.copy_to_serving = lambda run_id, output: copied.append(output.name) or f"file:///home/{output.name}"
+
+            def swapped(version: str, path: Path) -> None:
+                """What the adapter does on next.json: serve ``version`` and say so in current.json."""
+                self.assertEqual(json.loads((serve / "next.json").read_text()), {"version": version, "path": str(path)})
+                (serve / "current.json").write_text(json.dumps({"version": version, "path": str(path)}))
+
+            def finish_round(number: int, merged: bool) -> Path:
+                spec = json.loads((run_dir / f"round-{number}/spec.json").read_text())
+                output = Path(spec["output_dir"])
+                output.mkdir(parents=True)
+                (output / "adapter_config.json").write_text("{}")
+                (output / "metrics.json").write_text(json.dumps({"loss": 0.1, "step_count": 5}))
+                if merged:  # The worker's merge for the next round's sglang rollouts.
+                    copy = Path(str(output) + "-merged")
+                    copy.mkdir()
+                    (copy / "config.json").write_text(json.dumps({"model_type": "minicpmv4_7"}))
+                (run_dir / f"round-{number}/COMPLETE").write_text("{}")
+                return output
+
+            launcher.tick()  # Claim and stage.
+            self.assertTrue(json.loads((run_dir / "online.json").read_text())["resident"])
+            launcher.tick()  # The resident rollout service for round 0.
+            self.assertEqual(list(launcher.deployments), ["alvarez-roll-abc"])
+            container = launcher.deployments["alvarez-roll-abc"]["spec"]["template"]["spec"]["containers"][0]
+            self.assertIn("livenessProbe", container)
+            self.assertIn(str(serve / "ready.json"), container["livenessProbe"]["exec"]["command"][2])
+            self.assertTrue(json.loads((serve / "spec.json").read_text())["resident"])
+            base = root / "alvarez-models/M"
+            (serve / "ready.json").write_text(json.dumps({"port": 4321}))
+            launcher.tick()  # Answering, but not yet on round 0's policy: nothing is published or sampled.
+            agent.request_rollouts.assert_not_called()
+            self.assertEqual(endpoints()[-1], {"endpoint": None, "token": None})
+            swapped("base", base)
+            launcher.tick()
+            self.assertEqual(endpoints()[-1]["endpoint"], "http://10.0.0.5:4321")
+            self.assertEqual(agent.request_rollouts.call_args.args[1:], (0, "base"))
+            launcher.tick()  # Rollouts done: withdraw (the service stays), queue round 0 for the worker.
+            self.assertEqual(endpoints()[-1], {"endpoint": None, "token": None})
+            self.assertEqual(set(launcher.deployments), {"alvarez-roll-abc"})
+            launcher.tick()  # The worker appears with its probes.
+            self.assertEqual(set(launcher.deployments), {"alvarez-roll-abc", "alvarez-train-abc-w"})
+            worker = launcher.deployments["alvarez-train-abc-w"]["spec"]["template"]["spec"]["containers"][0]
+            self.assertEqual(worker["livenessProbe"], WORKER_PROBES["livenessProbe"])
+            self.assertIn("alvarezgui.train_worker", (run_dir / "worker.sh").read_text())
+            del launcher.deployments["alvarez-train-abc-w"]
+            launcher.tick()  # Lost worker: recreated.
+            self.assertIn("alvarez-train-abc-w", launcher.deployments)
+            output0 = finish_round(0, merged=True)
+            launcher.tick()  # Round 0 done: copy in the background, swap the service to round 0's merge.
+            launcher.copy_threads["run_abc"].join()
+            self.assertEqual(copied, ["round-0"])
+            launcher.tick()  # Copy verified: register round 0. Not yet swapped: nothing published.
+            self.assertEqual(agent.register.call_args.args[3], "r0")
+            self.assertEqual(agent.register.call_args.kwargs["checkpoint_uri"], "file:///home/round-0")
+            merged0 = Path(str(output0) + "-merged")
+            swapped("run_abc-r0", merged0)
+            launcher.tick()
+            self.assertEqual(agent.request_rollouts.call_args.args[1:], (1, "run_abc-r0"))
+            self.assertEqual(set(launcher.deployments), {"alvarez-roll-abc", "alvarez-train-abc-w"})
+            self.assertTrue(merged0.is_dir())  # In use by the service.
+            launcher.tick()  # Round 1 rollouts done.
+            finish_round(1, merged=False)  # The last round is not merged.
+            launcher.tick()
+            launcher.copy_threads["run_abc"].join()
+            agent.finish.assert_not_called()  # Round 1 is not on the 4090 yet.
+            launcher.tick()  # Register round 1; all rounds on the 4090: succeed and delete both deployments.
+            self.assertEqual(agent.finish.call_args.args[:2], ("run_abc", True))
+            self.assertEqual(agent.finish.call_args.args[2]["model_version"], "run_abc-r1")
+            self.assertEqual(launcher.deployments, {})
+            self.assertFalse(merged0.exists())  # The service's merged copies go with it.
+            self.assertTrue(output0.exists())  # The checkpoint itself stays.
+
+    def test_resident_pod_restart_cap_fails_the_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            launcher = FakeLauncher(Path(directory, "cfs"), Path(directory, "gpu"), MagicMock())
+            launcher.fail = MagicMock()
+            work = Path(directory, "round-3")
+            work.mkdir()
+            for count, ok in ((2, True), (7, True), (8, False)):
+                launcher.restarts = MagicMock(return_value=count)
+                self.assertEqual(launcher.check_restarts("run_abc", work.parent, work, "w", "training worker"), ok)
+            self.assertIn("restarted 6 times in round-3", launcher.fail.call_args.args[2])
+            (work / "restarts-training-worker.json").unlink()
+            launcher.restarts = MagicMock(return_value=1)  # A recreated pod counts from zero again.
+            self.assertTrue(launcher.check_restarts("run_abc", work.parent, work, "w", "training worker"))
 
     def test_canceled_run_deletes_deployment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -349,8 +473,9 @@ class H800LauncherTest(unittest.TestCase):
             launcher.tick()
             work = root / "alvarez-serving/eval_1"
             spec = json.loads((work / "spec.json").read_text())
-            self.assertEqual(spec["models"], {"trained": str(root / "alvarez-checkpoints/run_x/final"),
-                                              "cand": str(root / "alvarez-checkpoints/cand")})
+            self.assertEqual(spec["models"], {
+                "trained": {"path": str(root / "alvarez-checkpoints/run_x/final"), "backend": "hf"},
+                "cand": {"path": str(root / "alvarez-checkpoints/cand"), "backend": "hf"}})
             staged = json.loads((root / "alvarez-checkpoints/cand/adapter_config.json").read_text())
             self.assertEqual(staged["base_model_name_or_path"], str(root / "alvarez-models/M"))
             self.assertEqual((work / "token").stat().st_mode & 0o777, 0o600)

@@ -113,7 +113,7 @@ class MiniCPMTrainingTest(unittest.TestCase):
                 ("sft", {"gradient_checkpointing": "true"}),
                 ("sft", {"shuffle": "true"}),
                 *[(algorithm, option) for algorithm in ("grpo", "gigpo")
-                  for option in ({"batch_size": 2}, {"cache_preprocessed": True}, {"shuffle": True})],
+                  for option in ({"shuffle": True},)],
                 ("sft", {"train_top_layers": -1}),
                 ("sft", {"train_top_layers": True}),
                 ("sft", {"train_top_layers": 1.5}),
@@ -847,15 +847,20 @@ class MiniCPMTrainingTest(unittest.TestCase):
                 self.assertEqual(tuple(trainer.call_args.kwargs[key] for key in (
                     "batch_size", "cache_preprocessed", "gradient_checkpointing", "shuffle",
                 )), expected)
-            for algorithm in ("grpo", "gigpo", "perception"):
-                for option in (["--batch-size", "2"], ["--cache-preprocessed"], ["--shuffle"]):
-                    with self.subTest(algorithm=algorithm, option=option), patch(
-                        "sys.argv", arguments[:2] + [algorithm] + arguments[3:] + option
-                    ), patch("sys.stderr"), self.assertRaises(SystemExit):
-                        main()
+            rejected = [(algorithm, ["--shuffle"]) for algorithm in ("grpo", "gigpo", "perception")]
+            rejected += [("perception", option) for option in (["--batch-size", "2"], ["--cache-preprocessed"])]
+            for algorithm, option in rejected:
+                with self.subTest(algorithm=algorithm, option=option), patch(
+                    "sys.argv", arguments[:2] + [algorithm] + arguments[3:] + option
+                ), patch("sys.stderr"), self.assertRaises(SystemExit):
+                    main()
+            # Policy algorithms take micro-batches and the preprocessing cache.
+            with patch("sys.argv", arguments[:2] + ["grpo"] + arguments[3:] + ["--batch-size", "4", "--cache-preprocessed"]):
+                main()
+            self.assertEqual((trainer.call_args.kwargs["batch_size"], trainer.call_args.kwargs["cache_preprocessed"]), (4, True))
             with patch("sys.argv", arguments + ["--batch-size", "0"]), patch("sys.stderr"), self.assertRaises(SystemExit):
                 main()
-            self.assertEqual(trainer.call_count, 2)
+            self.assertEqual(trainer.call_count, 3)
 
     def test_cli_passes_checkpoint_dir_and_rejects_non_sft(self) -> None:
         arguments = ["minicpm_training", "--algorithm", "sft", "--base-model", "base",
@@ -1529,6 +1534,95 @@ class MiniCPMTrainingTest(unittest.TestCase):
             run([row(1.0, 1.0, 0.0)])
         with self.assertRaises(ValueError):
             run([row(1.0, 1.0)], clip_epsilon_high=1.5)
+
+    def test_policy_microbatches_and_cache_match_batch_one(self) -> None:
+        """batch_size x gradient_accumulation windows give batch one's gradients, updates and per-row metrics."""
+        try:
+            import torch
+            from accelerate import Accelerator
+        except ImportError:
+            self.skipTest("requires torch and accelerate; runs on CPU without model downloads")
+        test = self
+
+        class TinyModel(torch.nn.Module):
+            config = SimpleNamespace(model_type="minicpmv4_7")
+
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor(.3))
+                self.seen = []
+
+            def forward(self, input_ids, attention_mask, mm_token_type_ids, pixel_values, target_sizes, use_cache=False):
+                markers = pixel_values[0, 0, 0, ::14]
+                features, offset = [], 0
+                for ids, modalities in zip(input_ids, mm_token_type_ids):
+                    slices = int(modalities.sum())
+                    test.assertTrue(markers[offset:offset + slices].eq(int(ids[0])).all())
+                    self.seen.append(int(ids[0]) - 1)
+                    features.append(markers[offset:offset + slices].mean() / 7)
+                    offset += slices
+                position = torch.arange(input_ids.shape[1])[None, :] / 10
+                score = self.weight * (torch.stack(features)[:, None] + position)
+                pixel_values.zero_()  # The cache must survive models that mutate their inputs.
+                return SimpleNamespace(logits=torch.stack((score, -score), dim=-1))
+
+        def masked(_processor, row, _torch, **_kwargs):
+            index = row["id"]
+            prepared.append(index)
+            slices, prompt, completion = 1 + index % 3, 3 + index % 2, 1 + index % 3
+            ids = torch.full((1, prompt + completion), index + 1, dtype=torch.long)
+            labels = torch.full_like(ids, -100)
+            labels[:, prompt:] = torch.arange(completion) % 2
+            modalities = torch.zeros_like(ids)
+            modalities[:, 1:1 + slices] = 1
+            return {"input_ids": ids, "attention_mask": torch.ones_like(ids), "mm_token_type_ids": modalities,
+                    "pixel_values": torch.full((1, 3, 14, slices * 14), float(index + 1)),
+                    "target_sizes": torch.ones((slices, 2), dtype=torch.int32)}, labels
+
+        count = 7  # Not a multiple of the window: the short last window must weigh like batch one's.
+        baseline = None
+        for batch_size, accumulation in ((1, 4), (2, 2), (4, 1)):
+            for cache in (False, True):
+                with self.subTest(batch_size=batch_size, cache=cache), tempfile.TemporaryDirectory() as directory:
+                    rows = [{"id": index, "group_id": f"g{index % 2}", "reward": {"total": index % 3},
+                             "advantage": (index % 3) - 1.0, "loss_weight": 1.0 + index % 2,
+                             "conversations": self._row(Path("unused"))["conversations"]} for index in range(count)]
+                    model, prepared, callbacks, gradients = TinyModel(), [], [], []
+                    optimizer = torch.optim.SGD(model.parameters(), lr=.05)
+                    real_step = optimizer.step
+
+                    def step(*args, **kwargs):
+                        gradients.append(model.weight.grad.detach().clone())
+                        return real_step(*args, **kwargs)
+
+                    optimizer.step = step
+                    with patch("alvarezgui.minicpm_training._imports", return_value=(
+                        torch, lambda **kwargs: Accelerator(cpu=True, **kwargs),
+                        SimpleNamespace(from_pretrained=Mock(return_value=model)),
+                        SimpleNamespace(from_pretrained=Mock(return_value=SimpleNamespace(
+                            tokenizer=SimpleNamespace(pad_token_id=0)))),
+                    )), patch("alvarezgui.minicpm_training._masked_batch", side_effect=masked), patch(
+                        "alvarezgui.minicpm_training._checkpoint"
+                    ), patch.object(torch.optim, "AdamW", return_value=optimizer):
+                        metrics = train("dr_grpo", "unused-model", rows, directory, compute_old_logprob=True,
+                                        batch_size=batch_size, gradient_accumulation=accumulation,
+                                        cache_preprocessed=cache, gradient_checkpointing=False,
+                                        on_step=lambda step, values: callbacks.append((step, values)))
+                    # old_logprob pass, then the update pass; the cache prepares each row once for both.
+                    self.assertEqual(prepared, list(range(count)) * (1 if cache else 2))
+                    self.assertEqual(model.seen, list(range(count)) * 2)
+                    self.assertEqual(metrics["update_count"], math.ceil(count / 4))
+                    self.assertEqual([step for step, _ in callbacks], list(range(1, count + 1)))
+                    per_row = torch.tensor([[values[key] for key in ("train/loss", "train/ratio", "train/advantage",
+                                                                    "train/loss_weight", "train/entropy")]
+                                            for _, values in callbacks])
+                    result = (model.weight.detach(), torch.stack(gradients), per_row,
+                              torch.tensor([row["old_logprob"] for row in rows]))
+                    if baseline is None:
+                        baseline = result
+                    else:
+                        for actual, expected in zip(result, baseline):
+                            torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
     def test_policy_training_uses_the_base_checkpoint_visual_views(self) -> None:
         try:

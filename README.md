@@ -53,7 +53,7 @@ flowchart LR
         TA["训练 agent"]
     end
 
-    H800["H800 集群<br/>按需 Pod：训练 / 评测推理"]
+    H800["H800 集群<br/>在线 RL：每个 run 常驻训练 worker + sglang rollout<br/>SFT / 评测：按需 Pod"]
 
     Console --> API --> PG
     Sched -- "alvarez:tasks:firecracker" --> Redis
@@ -101,7 +101,7 @@ sequenceDiagram
 | 任务 | Settings（检查前台包）、商城（检查 `Order complete`）、推箱子（检查 `Sokoban complete`）；推箱子题目集 `sokoban-train`（48 关）、`sokoban-validation`、`sokoban-test`（各 8 关） |
 | 模型服务 | MiniCPM-V-4.7-1B、Qwen3-VL-8B-Instruct；要求输出单个 JSON 动作，格式错误返回 422；load/unload；LoRA 合并成完整权重；上报每次生成的采样熵 |
 | SFT | 全参数或 LoRA（rank 16、alpha 32）、视觉 merger、双视图（完整截图 + 棋盘裁剪）、micro-batch、预处理缓存、每 epoch 打乱；H800 上按 epoch 断点续训 |
-| 在线强化学习 | GRPO、DAPO、Dr. GRPO、GiGPO 共用同一套在线 rollout：每轮用上一轮策略在真实沙箱里采样，按算法计算每一步的 advantage 和 loss 权重，PPO-clip 更新；4090 或 H800 训练；运行错误用同一 seed 重试最多 3 次；支持 LoRA。见[策略优化算法](#策略优化算法) |
+| 在线强化学习 | GRPO、DAPO、Dr. GRPO、GiGPO 共用同一套在线 rollout：每轮用上一轮策略在真实沙箱里采样，按算法计算每一步的 advantage 和 loss 权重，PPO-clip 更新；4090 或 H800 训练；H800 上每个 run 常驻一个训练 worker 和一个 sglang rollout 服务，每轮热更新权重，pod 挂了由 livenessProbe 原地重启或 launcher 重建；运行错误用同一 seed 重试最多 3 次；支持 LoRA、micro-batch 和预处理缓存。见[策略优化算法](#策略优化算法) |
 | 评测 | 选模型（可多选）、runtime、推理资源（4090 常驻或 H800 按需 Pod）、单题或题目集，逐题记录成功、步数和输出格式 |
 | 模型与数据管理 | 模型 / LoRA / checkpoint 三类分开管理，每个实验一个正式模型；离线轨迹数据集注册；截图存 MinIO，每日按引用 GC |
 
@@ -171,10 +171,26 @@ flowchart LR
 | 算法 | `sft`，或在线策略算法 `grpo`、`dapo`、`dr_grpo`、`gigpo`（区别见[策略优化算法](#策略优化算法)） |
 | 基础模型 | 必须与算法兼容，不兼容时创建时就会被拒绝 |
 | 训练资源 | `4090`（一次只跑一个实验）或 `h800`（每个实验一个 Pod，可并行） |
-| SFT 专用 | 数据集、LoRA / 全参数、merger、双视图、batch、缓存、打乱 |
-| 在线算法专用 | `train_set`、`tasks_per_round`（1–16）、group 大小、轮数、学习率、采样 temperature、`clip_epsilon`、runtime；DAPO 另有 `clip_epsilon_high`（默认 0.28） |
+| SFT 专用 | 数据集、merger、双视图、输出格式、打乱 |
+| 在线算法专用 | `train_set`、`tasks_per_round`（1–16）、group 大小、轮数、采样 temperature、`clip_epsilon`、runtime；DAPO 另有 `clip_epsilon_high`（默认 0.28） |
+| 通用 | LoRA / 全参数、学习率、epoch、梯度累积、micro-batch、预处理缓存、梯度检查点、seed |
 | `eval_set` | 训练成功后自动在这个题目集上评测 |
 | `checkpoint_every` | 每 N 轮 / N 个 epoch 保留一个 checkpoint |
+
+表单的默认值是推箱子在线 RL 目前最建议的配置，来自最近几个跑通的 H800 实验（`run_a58c3b10…`、`run_39185a4e…`、`run_658aa22c…`）和 11-24 的加速实测：
+
+| 设置 | 默认 | 依据 |
+|---|---|---|
+| 算法 / 资源 | Dr. GRPO / H800 | 多步任务里不按轨迹长度归一；H800 每个实验常驻 2 张卡，rollout 用 sglang |
+| 题目 | `sokoban-train` 训练，`sokoban-validation` 自动评测 | 评测题训练时没见过 |
+| 轮数 × 每轮题数 × group | 12 × 4 × 8 | 每轮 32 条 rollout；group 8 比 4 更容易在组内出现成功和失败 |
+| 步数 / 采样 temperature | 20 / 1.0 | 训练题最优解 4–10 步；组内要有 reward 差异 |
+| 微调 / 学习率 | 全参数 / 1e-6 | 1e-7 时 BF16 几乎舍掉全部更新，1e-5 曾破坏输出格式 |
+| 梯度累积 / micro-batch | 16 / 1 | 一轮约 20–30 次更新；batch 4 只快 10%，显存接近 80 GB |
+| 预处理缓存 / 梯度检查点 | 开 / 关 | 预处理时间减半；关检查点训练快约 21%，显存 30 GB |
+| 自动评测 | 每题 1 次，temperature 0 | 贪心解码重复结果基本相同 |
+
+评测表单默认在 H800 上用 `sokoban-validation`、每题 1 次、20 步、temperature 0。每个输入框下的说明写了它的作用和取值依据。
 
 训练配置是白名单字段，路径和命令只在服务端解析，客户端不能传任意命令。
 
@@ -184,7 +200,7 @@ flowchart LR
 
 ### 4. 评测
 
-在**评测**页展开"新建评测"，选模型（checkpoint 默认折叠）、runtime、推理资源和题目（单个任务或题目集，最多 8 题）。建议主评测用 `temperature=0`，结果可复现，不同模型之间可以直接比较。
+在**评测**页展开"新建评测"，选模型（checkpoint 默认折叠，最多 6 个）、runtime、推理资源和题目（单个任务或题目集，最多 48 题）。一次评测最多 2304 个 trial（模型数 × 题数 × 每题次数）。建议主评测用 `temperature=0`，结果可复现，不同模型之间可以直接比较。
 
 ### 5. API 示例
 
@@ -242,7 +258,8 @@ flowchart LR
 
 | 场景 | 推荐 | 原因 |
 |---|---|---|
-| 首次跑通、作为基线 | GRPO | 实现最简单，便于和已有实验对比 |
+| 推箱子这类多步任务（表单默认） | Dr. GRPO | 不按 rollout 长度归一，短的成功轨迹不会被压低权重；advantage 不除 std |
+| 和早期实验对比、作为基线 | GRPO | 实现最简单，最早的几个实验都是它 |
 | 题目太简单或太难，很多组的 reward 全相同 | GiGPO，或换题目集 | GRPO、DAPO、Dr. GRPO 会整组跳过这些组，有效样本变少。GiGPO 在都通关的组里仍能区分步数多少。根本办法是让题目难度和模型能力匹配 |
 | `max_steps` 设得偏小，很多 rollout 被截断 | DAPO | 截断过滤不把"没走完"当失败 |
 | 失败 rollout 越来越长、模型学会拖步数 | DAPO 或 Dr. GRPO | 两者都不再按 rollout 长度摊薄惩罚 |
@@ -425,7 +442,12 @@ Firecracker 的快照在虚拟机层面保存整台 guest 的内存和设备状�
 | UI dump 复用：`observe` 直接用上一次 `execute` 结尾的 dump | 推箱子每步 `execute + observe` 中位 7.0 → 2.59 秒，整次评测少 29% |
 | 刚启动后第一个任务的重试：等 fixture 时 dump 失败继续轮询；Docker `adb root` 被拒重试 30 秒 | Firecracker 冷启动 16 并发 48 个首任务全部成功，Docker 评测 8/8 |
 | H800 SFT：真实 micro-batch、CPU 预处理缓存、关闭梯度检查点 | 吞吐是基线的 4.2 倍（3.0 样本/秒） |
-| Qwen3-VL 视觉 Conv3d 换成等价矩阵乘法（H800 镜像 torch 2.9） | 一张截图 19.8 秒 → 5 毫秒 |
+| Qwen3-VL 视觉 Conv3d 换成等价矩阵乘法 | 旧 H800 镜像（torch 2.9）一张截图 19.8 秒 → 5 毫秒；现镜像（torch 2.14）Conv3d 本身 0.7 毫秒，补丁保留 |
+| H800 rollout 改用 sglang（连续批处理） | 每轮 rollout（32 条轨迹）789–1355 秒 → 91–114 秒 |
+| H800 在线 RL 按 run 常驻 pod：训练 worker 常驻、sglang 每轮热更新权重、4090 拷贝改后台 | 每轮固定开销约 11.8 → 1–2 分钟（热更新约 0.5 分钟，训练进程内加载和保存约 0.7 分钟）；第 9 轮规模（约 440 行）一轮约 23 → 约 11 分钟（`run_658aa22c…`，含下面几项训练加速） |
+| H800 训练装 flash-linear-attention + causal-conv1d（线性注意力层的 kernel） | dr_grpo 训练快 35%（Triton 缓存热时 47 → 31 秒 / 32 行） |
+| 在线 RL 关闭梯度检查点、预处理缓存 | 训练快 21%（显存 20 → 30 GB）；old_logprob 与训练共用预处理，预处理时间减半 |
+| 策略 logprob 只对 completion 位置做 fp32 log_softmax | 每行少约 1.3 GB 显存（24.8 万词表 × 约 1300 个 prompt token） |
 | GRPO logprob 按采样 temperature 计算 | T=0.7 时训推 logprob 最大差从 1.57 降到 0.20 |
 | 截图直传 MinIO + 每日按引用 GC | 本地不堆积 PNG，只删 30 天以上且无引用的对象 |
 
@@ -436,7 +458,10 @@ Firecracker 的快照在虚拟机层面保存整台 guest 的内存和设备状�
 - 崩溃 sandbox 留下的 ADB offline 条目会在共享 ADB 容器里累积，要重启 `alvarez-adb-host-runtime` 才清掉。
 - 模板 6.3 GB，rootfs、内核、Firecracker 或 VM 配置变了要重做；旧模板手动删除，有 sandbox 在用时不能改或删。
 - Docker backend 的 privileged 模式不适合多租户；Docker Desktop 只有配置说明，未在目标平台实测。
-- 在线强化学习还没有在题目集上做出过有效提升（BF16 全参数在 lr 1e-7 下几乎不改变权重，已改为支持 LoRA）。DAPO、Dr. GRPO、GiGPO 还没有真实实验。
+- H800 所有 Pod 用 `sglang_v0.5.23:base` 镜像（torch 2.14.1+cu130）。部分节点驱动是 535（CUDA 12.2），Pod 脚本在驱动低于 580 时自动加镜像内的 CUDA 13 compat 库；sglang 0.5.23 的补丁依赖其内部实现，换镜像前要重新探测。
+- H800 在线 RL 每个 run 常驻 2 张 H800（训练 worker 一张、sglang rollout 一张），包括空闲阶段，run 结束才释放，见 [docs/h800-resident-pods.md](docs/h800-resident-pods.md)。H800 是 best-effort 资源，集群会把常驻 pod 挪到别的节点；挪到没有镜像的节点要重新拉镜像（约 5.5 分钟），worker 和 rollout 服务会从当前轮继续。人为卡死触发 livenessProbe 重启、单轮重启超过 5 次让 run 失败，只有单测覆盖，没在集群上实测。
+- fla 的 Triton kernel 在新 Pod 第一次遇到新的序列形状时要编译 / autotune，开头几步会变慢；编译结果缓存在 CFS。
+- 在线强化学习还没有证明能在题目集上带来提升。全参数 lr 1e-7 时 BF16 几乎舍掉全部更新（`run_ea0d1df4…` 12 轮后与基础模型逐关结果相同），默认学习率已改为 1e-6。lr 1e-6 的 Dr. GRPO（`run_a58c3b10…`）和 GiGPO（`run_39185a4e…`）各跑完 12 轮全参数训练，每轮 rollout 成功率在 0.09–0.84 之间波动；但每轮抽到的题不同，单轮成功率主要反映题目难度，不能说明模型变好。这两个实验在 `sokoban-validation` 上的对比评测被取消，还没有结果。DAPO 还没有真实实验。
 
 ## 相关文档
 
@@ -444,4 +469,7 @@ Firecracker 的快照在虚拟机层面保存整台 guest 的内存和设备状�
 - [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)：交付状态和后续计划
 - [docs/adr/0001-local-environment.md](docs/adr/0001-local-environment.md)：环境、多节点拓扑和运维细节
 - [docs/firecracker-template-clone.md](docs/firecracker-template-clone.md)：模板克隆的设计方案
+- [docs/h800-sglang-rollout.md](docs/h800-sglang-rollout.md)：H800 rollout 改用 sglang 的方案与验证
+- [docs/h800-sglang-evaluation.md](docs/h800-sglang-evaluation.md)：H800 评测改用 sglang 的方案
+- [docs/h800-resident-pods.md](docs/h800-resident-pods.md)：H800 在线 RL 按 run 常驻 pod 的方案与验证
 - [docs/sokoban-sft.md](docs/sokoban-sft.md)、[docs/sokoban-sft-v2.md](docs/sokoban-sft-v2.md)：推箱子 SFT 实验

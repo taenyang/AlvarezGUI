@@ -173,13 +173,13 @@ class TrainingRunRequest(BaseModel):
 
     @model_validator(mode="after")
     def _data_source(self) -> "TrainingRunRequest":
-        # Policy algorithms may use language LoRA (FP32 adapter); the rest of the recipe stays SFT-only.
+        # Policy algorithms may use language LoRA (FP32 adapter), micro-batches and the preprocessing cache;
+        # the rest of the recipe stays SFT-only.
         if self.algorithm != "sft" and (
             self.config.output_format != "action-v1"
-            or self.config.train_merger_mlp or self.config.multiview
-            or self.config.batch_size > 1 or self.config.cache_preprocessed or self.config.shuffle
+            or self.config.train_merger_mlp or self.config.multiview or self.config.shuffle
         ):
-            raise ValueError("merger, multiview, batching, caching, shuffling and structured output currently require SFT")
+            raise ValueError("merger, multiview, shuffling and structured output currently require SFT")
         if self.config.train_merger_mlp and self.config.finetuning_method != "lora":
             raise ValueError("train_merger_mlp requires LoRA")
         if self.algorithm == "sft" and self.dataset_version is None:

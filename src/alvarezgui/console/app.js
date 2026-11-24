@@ -660,9 +660,9 @@ function algorithmLabel(algorithm) {
 }
 
 // Config knobs each algorithm consumes; the form shows and submits only these.
-const SHARED_KNOBS = ["accelerator", "learning_rate", "epochs", "gradient_accumulation", "gradient_checkpointing", "max_steps", "checkpoint_every", "eval_trials", "seed"];
+const SHARED_KNOBS = ["accelerator", "learning_rate", "epochs", "gradient_accumulation", "batch_size", "cache_preprocessed", "gradient_checkpointing", "max_steps", "checkpoint_every", "eval_trials", "seed"];
 const ALGORITHM_KNOBS = {
-  sft: ["finetuning_method", "train_merger_mlp", "multiview", "output_format", "batch_size", "cache_preprocessed", ...SHARED_KNOBS],
+  sft: ["finetuning_method", "train_merger_mlp", "multiview", "output_format", ...SHARED_KNOBS],
   grpo: ["rounds", "tasks_per_round", "group_size", "temperature", "clip_epsilon", ...SHARED_KNOBS],
 };
 ALGORITHM_KNOBS.dapo = [...ALGORITHM_KNOBS.grpo, "clip_epsilon_high"];
@@ -726,11 +726,11 @@ function runForm(catalog) {
     algorithm: h("select", {},
       h("option", { value: "grpo" }, "GRPO（在线 rollout）"),
       h("option", { value: "dapo" }, "DAPO（动态采样 · clip-higher · 截断过滤）"),
-      h("option", { value: "dr_grpo" }, "Dr. GRPO（去掉 std 与长度归一）"),
+      h("option", { value: "dr_grpo", selected: true }, "Dr. GRPO（去掉 std 与长度归一）"),
       h("option", { value: "gigpo" }, "GiGPO（episode + 相同状态步骤级优势）"),
       h("option", { value: "sft" }, "SFT（离线数据集）")),
-    accelerator: h("select", {}, h("option", { value: "h800" }, "H800（按需创建 Pod，可并行）"), h("option", { value: "4090" }, "4090（常驻，单任务）")),
-    finetuning_method: h("select", {}, h("option", { value: "full" }, "全参数"), h("option", { value: "lora" }, "LoRA（仅 SFT，FP32 adapter）")),
+    accelerator: h("select", {}, h("option", { value: "h800" }, "H800（每个实验独立 Pod，可并行）"), h("option", { value: "4090" }, "4090（共用一张卡，一次一个实验）")),
+    finetuning_method: h("select", {}, h("option", { value: "full" }, "全参数"), h("option", { value: "lora" }, "LoRA（FP32 adapter）")),
     train_merger_mlp: h("input", { type: "checkbox" }),
     multiview: h("input", { type: "checkbox" }),
     output_format: h("select", {}, h("option", { value: "action-v1" }, "动作 JSON"), h("option", { value: "sokoban-plan-v1" }, "推箱子：棋盘 / 决策 / 动作")),
@@ -744,20 +744,20 @@ function runForm(catalog) {
         "option", { value: `ds:${d.dataset_version}` }, `${d.dataset_version}（${d.sample_count} 条）`)))),
     eval_set: h("select", {}, catalog.task_sets.map((s) => h(
       "option", { value: s.name, selected: s.name === "sokoban-validation" }, taskSetLabel(s)))),
-    rounds: h("input", { type: "number", min: 1, max: 20, value: 2 }),
+    rounds: h("input", { type: "number", min: 1, max: 20, value: 12 }),
     tasks_per_round: h("input", { type: "number", min: 1, max: 16, value: 4 }),
-    group_size: h("input", { type: "number", min: 2, max: 16, value: 4 }),
+    group_size: h("input", { type: "number", min: 2, max: 16, value: 8 }),
     temperature: h("input", { type: "number", min: 0, max: 2, step: 0.1, value: 1.0 }),
-    max_steps: h("input", { type: "number", min: 1, max: 50, value: 3 }),
-    learning_rate: h("input", { type: "number", min: 1e-9, max: 1e-3, step: "any", value: 1e-7 }),
+    max_steps: h("input", { type: "number", min: 1, max: 50, value: 20 }),
+    learning_rate: h("input", { type: "number", min: 1e-9, max: 1e-3, step: "any", value: 1e-6 }),
     epochs: h("input", { type: "number", min: 1, max: 10, value: 1 }),
-    gradient_accumulation: h("input", { type: "number", min: 1, max: 64, value: 1 }),
+    gradient_accumulation: h("input", { type: "number", min: 1, max: 64, value: 16 }),
     batch_size: h("input", { type: "number", min: 1, max: 16, value: 1 }),
-    cache_preprocessed: h("input", { type: "checkbox" }),
-    gradient_checkpointing: h("input", { type: "checkbox", checked: true }),
+    cache_preprocessed: h("input", { type: "checkbox", checked: true }),
+    gradient_checkpointing: h("input", { type: "checkbox" }),
     clip_epsilon: h("input", { type: "number", min: 0.01, max: 1, step: 0.01, value: 0.2 }),
     clip_epsilon_high: h("input", { type: "number", min: 0.01, max: 1, step: 0.01, value: 0.28 }),
-    eval_trials: h("input", { type: "number", min: 0, max: 50, value: 4 }),
+    eval_trials: h("input", { type: "number", min: 0, max: 50, value: 1 }),
     checkpoint_every: h("input", { type: "number", min: 1, max: 100, value: 5, placeholder: "只保留正式模型" }),
     seed: h("input", { type: "number", value: 0 }),
   };
@@ -790,28 +790,33 @@ function runForm(catalog) {
       message.replaceChildren(h("p", { class: "error-text" }, `创建失败：${error.message}`));
     } finally { submit.disabled = false; }
   } },
-  field("算法", inputs.algorithm, "都用同一套在线 rollout，区别在 advantage 和每步在 loss 里的权重；对比见使用教程"),
-  knob("accelerator", "训练资源", "H800 每个实验独立 Pod，可并行，checkpoint 复制到 4090；在线 GRPO 每轮在 H800 训练、同步到 4090 后采样"),
-  field("Runtime", inputs.runtime_backend, "由当前服务配置的 runtime worker 执行；Docker 不支持快照"),
-  field("基础模型", inputs.base_model, models.length ? "也可以选择 checkpoint 继续训练" : "尚未注册模型，请先运行 import_artifacts"),
-  field("模型产物名称", inputs.model_name, "可选；只允许字母、数字、点、下划线和短横线，round 会自动追加版本后缀"),
-  field("数据集", inputs.data, "在线算法选题目集时每轮抽题在线 rollout，选轨迹数据集时离线训练；SFT 只能选轨迹数据集。详见数据管理"),
-  knob("finetuning_method", "微调方式", "LoRA：rank=16 / alpha=32，语言侧注意力层"),
+  field("算法", inputs.algorithm, "4 种在线算法共用同一套 rollout，只是 advantage 和每步 loss 权重不同（见使用教程）。默认 Dr. GRPO：多步推箱子里不按轨迹长度归一，短的成功轨迹不会被压低权重"),
+  knob("accelerator", "训练资源", "H800：在线算法每个实验常驻 2 张卡（训练 + sglang 采样），整个实验期间都占着；每轮 checkpoint 后台复制到 4090。4090：和评测、模型服务共用一张卡，一次只跑一个实验"),
+  field("Runtime", inputs.runtime_backend, "rollout 用的 Android 环境。Firecracker：microVM，模板快照克隆约 1 秒就绪；Docker：Redroid 容器，不支持快照，截图与 Firecracker 不完全相同，成功率不能直接比"),
+  field("基础模型", inputs.base_model, models.length ? "也可以选择 checkpoint 接着训练。在线算法要求完整权重；LoRA adapter 只能继续 LoRA SFT" : "尚未注册模型，请先运行 import_artifacts"),
+  field("模型产物名称", inputs.model_name, "可选，默认用实验 ID。只允许字母、数字、点、下划线和短横线；每轮自动加后缀，如 -r0、-r11"),
+  field("数据集", inputs.data, "在线算法选题目集：每轮从中抽题，在真实 Android 上采样。选轨迹数据集则离线训练。SFT 只能选轨迹数据集"),
+  knob("finetuning_method", "微调方式", "全参数：最近几个在线实验都用它。LoRA：rank 16 / alpha 32，只训语言侧注意力层，FP32 adapter，lr 1e-5 时 clip 比例约 45%，需要更小的学习率"),
   knob("train_merger_mlp", "全量训练视觉 merger", "仅 LoRA；额外全量训练视觉-语言投影层（MiniCPM-V：model.merger.mlp.0，约 2,597 万参数；Qwen3-VL：model.visual.merger）"),
-  knob("multiview", "双视图输入", "完整截图 + 棋盘裁剪；推理按 checkpoint 配置自动使用"),
-  knob("output_format", "输出协议", "必须与数据集一致；执行器仍只执行 action"),
-  field("评测题目集", inputs.eval_set, "训练后自动评测用，最多 48 题；应与训练题目集不同，否则测不出泛化"),
-  knob("rounds", "轮数"),
-  knob("tasks_per_round", "每轮题目数", "按 seed 洗牌后依次取题，全部做完一遍才会重复；每轮 rollout 数 = 题目数 × group size"),
-  knob("group_size", "每组 rollout 数 (group size)"),
-  knob("temperature", "采样 temperature", "组内需要 reward 差异，建议 ≥ 0.7"), knob("max_steps", "每条 rollout 最大步数"),
-  knob("learning_rate", "学习率", "1e-5 曾破坏输出格式，默认 1e-7"), knob("epochs", "epochs"),
-  knob("gradient_accumulation", "梯度累积", "有效 batch = micro-batch × 梯度累积"), knob("clip_epsilon", "clip ε"), knob("clip_epsilon_high", "clip ε 上界（DAPO）", "论文默认 0.28，下界仍用 clip ε"),
-  knob("batch_size", "micro-batch", "H800 加速配置为 4（配合梯度累积 1）；需确认显存"),
-  knob("cache_preprocessed", "缓存预处理输入", "CPU 内存换速度；333 条双视图约需 10 GiB 以上"),
-  knob("gradient_checkpointing", "梯度检查点", "关闭更快但显存更高；H800 加速配置为关闭"),
-  knob("checkpoint_every", "checkpoint 保存间隔", "在线算法每 N 轮、SFT 每 N 个 epoch 保留一个 checkpoint；最后一个总是正式模型；留空只保留正式模型"),
-  knob("eval_trials", "训练后每任务评测次数", "0 表示不自动评测"), knob("seed", "随机 seed"),
+  knob("multiview", "双视图输入", "完整截图 + 棋盘裁剪两张图；推理时按 checkpoint 的配置自动使用"),
+  knob("output_format", "输出协议", "必须与数据集一致。结构化输出多出棋盘和决策文本，执行器仍只执行其中的 action"),
+  field("评测题目集", inputs.eval_set, "训练结束后自动评测用，最多 48 题。要和训练题目集不同，否则测不出泛化；选训练集时默认换成 sokoban-validation"),
+  knob("rounds", "轮数", "每轮：用上一轮的策略采样、再训练一次。H800 上一轮约 10 分钟（12 轮约 2 小时），实际随题目和步数变化"),
+  knob("tasks_per_round", "每轮题目数", "按 seed 洗牌后依次取题，题目集做完一遍才会重复。每轮 rollout 数 = 题目数 × group size，默认 4 × 8 = 32"),
+  knob("group_size", "每组 rollout 数 (group size)", "同一道题采样几次，advantage 在组内比较。组内 reward 全相同时这组不参与训练；8 比 4 更容易出现成功和失败混在一组"),
+  knob("temperature", "采样 temperature", "rollout 的采样温度。组内需要 reward 差异，建议 ≥ 0.7；训练时 logprob 也按这个温度计算"),
+  knob("max_steps", "每条 rollout 最大步数", "到步数还没通关记为失败。训练题最优解 4–10 步，20 给模型留出试错的余地"),
+  knob("learning_rate", "学习率", "全参数默认 1e-6：1e-7 时 BF16 几乎舍掉全部更新（12 轮后与基础模型逐关结果相同），1e-5 曾破坏输出格式"),
+  knob("epochs", "epochs", "每轮样本训练几遍。在线算法建议 1：多遍会偏离采样时的策略，clip 比例上升"),
+  knob("gradient_accumulation", "梯度累积", "每多少个样本做一次 optimizer 更新（有效 batch = micro-batch × 梯度累积）。默认 16：一轮约 300–500 行，约 20–30 次更新；设成 1 相当于每个样本更新一次"),
+  knob("clip_epsilon", "clip ε", "PPO-clip 范围：新旧策略概率比超出 1 ± ε 的样本不再贡献梯度"),
+  knob("clip_epsilon_high", "clip ε 上界（DAPO）", "DAPO 的 clip-higher：上界单独放宽到 1 + 这个值（论文 0.28），下界仍用 clip ε"),
+  knob("batch_size", "micro-batch", "一次前向放几个样本。在线算法建议 1：H800 上 batch 4 只快 10%，峰值显存已到 78.7 GB（80 GB 卡），长样本会爆显存。SFT 在 H800 常用 4"),
+  knob("cache_preprocessed", "缓存预处理输入", "把截图预处理结果放在 CPU 内存里复用。在线算法的 old_logprob 和训练共用一份，预处理时间减半；SFT 多个 epoch 也只做一遍。333 条双视图约需 10 GiB 内存"),
+  knob("gradient_checkpointing", "梯度检查点", "开启后反向时重算前向，省显存但更慢。H800 上关闭训练快约 21%，在线算法 batch 1 显存 20 → 30 GB，远低于 80 GB；4090 显存不够时再开"),
+  knob("checkpoint_every", "checkpoint 保存间隔", "在线算法每 N 轮、SFT 每 N 个 epoch 保留一个 checkpoint，其余训练结束后删除；最后一轮总是正式模型。留空只保留正式模型"),
+  knob("eval_trials", "训练后每任务评测次数", "训练成功后在 4090 上对比评测基础模型和正式模型，题目集见上，步数同 rollout，0 表示不评测。自动评测用 temperature 0，同一题重复结果基本相同，所以默认 1"),
+  knob("seed", "随机 seed", "决定抽题顺序和采样 seed；同一个 seed 重跑，每轮抽到的题相同"),
   h("div", { class: "wide row" }, submit, message));
   const syncAlgorithm = () => {
     const visible = new Set(ALGORITHM_KNOBS[inputs.algorithm.value]);
@@ -996,8 +1001,8 @@ function evalForm(catalog) {
   const name = h("input", { type: "text", maxlength: 100, placeholder: "例如 sokoban-baseline" });
   const runtimeBackend = h("select", {}, runtimeBackends.map((backend) => h(
     "option", { value: backend, selected: backend === defaultBackend }, runtimeLabel(backend))));
-  const accelerator = h("select", {}, h("option", { value: "4090" }, "4090（常驻模型服务）"),
-    h("option", { value: "h800" }, "H800（按需部署所选模型）"));
+  const accelerator = h("select", {}, h("option", { value: "h800", selected: true }, "H800（为本次评测部署所选模型）"),
+    h("option", { value: "4090" }, "4090（常驻模型服务）"));
   const formal = models.filter((m) => m.kind !== "checkpoint");
   const modelBoxes = models.map((m) => h("input", { type: "checkbox", value: m.version, checked: m === formal[formal.length - 1] }));
   const boxes = (rows) => h("div", { class: "checks" }, rows.map((m) => h("label", {}, modelBoxes[models.indexOf(m)], modelLabel(m))));
@@ -1005,16 +1010,17 @@ function evalForm(catalog) {
   const evalSets = catalog.task_sets;
   const taskSelect = h("select", {},
     h("optgroup", { label: "单个任务" }, catalog.tasks.map((t, i) => h("option", { value: `task:${i}` }, `${t.label}（${t.app_image}）`))),
-    evalSets.length ? h("optgroup", { label: "题目集" }, evalSets.map((s) => h("option", { value: `set:${s.name}` }, taskSetLabel(s)))) : null);
+    evalSets.length ? h("optgroup", { label: "题目集" }, evalSets.map((s) => h(
+      "option", { value: `set:${s.name}`, selected: s.name === "sokoban-validation" }, taskSetLabel(s)))) : null);
   const selectedTasks = () => (taskSelect.value.startsWith("set:")
     ? evalSets.find((s) => s.name === taskSelect.value.slice(4)).tasks
     : [catalog.tasks[Number(taskSelect.value.slice(5))]]);
   // Every task of a set shares its type's instruction (one Sokoban instruction for all levels).
   const defaultInstruction = () => catalog.tasks.find((t) => t.task_type === selectedTasks()[0]?.task_type)?.instruction || "";
-  const instruction = h("textarea", { value: catalog.tasks[0]?.instruction || "" });
+  const instruction = h("textarea", { value: defaultInstruction() });
   taskSelect.addEventListener("change", () => { instruction.value = defaultInstruction(); });
   const trials = h("input", { type: "number", min: 1, max: 50, value: 1 });
-  const maxSteps = h("input", { type: "number", min: 1, max: 50, value: 5 });
+  const maxSteps = h("input", { type: "number", min: 1, max: 50, value: 20 });
   const temperature = h("input", { type: "number", min: 0, max: 2, step: 0.1, value: 0 });
   const seed = h("input", { type: "number", value: 0 });
   const submit = h("button", { class: "primary", type: "submit", disabled: !models.length }, "开始评测");
@@ -1039,16 +1045,18 @@ function evalForm(catalog) {
       message.replaceChildren(h("p", { class: "error-text" }, `创建失败：${error.message}`));
     } finally { submit.disabled = false; }
   } },
-  h("div", { class: "wide" }, h("div", { class: "secondary" }, "模型 / checkpoint（多选即为对比评测，所有模型使用相同 seed）"),
+  h("div", { class: "wide" }, h("div", { class: "secondary" }, "模型 / checkpoint（最多 6 个；多选即对比评测，所有模型用相同的题目和 seed）"),
     boxes(formal),
     checkpoints.length ? h("details", {}, h("summary", { class: "secondary" }, `Checkpoint（${checkpoints.length} 个）`), boxes(checkpoints)) : null),
-  field("评测名称", name, "可选；不填写时自动生成名称"),
-  field("Runtime", runtimeBackend, "Firecracker 使用 Android microVM；Docker 使用 Android 容器"),
-  field("推理资源", accelerator, "H800 为本次评测单独创建 Pod 并预加载所选模型，加载完成后 trial 才开始；评测结束自动删除"),
-  field("任务 / 题目集", taskSelect, "题目集的每一题都会跑；单次评测最多 48 题、600 个 trial（模型数 × 题数 × 每题次数）"),
-  field("每题 trial 次数", trials, "temperature 为 0 时同一题重复 trial 结果基本相同，要增加样本请用题目集；对比成功率建议总 trial ≥ 20"),
-  field("最大步数", maxSteps), field("temperature", temperature, "0 为贪心解码"), field("起始 seed", seed),
-  h("label", { class: "wide" }, "指令（可修改）", instruction),
+  field("评测名称", name, "可选，不填时自动生成"),
+  field("Runtime", runtimeBackend, "Firecracker：Android microVM，约 1 秒就绪。Docker：Redroid 容器。两者截图不完全相同，成功率只在同一种 runtime 之间比"),
+  field("推理资源", accelerator, "H800：单独起一个 Pod，完整 MiniCPM-V 权重走 sglang 确定性推理（重跑结果一致），LoRA 在 Pod 里合并，其余走 HF；模型加载完 trial 才开始，结束自动删除。4090：常驻 HF 服务，和训练、其他评测共用"),
+  field("任务 / 题目集", taskSelect, "题目集里每题都会跑。默认 sokoban-validation（8 题，训练时没见过）；sokoban-test 已反复用于回归，不宜作泛化结论。单次最多 48 题、2304 个 trial（模型数 × 题数 × 每题次数）"),
+  field("每题 trial 次数", trials, "temperature 0 时同一题重复结果基本相同，默认 1；要更多样本就换更大的题目集。temperature > 0 时才值得重复，对比成功率建议每模型总 trial ≥ 20"),
+  field("最大步数", maxSteps, "到步数还没通关记为失败。推箱子题最优解 4–10 步，默认 20 与训练 rollout 一致"),
+  field("temperature", temperature, "0 为贪心解码，结果可复现，模型之间可以直接比较；> 0 时按采样评估，需要多次 trial"),
+  field("起始 seed", seed, "第 n 次 trial（从 0 数）用 起始 seed + n；temperature 0 时不影响结果"),
+  h("label", { class: "wide" }, "指令（可修改，默认是该任务类型的标准指令；改了之后和其他评测的结果不能直接比）", instruction),
   h("div", { class: "wide row" }, submit, message));
   return h("details", { class: "card" }, h("summary", {}, "新建模型评测"), h("div", { style: "margin-top:12px" }, form));
 }
