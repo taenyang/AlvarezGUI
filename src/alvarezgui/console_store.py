@@ -89,6 +89,10 @@ class ModelEndpointRequest(BaseModel):
         return self
 
 
+class VersionEndpointRequest(ModelEndpointRequest):
+    model_version: str = Field(min_length=1, max_length=200)
+
+
 class ServingFailure(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
 
@@ -454,7 +458,12 @@ class ConsoleStore:
             rows = self.connection.execute(
                 """
                 SELECT ev.eval_id, ev.name, ev.run_id, ev.model_versions, ev.task_set, ev.trials_per_task,
-                       ev.temperature, ev.created_at, ev.accelerator, ev.model_endpoint IS NOT NULL AS model_ready,
+                       ev.temperature, ev.created_at, ev.accelerator,
+                       (ev.model_endpoint IS NOT NULL OR (SELECT count(*) FROM evaluation_model_endpoints AS me
+                        WHERE me.eval_id = ev.eval_id) = jsonb_array_length(ev.model_versions))
+                       AS model_ready,
+                       ARRAY(SELECT me.model_version FROM evaluation_model_endpoints AS me
+                             WHERE me.eval_id = ev.eval_id ORDER BY me.model_version) AS ready_models,
                        min(t.runtime_backend) AS runtime_backend,
                        count(t.task_id) AS trials,
                        count(t.task_id) FILTER (WHERE t.status IN ('QUEUED','ALLOCATING','RUNNING_ENV','WAITING_MODEL'))
@@ -475,7 +484,12 @@ class ConsoleStore:
             evaluation = self.connection.execute(
                 """
                 SELECT ev.eval_id, ev.name, ev.run_id, ev.model_versions, ev.task_set, ev.trials_per_task, ev.max_steps,
-                       ev.temperature, ev.seeds, ev.created_at, ev.accelerator, ev.model_endpoint IS NOT NULL AS model_ready,
+                       ev.temperature, ev.seeds, ev.created_at, ev.accelerator,
+                       (ev.model_endpoint IS NOT NULL OR (SELECT count(*) FROM evaluation_model_endpoints AS me
+                        WHERE me.eval_id = ev.eval_id) = jsonb_array_length(ev.model_versions))
+                       AS model_ready,
+                       ARRAY(SELECT me.model_version FROM evaluation_model_endpoints AS me
+                             WHERE me.eval_id = ev.eval_id ORDER BY me.model_version) AS ready_models,
                        (SELECT min(runtime_backend) FROM tasks WHERE eval_id = ev.eval_id) AS runtime_backend
                 FROM evaluations AS ev WHERE ev.eval_id = %s
                 """,
@@ -522,7 +536,9 @@ class ConsoleStore:
         with self.connection.transaction():
             return self.connection.execute(
                 """
-                SELECT ev.eval_id, ev.model_versions, ev.model_endpoint
+                SELECT ev.eval_id, ev.model_versions, ev.model_endpoint,
+                       COALESCE((SELECT jsonb_object_agg(me.model_version, me.endpoint) FROM evaluation_model_endpoints AS me
+                                 WHERE me.eval_id = ev.eval_id), '{}'::jsonb) AS model_endpoints
                 FROM evaluations AS ev
                 WHERE ev.accelerator = 'h800'
                   AND EXISTS (SELECT 1 FROM tasks AS t WHERE t.eval_id = ev.eval_id AND t.status = ANY(%s))
@@ -531,8 +547,33 @@ class ConsoleStore:
                 (list(ACTIVE_STATUSES),),
             ).fetchall()
 
+    def set_version_endpoint(self, eval_id: str, model_version: str, endpoint: str | None, token: str | None) -> bool:
+        """Publish (or withdraw, with None) one model's H800 service; that model's queued trials wait for it."""
+        with self.connection.transaction():
+            evaluation = self.connection.execute(
+                "SELECT model_versions FROM evaluations WHERE eval_id = %s AND accelerator = 'h800' FOR UPDATE",
+                (eval_id,),
+            ).fetchone()
+            if evaluation is None or model_version not in evaluation["model_versions"]:
+                return False
+            if endpoint is None:
+                self.connection.execute(
+                    "DELETE FROM evaluation_model_endpoints WHERE eval_id = %s AND model_version = %s",
+                    (eval_id, model_version),
+                )
+            else:
+                self.connection.execute(
+                    """
+                    INSERT INTO evaluation_model_endpoints (eval_id, model_version, endpoint, token)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (eval_id, model_version) DO UPDATE SET endpoint = EXCLUDED.endpoint, token = EXCLUDED.token
+                    """,
+                    (eval_id, model_version, endpoint, token),
+                )
+            return True
+
     def set_model_endpoint(self, eval_id: str, endpoint: str | None, token: str | None) -> bool:
-        """Publish (or withdraw, with None) an H800 evaluation's model service; queued trials wait for it."""
+        """Legacy single-pod evaluations: one endpoint for every model; queued trials wait for it."""
         with self.connection.transaction():
             return self.connection.execute(
                 "UPDATE evaluations SET model_endpoint = %s, model_token = %s WHERE eval_id = %s AND accelerator = 'h800'",

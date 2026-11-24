@@ -28,6 +28,7 @@ from alvarezgui.console_store import (
     StillActiveError,
     EvaluationRequest,
     ModelEndpointRequest,
+    VersionEndpointRequest,
     NodeHeartbeat,
     RolloutRequest,
     RolloutRetryRequest,
@@ -1013,6 +1014,16 @@ def create_app(
         if not ConsoleStore(connection).set_model_endpoint(eval_id, request.endpoint, request.token):
             raise HTTPException(status_code=404, detail="H800 evaluation not found")
         return {"eval_id": eval_id, "model_ready": request.endpoint is not None}
+
+    @app.put("/internal/v1/evaluations/{eval_id}/version-endpoint")
+    def publish_version_endpoint(
+        eval_id: str, request: VersionEndpointRequest, connection: psycopg.Connection = Depends(database)
+    ) -> dict:
+        """One H800 pod per model: that model's trials start once its own service is published."""
+        if not ConsoleStore(connection).set_version_endpoint(eval_id, request.model_version, request.endpoint,
+                                                             request.token):
+            raise HTTPException(status_code=404, detail="H800 evaluation or model version not found")
+        return {"eval_id": eval_id, "model_version": request.model_version, "model_ready": request.endpoint is not None}
 
     @app.put("/internal/v1/training/runs/{run_id}/model-endpoint")
     def publish_training_model_endpoint(

@@ -130,9 +130,14 @@ ROLLOUT_PROBE_COMMAND = (
 )
 
 
-def rollout_probes(work: Path) -> dict[str, Any]:
+def rollout_probes(work: Path, models: int = 1) -> dict[str, Any]:
+    """Probes for a pod running the sglang adapter: rollout (one model) or evaluation (models start one by one).
+
+    Startup allows image pull plus ~5 minutes per model; a hung start (e.g. a server that lost its port) is
+    then restarted by kubelet instead of holding every queued trial.
+    """
     command = ["bash", "-c", ROLLOUT_PROBE_COMMAND.format(work=work)]
-    return {"startupProbe": {"exec": {"command": command}, "periodSeconds": 10, "failureThreshold": 90},
+    return {"startupProbe": {"exec": {"command": command}, "periodSeconds": 10, "failureThreshold": 60 + 30 * models},
             "livenessProbe": {"exec": {"command": command}, "periodSeconds": 10, "failureThreshold": 3,
                               "timeoutSeconds": 10}}
 
@@ -882,49 +887,77 @@ class H800Launcher:
             work = self.serving_root / eval_id
             if work.is_dir() and not (work / "spec.json").exists() and not (work / "DONE").exists():
                 shutil.rmtree(work)  # The launcher stopped while staging; start over.
-            # ponytail: one pod per evaluation, capped by serving_limit; share pods if evaluations pile up.
+            # One pod (one H800) per model. The cluster has no fixed card quota: pods that do not fit stay Pending
+            # until the scheduler places them, and each model's trials start once its own pod is up. The console
+            # limit (in evaluations) only holds back new evaluations; lowering it never stops running pods.
             if not work.exists() and len(self.serving_dirs()) < self.serving_limit:
                 self.start_serving(evaluation)
 
+    @staticmethod
+    def model_dirs(work: Path) -> list[Path]:
+        """An evaluation's per-model serving directories (empty for legacy single-pod evaluations)."""
+        models = work / "models"
+        return sorted(path for path in models.iterdir() if (path / "spec.json").is_file()) if models.is_dir() else []
+
+    @staticmethod
+    def model_pod_name(eval_id: str, index: int) -> str:
+        return f"alvarez-eval-{eval_id.removeprefix('eval_')[:12]}-m{index}"
+
+    def apply_model_pod(self, eval_id: str, model_work: Path) -> str:
+        spec = json.loads((model_work / "spec.json").read_text())
+        name = self.model_pod_name(eval_id, spec["index"])
+        (model_work / "ready.json").unlink(missing_ok=True)  # The new pod announces its own port.
+        self.kube("apply", "-f", "-", stdin=json.dumps(deployment_manifest(
+            self.template(), name, eval_id, model_work / "pod.sh", rollout_probes(model_work))))
+        return name
+
     def apply_serving(self, eval_id: str, work: Path) -> str:
+        """Legacy single-pod evaluations (staged before one pod per model)."""
         name = f"alvarez-eval-{eval_id.removeprefix('eval_')[:12]}"
-        self.kube("apply", "-f", "-", stdin=json.dumps(deployment_manifest(self.template(), name, eval_id, work / "pod.sh")))
+        models = len(json.loads((work / "spec.json").read_text())["models"]) if (work / "spec.json").exists() else 1
+        self.kube("apply", "-f", "-", stdin=json.dumps(deployment_manifest(
+            self.template(), name, eval_id, work / "pod.sh", rollout_probes(work, models))))
         return name
 
     def start_serving(self, evaluation: dict[str, Any]) -> None:
+        """One pod per model: each has its own directory, token and endpoint, and fails or restarts alone.
+
+        Per model: sglang for full MiniCPM-V 4.7 weights or a LoRA over them (merged in its pod), else HF.
+        See docs/h800-sglang-evaluation.md.
+        """
         eval_id = evaluation["eval_id"]
         work = self.serving_root / eval_id
         work.mkdir(parents=True)
         try:
-            # Per model: sglang for full MiniCPM-V 4.7 weights or a LoRA over them (merged in the pod), else HF.
-            # See docs/h800-sglang-evaluation.md.
-            models: dict[str, dict[str, str]] = {}
-            for version in evaluation["model_versions"]:
+            self.snapshot_source(work)
+            for index, version in enumerate(evaluation["model_versions"]):
                 path = self.serving_model(version)
                 entry = {"path": str(path), "backend": "sglang" if sglang_servable(path) else "hf"}
                 if sglang_mergeable(path):
                     entry = {"path": str(path), "backend": "sglang",
                              "merged_copy": str(work / "merged" / quote(version, safe=""))}
-                models[version] = entry
-            sglang = any(entry["backend"] == "sglang" for entry in models.values())
-            token = work / "token"
-            token.touch(mode=0o600)
-            token.write_text(secrets.token_urlsafe(32))
-            self.snapshot_source(work)
-            script = SGLANG_POD_SCRIPT if sglang else SERVE_POD_SCRIPT
-            (work / "pod.sh").write_text(script.format(work=work, root=self.root, src=work / "src"))
+                model_work = work / "models" / str(index)
+                model_work.mkdir(parents=True)
+                token = model_work / "token"
+                token.touch(mode=0o600)
+                token.write_text(secrets.token_urlsafe(32))
+                script = SGLANG_POD_SCRIPT if entry["backend"] == "sglang" else SERVE_POD_SCRIPT
+                (model_work / "pod.sh").write_text(script.format(work=model_work, root=self.root, src=work / "src"))
+                (model_work / "spec.json").write_text(json.dumps(
+                    {"eval_id": eval_id, "index": index, "model_version": version, "models": {version: entry},
+                     "sglang_memory": 0.8,  # The pod's card is this model's alone.
+                     # Greedy reruns agree 97.9% by default, 100% with this at 11.4 req/s vs 13.9 (sglang-eval-parity-20261124).
+                     "sglang_args": ["--enable-deterministic-inference"]}, indent=2))
+                self.apply_model_pod(eval_id, model_work)
             # Written last: a directory without spec.json is an interrupted start (see tick_evaluations).
             (work / "spec.json").write_text(json.dumps(
-                {"eval_id": eval_id, "models": models, "sglang_memory": 0.8,
-                 # Greedy reruns agree 97.9% by default, 100% with this at 11.4 req/s vs 13.9 (sglang-eval-parity-20261124).
-                 "sglang_args": ["--enable-deterministic-inference"]}, indent=2))
-            name = self.apply_serving(eval_id, work)
+                {"eval_id": eval_id, "pods": "per-model", "models": evaluation["model_versions"]}, indent=2))
         except Exception as exc:
             log.exception("evaluation %s: staging failed", eval_id)
             self.serving_failed(eval_id, work, f"H800 model staging failed: {exc}")
             return
-        log.info("evaluation %s: created deployment %s for %s", eval_id, name,
-                 {version: entry["backend"] for version, entry in models.items()})
+        log.info("evaluation %s: created %d model pods for %s", eval_id, len(evaluation["model_versions"]),
+                 evaluation["model_versions"])
 
     def serving_model(self, version: str) -> Path:
         """CFS path of a registered model: the launcher's own original, else a copy from the 4090."""
@@ -939,6 +972,37 @@ class H800Launcher:
         return self.stage_model(path)
 
     def advance_serving(self, evaluation: dict[str, Any], work: Path) -> None:
+        if not self.model_dirs(work):
+            return self.advance_single_pod(evaluation, work)
+        eval_id = evaluation["eval_id"]
+        published = evaluation.get("model_endpoints") or {}
+        for model_work in self.model_dirs(work):
+            spec = json.loads((model_work / "spec.json").read_text())
+            version, name = spec["model_version"], self.model_pod_name(eval_id, spec["index"])
+            if (model_work / "FAILED").exists():
+                # ponytail: one model's failure fails the whole evaluation, as before; per-model cancellation
+                # would need the control plane to cancel only that version's trials.
+                self.serving_failed(eval_id, work, f"H800 model service for {version} failed: "
+                                    + (model_work / "FAILED").read_text()[-1500:])
+                return
+            if not self.kube("get", "deployment", name, "--ignore-not-found", "-o", "name").strip():
+                self.apply_model_pod(eval_id, model_work)
+                log.info("evaluation %s: recreated missing deployment %s for %s", eval_id, name, version)
+                continue
+            if self.restarts(name) > MAX_CONTAINER_RESTARTS:
+                self.serving_failed(eval_id, work, f"H800 model service for {version} restarted more than "
+                                    f"{MAX_CONTAINER_RESTARTS} times; see {model_work}/sglang.log")
+                return
+            token = (model_work / "token").read_text().strip()
+            endpoint = self.serving_endpoint(f"gpu-be-label={name}", model_work)
+            target = endpoint if endpoint is not None and self.healthy(endpoint, token) else None
+            if target != published.get(version):
+                self.cp.call("PUT", f"/internal/v1/evaluations/{eval_id}/version-endpoint",
+                             {"model_version": version, "endpoint": target, "token": token if target else None})
+                log.info("evaluation %s: %s endpoint %s", eval_id, version, target or "withdrawn")
+
+    def advance_single_pod(self, evaluation: dict[str, Any], work: Path) -> None:
+        """Legacy single-pod evaluations (staged before one pod per model)."""
         eval_id = evaluation["eval_id"]
         if (work / "FAILED").exists():
             self.serving_failed(eval_id, work, "H800 model service failed: " + (work / "FAILED").read_text()[-1500:])
@@ -983,16 +1047,26 @@ class H800Launcher:
         self.stop_serving(eval_id, work, "failed: " + message[:500])
 
     def stop_serving(self, eval_id: str, work: Path, reason: str) -> None:
-        self.delete_deployment(eval_id)
-        self._ignore_missing("PUT", f"/internal/v1/evaluations/{eval_id}/model-endpoint",
-                             {"endpoint": None, "token": None})
-        (work / "token").unlink(missing_ok=True)
-        spec_path = work / "spec.json"
-        # Only the merged copies spec.json records; registered checkpoints are never touched.
-        for entry in (json.loads(spec_path.read_text())["models"].values() if spec_path.exists() else ()):
-            if isinstance(entry, dict) and entry.get("merged_copy"):
-                for path in (entry["merged_copy"], entry["merged_copy"] + ".tmp"):  # .tmp: an interrupted merge.
-                    shutil.rmtree(path, ignore_errors=True)
+        self.delete_deployment(eval_id)  # Every model pod: they share the evaluation's alvarez-run label.
+        model_dirs = self.model_dirs(work)
+        if model_dirs:
+            for model_work in model_dirs:
+                version = json.loads((model_work / "spec.json").read_text())["model_version"]
+                self._ignore_missing("PUT", f"/internal/v1/evaluations/{eval_id}/version-endpoint",
+                                     {"model_version": version, "endpoint": None, "token": None})
+                (model_work / "token").unlink(missing_ok=True)
+        else:
+            self._ignore_missing("PUT", f"/internal/v1/evaluations/{eval_id}/model-endpoint",
+                                 {"endpoint": None, "token": None})
+            (work / "token").unlink(missing_ok=True)
+        # Only the merged copies a spec records; registered checkpoints are never touched.
+        specs = [model_work / "spec.json" for model_work in model_dirs] or [work / "spec.json"]
+        for spec_path in specs:
+            models = json.loads(spec_path.read_text()).get("models", {}) if spec_path.exists() else {}
+            for entry in (models.values() if isinstance(models, dict) else ()):
+                if isinstance(entry, dict) and entry.get("merged_copy"):
+                    for path in (entry["merged_copy"], entry["merged_copy"] + ".tmp"):  # .tmp: an interrupted merge.
+                        shutil.rmtree(path, ignore_errors=True)
         (work / "DONE").write_text(reason + "\n")
         log.info("evaluation %s: serving stopped (%s); deployment deleted", eval_id, reason)
 
@@ -1120,7 +1194,7 @@ def main() -> None:
     serve.add_argument("--template-deployment", required=True)
     serve.add_argument("--max-runs", type=int, default=4, help="ceiling for concurrent H800 training pods (console adjusts within)")
     serve.add_argument("--serving-host", default=SERVING_HOST)
-    serve.add_argument("--max-serving", type=int, default=2, help="ceiling for concurrent H800 evaluation pods (console adjusts within)")
+    serve.add_argument("--max-serving", type=int, default=2, help="ceiling for concurrent H800 evaluations, each one pod per model (console adjusts within)")
     pod = commands.add_parser("pod")
     pod.add_argument("run_dir", type=Path)
     serve_pod_parser = commands.add_parser("serve-pod")

@@ -11,6 +11,7 @@ import base64
 import json
 import math
 import os
+import random
 import signal
 import socket
 import subprocess
@@ -120,18 +121,63 @@ class SglangService:
                                  output_format=self.output_format, entropy=entropy)
 
 
-def _free_port() -> int:
-    # Bind-and-release races other host-network processes, as do sglang's own internal ports; _start retries.
+def _reserved_ports() -> set[int]:
+    """The node's ``ip_local_reserved_ports``: ports set aside for services that bind them by number."""
+    try:
+        text = Path("/proc/sys/net/ipv4/ip_local_reserved_ports").read_text().strip()
+    except OSError:
+        return set()
+    reserved: set[int] = set()
+    for part in filter(None, text.split(",")):
+        low, _, high = part.partition("-")
+        reserved.update(range(int(low), int(high or low) + 1))
+    return reserved
+
+
+def _free_port(low: int = 20000, high: int = 29000, attempts: int = 64) -> int:
+    """A free port for sglang's HTTP server, picked at random from ``low``-``high``, outside reserved ports.
+
+    ``bind(0)`` hands out the lowest free ephemeral port. On the H800 nodes (host network, ephemeral range
+    10000-61000 with 6676-18000 and 30000-61000 reserved) that is 18001-18015 almost every time, the same few
+    ports other pods' sglang servers take next, so conflicts repeated (eval_423508c1). Random picks in
+    20000-29000 spread out; sglang's derived ports (port + 233 + 0..6) stay below the reserved 30000.
+    Bind-and-release still races; ``_start`` retries on a conflict.
+    """
+    reserved = _reserved_ports()
+    candidates = [port for port in range(low, high + 1) if port not in reserved]
+    for port in random.sample(candidates, min(attempts, len(candidates))):
+        with socket.socket() as sock:
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
 
 
-def _wait_ready(url: str, process: subprocess.Popen, timeout: float = 900) -> None:
+# sglang's HTTP server fails to bind but its scheduler keeps the process alive (2026-11-24, eval_423508c1):
+# the exit-based retry below never fires, so the log line is the signal.
+PORT_IN_USE = b"address already in use"
+
+
+class PortInUse(RuntimeError):
+    """sglang could not bind its port; the process is still alive and must be killed before a retry."""
+
+
+def _wait_ready(url: str, process: subprocess.Popen, timeout: float = 900, log_path: Path | None = None,
+                log_offset: int = 0) -> None:
+    """Return once ``url`` answers. ``log_path`` from ``log_offset`` on is this process's own output."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError(f"sglang exited with status {process.returncode} before it was ready")
+        if log_path is not None:
+            with log_path.open("rb") as log:
+                log.seek(log_offset)
+                if PORT_IN_USE in log.read():
+                    raise PortInUse(f"{url}: port already in use")
         try:
             with urlopen(f"{url}/health", timeout=5) as response:
                 if response.status == 200:
@@ -142,6 +188,21 @@ def _wait_ready(url: str, process: subprocess.Popen, timeout: float = 900) -> No
     raise RuntimeError(f"sglang was not ready after {timeout:.0f} s")
 
 
+def _kill(process: subprocess.Popen, grace: float = 30) -> None:
+    """SIGTERM the server's process group (scheduler, detokenizer), then SIGKILL; wait so its memory is free."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+    process.wait()
+
+
 def _start(path: str, log_path: Path, current: list[subprocess.Popen], attempts: int = 3,
            memory: float = 0.5, extra: tuple[str, ...] = ()) -> str:
     """Launch sglang until it answers, appending it to ``current`` (so SIGTERM can stop it while starting);
@@ -150,6 +211,7 @@ def _start(path: str, log_path: Path, current: list[subprocess.Popen], attempts:
     for attempt in range(1, attempts + 1):
         port = _free_port()
         with log_path.open("ab") as log:
+            offset = log.tell()
             process = subprocess.Popen(
                 [H800_PYTHON, "-m", "sglang.launch_server", "--model-path", path, "--host", "127.0.0.1",
                  "--port", str(port), "--trust-remote-code", "--mem-fraction-static", f"{memory:.3f}", *extra],
@@ -157,8 +219,15 @@ def _start(path: str, log_path: Path, current: list[subprocess.Popen], attempts:
         current.append(process)
         url = f"http://127.0.0.1:{port}"
         try:
-            _wait_ready(url, process)
+            _wait_ready(url, process, log_path=log_path, log_offset=offset)
             return url
+        except PortInUse:
+            # Its scheduler holds GPU memory: kill the whole process group before the next attempt.
+            _kill(process)
+            if attempt == attempts:
+                raise
+            current.remove(process)
+            print(f"sglang attempt {attempt} could not bind port {port}; retrying on another port", flush=True)
         except RuntimeError:
             if process.poll() is None or attempt == attempts:
                 raise  # Hung (timeout) or out of attempts.
@@ -309,6 +378,9 @@ def run(work: Path) -> None:
             if memory < MIN_SGLANG_MEMORY:
                 raise RuntimeError(f"{len(sglang)} sglang + {len(hf)} HF models leave {memory:.3f} of the GPU "
                                    f"per sglang server (minimum {MIN_SGLANG_MEMORY})")
+        # ponytail: several sglang servers in one pod each size their pools from the memory free when they start,
+        # so later ones get less (eval_7b50ac4b: 1.28 M vs 0.69 M tokens). New H800 evaluations run one model per
+        # pod; this path remains for legacy multi-model specs.
         for version, path in sglang.items():
             # Serial: concurrent CUDA graph captures peak together and run out of memory.
             url = _start(path, work / "sglang.log", current, memory=memory,

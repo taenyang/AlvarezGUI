@@ -1,4 +1,5 @@
 import base64
+import functools
 import importlib.metadata
 import importlib.util
 import json
@@ -178,7 +179,7 @@ class StartRetryTest(unittest.TestCase):
             launched.append(args[args.index("--port") + 1])
             return next(processes)
 
-        def wait_ready(url, process):
+        def wait_ready(url, process, **_):
             if process.poll() is not None:
                 raise RuntimeError("exited")
 
@@ -189,6 +190,57 @@ class StartRetryTest(unittest.TestCase):
             current = []
             url = sglang_adapter._start("/model", Path(directory, "sglang.log"), current)
         self.assertEqual((launched, url, current[0].returncode), (["1111", "2222"], "http://127.0.0.1:2222", None))
+
+    def test_live_server_that_lost_its_port_is_killed_and_retried(self):
+        """eval_423508c1: uvicorn fails to bind but the scheduler keeps the process (and GPU memory) alive."""
+        from alvarezgui import sglang_adapter
+
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory, "sglang.log")
+            log_path.write_bytes(b"earlier attempt: address already in use\n")  # Not this process's output.
+            launched, killed = [], []
+
+            class Process:
+                def __init__(self, port):
+                    self.port, self.pid, self.returncode = port, 4242, None
+
+                def poll(self):
+                    return self.returncode
+
+                def wait(self, timeout=None):
+                    self.returncode = -15
+                    return self.returncode
+
+            def popen(args, stdout, **_):
+                port = args[args.index("--port") + 1]
+                launched.append(port)
+                if port == "1111":  # This attempt's server loses the race for its port.
+                    stdout.write(b"ERROR: [Errno 98] error while attempting to bind on address "
+                                 b"('127.0.0.1', 1111): address already in use\n")
+                    stdout.flush()
+                return Process(port)
+
+            answered = []
+
+            def urlopen(url, timeout):
+                if ":2222/" not in url:
+                    raise OSError("refused")
+                answered.append(url)
+                return type("R", (), {"status": 200, "__enter__": lambda self: self, "__exit__": lambda self, *a: None})()
+
+            # A regression (bind failure not noticed) fails within 5 s instead of waiting out the 900 s default.
+            wait_ready = functools.partial(sglang_adapter._wait_ready, timeout=5)
+            with patch.object(sglang_adapter.subprocess, "Popen", popen), \
+                    patch.object(sglang_adapter, "_wait_ready", wait_ready), \
+                    patch.object(sglang_adapter, "urlopen", urlopen), \
+                    patch.object(sglang_adapter, "_free_port", side_effect=[1111, 2222]), \
+                    patch.object(sglang_adapter.os, "killpg", lambda pid, sig: killed.append((pid, sig))), \
+                    patch.object(sglang_adapter.time, "sleep", lambda _: None):
+                current = []
+                url = sglang_adapter._start("/model", log_path, current)
+            self.assertEqual((launched, url), (["1111", "2222"], "http://127.0.0.1:2222"))
+            self.assertEqual(killed, [(4242, sglang_adapter.signal.SIGTERM)])  # Group killed, not left holding GPU memory.
+            self.assertEqual([process.port for process in current], ["2222"])
 
     def test_run_serves_adapter_once_sglang_is_ready(self):
         from alvarezgui import sglang_adapter
@@ -252,13 +304,20 @@ class EvaluationServingTest(unittest.TestCase):
             launcher.serving_model = lambda version: root / "alvarez-checkpoints" / version
             launcher.start_serving({"eval_id": "eval_1", "model_versions": ["full", "lora", "qwen"]})
             work = root / "alvarez-serving/eval_1"
-            spec = json.loads((work / "spec.json").read_text())
-            self.assertEqual(spec["sglang_args"], ["--enable-deterministic-inference"])
-            models = spec["models"]
+            # One pod per model, each with its own spec, script, token and deployment.
+            specs = [json.loads((work / f"models/{index}/spec.json").read_text()) for index in range(3)]
+            self.assertEqual([spec["model_version"] for spec in specs], ["full", "lora", "qwen"])
+            self.assertTrue(all(spec["sglang_args"] == ["--enable-deterministic-inference"] for spec in specs))
+            models = {spec["model_version"]: spec["models"][spec["model_version"]] for spec in specs}
             self.assertEqual({version: entry["backend"] for version, entry in models.items()},
                              {"full": "sglang", "lora": "sglang", "qwen": "hf"})
             self.assertEqual(models["lora"]["merged_copy"], str(work / "merged/lora"))
-            self.assertIn("sglang-adapter", (work / "pod.sh").read_text())
+            self.assertIn("sglang-adapter", (work / "models/0/pod.sh").read_text())
+            self.assertIn("serve-pod", (work / "models/2/pod.sh").read_text())  # HF model, HF pod.
+            self.assertEqual(sorted(launcher.deployments),
+                             ["alvarez-eval-1-m0", "alvarez-eval-1-m1", "alvarez-eval-1-m2"])
+            tokens = {(work / f"models/{index}/token").read_text() for index in range(3)}
+            self.assertEqual(len(tokens), 3)
             (work / "merged/lora").mkdir(parents=True)
             launcher.stop_serving("eval_1", work, "done")
             self.assertFalse((work / "merged/lora").exists())
@@ -398,3 +457,17 @@ class ResidentSwapTest(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     sglang_adapter.run(work)
             self.assertEqual(started, ["/m/r3-merged"])
+
+
+class FreePortTest(unittest.TestCase):
+    def test_random_port_outside_reserved_and_below_sglang_derived_range(self):
+        """H800 nodes: bind(0) kept returning 18001-18015 (eval_423508c1); reserved ports must be skipped."""
+        from alvarezgui import sglang_adapter
+
+        reserved = "2375,6676-18000,21270-21271,23456,29500,30000-32768,34595,35000-61000"
+        with patch.object(Path, "read_text", return_value=reserved):
+            ports = {sglang_adapter._free_port() for _ in range(100)}
+            self.assertTrue({21270, 23456, 29500}.issubset(sglang_adapter._reserved_ports()))
+        self.assertGreater(len(ports), 50)  # Spread out, not the same few ports every time.
+        self.assertTrue(all(20000 <= port <= 29000 and port not in (21270, 21271, 23456, 29500) for port in ports))
+        self.assertTrue(all(port + 233 + 6 < 30000 for port in ports))

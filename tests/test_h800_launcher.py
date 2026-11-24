@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from alvarezgui.h800_launcher import (
+    MAX_CONTAINER_RESTARTS,
     WORKER_PROBES,
     H800Launcher,
     _read_complete_lines,
@@ -469,50 +470,58 @@ class H800LauncherTest(unittest.TestCase):
             cp.call.side_effect = call
             launcher = FakeLauncher(root, serving, cp)
             launcher.healthy = MagicMock(return_value=True)
-            published = lambda: [body for method, path, body in calls if path.endswith("/model-endpoint")]
+            published = lambda version: [body for method, path, body in calls
+                                         if path.endswith("/version-endpoint") and body["model_version"] == version]
             launcher.tick()
             work = root / "alvarez-serving/eval_1"
-            spec = json.loads((work / "spec.json").read_text())
-            self.assertEqual(spec["models"], {
-                "trained": {"path": str(root / "alvarez-checkpoints/run_x/final"), "backend": "hf"},
-                "cand": {"path": str(root / "alvarez-checkpoints/cand"), "backend": "hf"}})
+            trained, cand = work / "models/0", work / "models/1"
+            self.assertEqual([json.loads((d / "spec.json").read_text())["models"] for d in (trained, cand)], [
+                {"trained": {"path": str(root / "alvarez-checkpoints/run_x/final"), "backend": "hf"}},
+                {"cand": {"path": str(root / "alvarez-checkpoints/cand"), "backend": "hf"}}])
             staged = json.loads((root / "alvarez-checkpoints/cand/adapter_config.json").read_text())
             self.assertEqual(staged["base_model_name_or_path"], str(root / "alvarez-models/M"))
-            self.assertEqual((work / "token").stat().st_mode & 0o777, 0o600)
-            self.assertEqual(list(launcher.deployments), ["alvarez-eval-1"])
-            self.assertEqual(launcher.deployments["alvarez-eval-1"]["metadata"]["labels"]["alvarez-run"], "eval_1")
-            self.assertIn("h800_launcher serve-pod", (work / "pod.sh").read_text())
-            self.assertEqual(published(), [])  # Not listening yet.
+            self.assertEqual((trained / "token").stat().st_mode & 0o777, 0o600)
+            self.assertEqual(sorted(launcher.deployments), ["alvarez-eval-1-m0", "alvarez-eval-1-m1"])
+            self.assertEqual(launcher.deployments["alvarez-eval-1-m0"]["metadata"]["labels"]["alvarez-run"], "eval_1")
+            # A hung start (e.g. sglang lost its port) is restarted by kubelet instead of holding the model's trials.
+            container = launcher.deployments["alvarez-eval-1-m0"]["spec"]["template"]["spec"]["containers"][0]
+            self.assertIn(str(trained / "ready.json"), container["livenessProbe"]["exec"]["command"][2])
+            self.assertEqual(container["startupProbe"]["failureThreshold"], 60 + 30)  # One model per pod.
+            self.assertIn("h800_launcher serve-pod", (trained / "pod.sh").read_text())
+            self.assertEqual((published("trained"), published("cand")), ([], []))  # Not listening yet.
 
-            (work / "ready.json").write_text(json.dumps({"port": 4321}))
+            # Each model publishes as soon as its own pod answers; the other keeps waiting.
+            (trained / "ready.json").write_text(json.dumps({"port": 4321}))
             launcher.tick()
-            token = (work / "token").read_text()
-            self.assertEqual(published(), [{"endpoint": "http://10.0.0.5:4321", "token": token}])
+            token = (trained / "token").read_text()
+            self.assertEqual(published("trained"),
+                             [{"model_version": "trained", "endpoint": "http://10.0.0.5:4321", "token": token}])
+            self.assertEqual(published("cand"), [])
             launcher.healthy.assert_called_with("http://10.0.0.5:4321", token)
-            active[0]["model_endpoint"] = "http://10.0.0.5:4321"
+            active[0]["model_endpoints"] = {"trained": "http://10.0.0.5:4321"}
             launcher.tick()
-            self.assertEqual(len(published()), 1)  # Unchanged endpoint is not republished.
+            self.assertEqual(len(published("trained")), 1)  # Unchanged endpoint is not republished.
             launcher.healthy.return_value = False
             launcher.tick()
-            self.assertEqual(published()[-1], {"endpoint": None, "token": None})
-            active[0]["model_endpoint"] = None
+            self.assertEqual(published("trained")[-1], {"model_version": "trained", "endpoint": None, "token": None})
+            active[0]["model_endpoints"] = {}
 
-            launcher.deployments.clear()  # Deleted externally: recreated.
+            del launcher.deployments["alvarez-eval-1-m1"]  # One model's pod deleted externally: only it is recreated.
             launcher.tick()
-            self.assertEqual(list(launcher.deployments), ["alvarez-eval-1"])
+            self.assertEqual(sorted(launcher.deployments), ["alvarez-eval-1-m0", "alvarez-eval-1-m1"])
 
             active.clear()  # Every trial finished or was canceled.
             launcher.tick()
             self.assertEqual(launcher.deployments, {})
             self.assertTrue((work / "DONE").exists())
-            self.assertFalse((work / "token").exists())
+            self.assertFalse((trained / "token").exists() or (cand / "token").exists())
             launcher.tick()
             self.assertEqual(launcher.deployments, {})
 
             # Pod failure and staging failure both cancel the evaluation's trials and remove the pod.
             active.append({"eval_id": "eval_2", "model_versions": ["trained"], "model_endpoint": None})
             launcher.tick()
-            (root / "alvarez-serving/eval_2/FAILED").write_text("CUDA error")
+            (root / "alvarez-serving/eval_2/models/0/FAILED").write_text("CUDA error")
             launcher.tick()
             failed = [body for method, path, body in calls if path == "/internal/v1/evaluations/eval_2/serving-failed"]
             self.assertIn("CUDA error", failed[0]["message"])
@@ -553,6 +562,39 @@ class H800LauncherTest(unittest.TestCase):
             paths.clear()
             launcher.tick()
             self.assertFalse(any("claim" in path for path in paths))  # 1 active, console limit 1.
+
+
+    def test_every_model_of_an_evaluation_gets_its_own_pod_with_no_card_cap(self) -> None:
+        """H800 has no fixed card quota: a 6-model evaluation gets 6 pods at once (the cluster schedules them)."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory, "cfs")
+            versions = [f"m{index}" for index in range(6)]
+            active = [{"eval_id": "eval_a", "model_versions": versions, "model_endpoints": {}, "model_endpoint": None},
+                      {"eval_id": "eval_b", "model_versions": ["m0"], "model_endpoints": {}, "model_endpoint": None}]
+            cp = MagicMock()
+            cp.call.side_effect = lambda method, path, body=None, *a, **k: active if path.endswith("/evaluations/h800") else {}
+            launcher = FakeLauncher(root, Path(directory, "gpu"), cp)
+            launcher.serving_model = lambda version: Path(directory, version)
+            launcher.serving_limit = 1  # Console limit counts evaluations, not cards.
+            launcher.tick_evaluations()
+            self.assertEqual([path.name for path in launcher.serving_dirs()], ["eval_a"])
+            self.assertEqual(sorted(launcher.deployments), [f"alvarez-eval-a-m{index}" for index in range(6)])
+            launcher.serving_limit = 2
+            launcher.tick_evaluations()
+            self.assertEqual([path.name for path in launcher.serving_dirs()], ["eval_a", "eval_b"])
+
+    def test_model_pod_restart_cap_fails_the_evaluation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory, "cfs")
+            evaluation = {"eval_id": "eval_a", "model_versions": ["m1"], "model_endpoints": {}, "model_endpoint": None}
+            launcher = FakeLauncher(root, Path(directory, "gpu"), MagicMock())
+            launcher.serving_model = lambda version: Path(directory, version)
+            launcher.start_serving(evaluation)
+            launcher.serving_failed = MagicMock()
+            launcher.restarts = MagicMock(return_value=MAX_CONTAINER_RESTARTS + 1)
+            launcher.advance_serving(evaluation, root / "alvarez-serving/eval_a")
+            self.assertIn("m1", launcher.serving_failed.call_args.args[2])
+            self.assertIn("restarted more than", launcher.serving_failed.call_args.args[2])
 
 
 if __name__ == "__main__":

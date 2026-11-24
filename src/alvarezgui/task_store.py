@@ -174,8 +174,11 @@ class TaskStore:
             WHERE t.status = 'QUEUED' AND e.status = 'QUEUED'
               AND t.runtime_backend IN ('firecracker', 'docker')
               AND NOT EXISTS (
+                  -- An H800 trial waits until its own model's service (or a legacy single-pod one) is published.
                   SELECT 1 FROM evaluations AS ev
                   WHERE ev.eval_id = t.eval_id AND ev.accelerator = 'h800' AND ev.model_endpoint IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM evaluation_model_endpoints AS me
+                                    WHERE me.eval_id = t.eval_id AND me.model_version = t.policy_version)
               )
               AND NOT EXISTS (
                   SELECT 1 FROM training_runs AS r
@@ -347,11 +350,13 @@ class TaskStore:
                        t.runtime_backend, e.episode_id, e.status AS episode_status,
                        e.actual_runtime_backend,
                        COALESCE(ev.accelerator, r.config->>'accelerator') AS accelerator,
-                       COALESCE(ev.model_endpoint, r.model_endpoint) AS model_endpoint,
-                       COALESCE(ev.model_token, r.model_token) AS model_token
+                       COALESCE(me.endpoint, ev.model_endpoint, r.model_endpoint) AS model_endpoint,
+                       COALESCE(me.token, ev.model_token, r.model_token) AS model_token
                 FROM tasks AS t
                 JOIN episodes AS e ON e.task_id = t.task_id
                 LEFT JOIN evaluations AS ev ON ev.eval_id = t.eval_id
+                LEFT JOIN evaluation_model_endpoints AS me
+                       ON me.eval_id = t.eval_id AND me.model_version = t.policy_version
                 LEFT JOIN training_runs AS r ON r.run_id = t.run_id
                 WHERE t.task_id = %s AND e.episode_id = %s
                 """,

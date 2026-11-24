@@ -102,7 +102,7 @@ sequenceDiagram
 | 模型服务 | MiniCPM-V-4.7-1B、Qwen3-VL-8B-Instruct；要求输出单个 JSON 动作，格式错误返回 422；load/unload；LoRA 合并成完整权重；上报每次生成的采样熵 |
 | SFT | 全参数或 LoRA（rank 16、alpha 32）、视觉 merger、双视图（完整截图 + 棋盘裁剪）、micro-batch、预处理缓存、每 epoch 打乱；H800 上按 epoch 断点续训 |
 | 在线强化学习 | GRPO、DAPO、Dr. GRPO、GiGPO 共用同一套在线 rollout：每轮用上一轮策略在真实沙箱里采样，按算法计算每一步的 advantage 和 loss 权重，PPO-clip 更新；4090 或 H800 训练；H800 上每个 run 常驻一个训练 worker 和一个 sglang rollout 服务，每轮热更新权重，pod 挂了由 livenessProbe 原地重启或 launcher 重建；运行错误用同一 seed 重试最多 3 次；支持 LoRA、micro-batch 和预处理缓存。见[策略优化算法](#策略优化算法) |
-| 评测 | 选模型（可多选）、runtime、推理资源（4090 常驻或 H800 按需 Pod）、单题或题目集，逐题记录成功、步数和输出格式 |
+| 评测 | 选模型（可多选）、runtime、推理资源（4090 常驻，或 H800 每个模型一个按需 Pod，哪个模型先就绪就先跑）、单题或题目集，逐题记录成功、步数和输出格式 |
 | 模型与数据管理 | 模型 / LoRA / checkpoint 三类分开管理，每个实验一个正式模型；离线轨迹数据集注册；截图存 MinIO，每日按引用 GC |
 
 ## 快速开始
@@ -470,6 +470,6 @@ Firecracker 的快照在虚拟机层面保存整台 guest 的内存和设备状�
 - [docs/adr/0001-local-environment.md](docs/adr/0001-local-environment.md)：环境、多节点拓扑和运维细节
 - [docs/firecracker-template-clone.md](docs/firecracker-template-clone.md)：模板克隆的设计方案
 - [docs/h800-sglang-rollout.md](docs/h800-sglang-rollout.md)：H800 rollout 改用 sglang 的方案与验证
-- [docs/h800-sglang-evaluation.md](docs/h800-sglang-evaluation.md)：H800 评测改用 sglang 的方案
+- [docs/h800-sglang-evaluation.md](docs/h800-sglang-evaluation.md)：H800 评测改用 sglang 的方案（现为每个模型一个 pod）
 - [docs/h800-resident-pods.md](docs/h800-resident-pods.md)：H800 在线 RL 按 run 常驻 pod 的方案与验证
 - [docs/sokoban-sft.md](docs/sokoban-sft.md)、[docs/sokoban-sft-v2.md](docs/sokoban-sft-v2.md)：推箱子 SFT 实验

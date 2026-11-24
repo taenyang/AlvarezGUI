@@ -531,7 +531,7 @@ function nodesTable(nodes) {
   ], nodes);
 }
 
-const CONCURRENCY = { sandboxes: "Sandbox", training_runs: "训练", evaluations: "评测推理" };
+const CONCURRENCY = { sandboxes: "Sandbox", training_runs: "训练", evaluations: "评测推理（每个模型一个 Pod）" };
 const CEILING_PARTS = { platform: "平台", cpu: "CPU", memory: "内存", network: "网络地址" };
 
 // Why the ceiling is what it is, so the user knows what raising it would take.
@@ -1050,7 +1050,7 @@ function evalForm(catalog) {
     checkpoints.length ? h("details", {}, h("summary", { class: "secondary" }, `Checkpoint（${checkpoints.length} 个）`), boxes(checkpoints)) : null),
   field("评测名称", name, "可选，不填时自动生成"),
   field("Runtime", runtimeBackend, "Firecracker：Android microVM，约 1 秒就绪。Docker：Redroid 容器。两者截图不完全相同，成功率只在同一种 runtime 之间比"),
-  field("推理资源", accelerator, "H800：单独起一个 Pod，完整 MiniCPM-V 权重走 sglang 确定性推理（重跑结果一致），LoRA 在 Pod 里合并，其余走 HF；模型加载完 trial 才开始，结束自动删除。4090：常驻 HF 服务，和训练、其他评测共用"),
+  field("推理资源", accelerator, "H800：每个模型单独一个 Pod、一张卡，哪个模型先加载好，它的 trial 就先开始；完整 MiniCPM-V 权重走 sglang 确定性推理（重跑结果一致），LoRA 在 Pod 里合并，其余（如 Qwen3-VL）走 HF。选几个模型就起几个 Pod，集群没空卡时 Pod 会等调度。结束自动删除。4090：常驻 HF 服务，和训练、其他评测共用"),
   field("任务 / 题目集", taskSelect, "题目集里每题都会跑。默认 sokoban-validation（8 题，训练时没见过）；sokoban-test 已反复用于回归，不宜作泛化结论。单次最多 48 题、2304 个 trial（模型数 × 题数 × 每题次数）"),
   field("每题 trial 次数", trials, "temperature 0 时同一题重复结果基本相同，默认 1；要更多样本就换更大的题目集。temperature > 0 时才值得重复，对比成功率建议每模型总 trial ≥ 20"),
   field("最大步数", maxSteps, "到步数还没通关记为失败。推箱子题最优解 4–10 步，默认 20 与训练 rollout 一致"),
@@ -1064,7 +1064,10 @@ function evalForm(catalog) {
 function inferenceLabel(ev) {
   if (ev.accelerator !== "h800") return "4090";
   if (ev.model_ready) return "H800（模型已就绪）";
-  return ev.status === "RUNNING" ? "H800（部署中）" : "H800";
+  if (ev.status !== "RUNNING") return "H800";
+  // One pod per model: each model's trials start once its own pod is ready.
+  const ready = (ev.ready_models || []).length;
+  return ready ? `H800（${ready} / ${ev.model_versions.length} 个模型就绪）` : "H800（部署中）";
 }
 
 function evalSummary(ev) {

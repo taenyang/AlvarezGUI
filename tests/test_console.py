@@ -494,7 +494,8 @@ class ConsoleApiTest(unittest.TestCase):
         self.assertEqual(call(self.app, "POST", "/api/v1/evaluations", plain, bearer(**{"Idempotency-Key": "h1"}))[0], 409)
         self.assertEqual(call(self.app, "GET", "/internal/v1/evaluations/h800")[0], 401)
         listed = json.loads(call(self.app, "GET", "/internal/v1/evaluations/h800", headers=bearer())[2])
-        self.assertEqual(listed, [{"eval_id": eval_id, "model_versions": ["base-v1"], "model_endpoint": None}])
+        self.assertEqual(listed, [{"eval_id": eval_id, "model_versions": ["base-v1"], "model_endpoint": None,
+                                   "model_endpoints": {}}])
         detail = json.loads(call(self.app, "GET", f"/api/v1/evaluations/{eval_id}", headers=bearer())[2])
         self.assertEqual((detail["accelerator"], detail["model_ready"]), ("h800", False))
         self.assertNotIn("model_token", detail)
@@ -553,6 +554,41 @@ class ConsoleApiTest(unittest.TestCase):
             reasons = {r["cancel_reason"] for r in connection.execute(
                 "SELECT cancel_reason FROM episodes JOIN tasks USING (task_id) WHERE eval_id = %s", (eval_id,)).fetchall()}
         self.assertEqual(reasons, {"h800_model_service_failed: CUDA error"})
+
+    def test_h800_evaluation_model_starts_once_its_own_pod_is_published(self) -> None:
+        """One pod per model: each version's trials wait for that version's endpoint only and use its token."""
+        body = {"model_versions": ["base-v1", "grpo-v1"], "trials_per_task": 1, "accelerator": "h800",
+                "tasks": [{"task_type": "shopping", "app_image": "android-shop-v1"}]}
+        eval_id = json.loads(call(self.app, "POST", "/api/v1/evaluations", body, bearer(**{"Idempotency-Key": "pm"}))[2])["eval_id"]
+        publish = lambda version, endpoint, token: call(
+            self.app, "PUT", f"/internal/v1/evaluations/{eval_id}/version-endpoint",
+            {"model_version": version, "endpoint": endpoint, "token": token}, bearer())
+        self.assertEqual(publish("not-in-this-evaluation", "http://10.0.0.5:1", "t" * 32)[0], 404)
+        self.assertEqual(publish("grpo-v1", "http://10.0.0.6:2", "c" * 32)[0], 200)
+        detail = json.loads(call(self.app, "GET", f"/api/v1/evaluations/{eval_id}", headers=bearer())[2])
+        self.assertEqual((detail["model_ready"], detail["ready_models"]), (False, ["grpo-v1"]))
+        listed = json.loads(call(self.app, "GET", "/internal/v1/evaluations/h800", headers=bearer())[2])
+        self.assertEqual(listed[0]["model_endpoints"], {"grpo-v1": "http://10.0.0.6:2"})
+        with connect(self.settings) as connection:
+            store = TaskStore(connection)
+            row = store.claim_next_queued()
+            self.assertIsNotNone(row)
+            context = store.get_execution_context(row["task_id"], row["episode_id"])
+            self.assertIsNone(store.claim_next_queued())  # base-v1's pod is not published yet.
+        self.assertEqual((context["policy_version"], context["model_endpoint"], context["model_token"]),
+                         ("grpo-v1", "http://10.0.0.6:2", "c" * 32))
+        self.assertEqual(publish("base-v1", "http://10.0.0.5:1", "b" * 32)[0], 200)
+        detail = json.loads(call(self.app, "GET", f"/api/v1/evaluations/{eval_id}", headers=bearer())[2])
+        self.assertTrue(detail["model_ready"])
+        with connect(self.settings) as connection:
+            store = TaskStore(connection)
+            row = store.claim_next_queued()
+            context = store.get_execution_context(row["task_id"], row["episode_id"])
+        self.assertEqual((context["policy_version"], context["model_endpoint"], context["model_token"]),
+                         ("base-v1", "http://10.0.0.5:1", "b" * 32))
+        self.assertEqual(publish("base-v1", None, None)[0], 200)  # Withdrawn: base-v1 waits again.
+        listed = json.loads(call(self.app, "GET", "/internal/v1/evaluations/h800", headers=bearer())[2])
+        self.assertEqual(listed[0]["model_endpoints"], {"grpo-v1": "http://10.0.0.6:2"})
 
     def test_h800_training_rollouts_wait_for_the_runs_published_policy_service(self) -> None:
         run_body = {
