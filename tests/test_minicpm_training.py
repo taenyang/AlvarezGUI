@@ -99,6 +99,14 @@ class MiniCPMTrainingTest(unittest.TestCase):
                 row["conversations"][-1]["content"] = completion
                 with self.subTest(completion=completion), self.assertRaises(DatasetValidationError):
                     load_dataset(self._dataset(directory, [row]))
+            # A rejected rollout output loads only when marked, and only policy algorithms train on it.
+            row = self._row(image)
+            row["conversations"][-1]["content"] = '{"type":"tap","x":544,980}'
+            row["invalid_output"] = True
+            self.assertEqual(len(load_dataset(self._dataset(directory, [row]))), 1)
+            with patch("alvarezgui.minicpm_training._imports"), \
+                    self.assertRaisesRegex(DatasetValidationError, "only trainable by policy"):
+                train("sft", directory, [row], Path(directory, "out"))
 
     def test_unsupported_training_and_protocol_mismatch_fail_before_imports(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch("alvarezgui.minicpm_training._imports") as imports:

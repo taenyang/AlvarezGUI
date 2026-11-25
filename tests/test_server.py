@@ -112,12 +112,12 @@ class ServerTest(unittest.TestCase):
         docker = consumer_for_settings(settings, Mock(), None)
         host = {"cpu_count": 14, "memory_total_bytes": 125 * 2**30}
         self.assertEqual(sandbox_ceiling(settings, docker.runtime.config, host),
-                         {"platform": 32, "cpu": 7, "memory": 31, "network": None})
+                         {"platform": 64, "cpu": 7, "memory": 31, "network": None})
         docker.close()
         settings = Settings(postgres_password="test", minio_root_password="12345678")
         firecracker = consumer_for_settings(settings, Mock(), None)
         self.assertEqual(sandbox_ceiling(settings, firecracker.runtime.config, {"cpu_count": None}),
-                         {"platform": 32, "cpu": None, "memory": None, "network": 63})  # /24 pool of /30s, less the template builder's.
+                         {"platform": 64, "cpu": None, "memory": None, "network": 63})  # /24 pool of /30s, less the template builder's.
         firecracker.close()
 
     def test_windows_resources_without_proc_or_loadavg(self) -> None:

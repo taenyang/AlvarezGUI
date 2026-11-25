@@ -1,6 +1,5 @@
 """H800 rollout and evaluation services on sglang: the ``/internal/v1/model/infer`` protocol of
-``MiniCPMService`` in front of supervised sglang servers, so requests are batched continuously. See docs/h800-sglang-rollout.md and
-docs/h800-sglang-evaluation.md.
+``MiniCPMService`` in front of supervised sglang servers, so requests are batched continuously.
 
 Runs with the sglang image's Python; needs only pydantic and PIL besides the standard library.
 """
@@ -22,6 +21,7 @@ import traceback
 from collections import deque
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -29,7 +29,7 @@ from urllib.request import Request, urlopen
 from alvarezgui.h800_launcher import H800_PYTHON
 from alvarezgui.minicpm_service import MiniCPMService, _parse_action, _read_image, _static_resolver, serve
 from alvarezgui.model import InferenceRequest, InferenceResponse, InvalidActionOutputError, ModelVersionNotFoundError
-from alvarezgui.model_families import MINICPM_V_4_7
+from alvarezgui.model_families import model_family
 from alvarezgui.policy_output import parse_policy_output, policy_instruction
 
 TOP_LOGPROBS = 20  # OpenAI-compatible maximum.
@@ -64,6 +64,8 @@ class SglangService:
         self.output_format = policy.get("output_format", "action-v1")
         self.visual_views = policy.get("visual_views", "full")
         self.max_tokens = policy.get("max_tokens", 512 if self.output_format == "sokoban-plan-v1" else 128)
+        # Chat template arguments are per architecture (MiniCPM-V: downsample_mode, max_slice_nums; Qwen3-VL: none).
+        self.family = model_family(SimpleNamespace(**json.loads((Path(path) / "config.json").read_text())))
         self.requests = self.rejected = 0
         self.latencies: deque[int] = deque(maxlen=200)
 
@@ -85,7 +87,7 @@ class SglangService:
         body = {"model": "default", "messages": [{"role": "user", "content": content}],
                 "temperature": request.temperature, "max_tokens": request.max_tokens or self.max_tokens,
                 "logprobs": True, "top_logprobs": TOP_LOGPROBS,
-                "chat_template_kwargs": MINICPM_V_4_7.chat_template_kwargs}
+                "chat_template_kwargs": self.family.chat_template_kwargs}
         if request.seed is not None and request.temperature > 0:
             body["seed"] = request.seed
         return body
@@ -241,7 +243,7 @@ class SwapPaused(RuntimeError):
 
 
 class ResidentService:
-    """A run's resident rollout service (docs/h800-resident-pods.md): one sglang server for every round.
+    """A run's resident rollout service: one sglang server for every round.
 
     ``swap()`` loads the next round's weights in place with sglang's ``/update_weights_from_disk`` and only
     then answers to the new policy version, so a round's requests are never served by another round's weights.

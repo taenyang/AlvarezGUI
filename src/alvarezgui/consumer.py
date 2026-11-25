@@ -19,7 +19,7 @@ from alvarezgui.action import validate_action
 from alvarezgui.artifacts import get as get_artifact, local_file, put_png, remove_local_screenshot
 from alvarezgui.config import MAX_SANDBOXES, Settings
 from alvarezgui.db import connect
-from alvarezgui.model import InferenceRequest, ModelService, ModelUnavailableError
+from alvarezgui.model import InferenceRequest, InvalidActionOutputError, ModelService, ModelUnavailableError
 from alvarezgui.model_http import HttpModelService
 from alvarezgui.node_agent.factory import runtime_from_settings
 from alvarezgui.node_agent.runtime import (
@@ -394,9 +394,17 @@ class Consumer:
             context = self._store_call("get_execution_context", task_id, episode_id)
             if context is None or context["status"] != "RUNNING_ENV":
                 return
+            invalid: str | None = None
             try:
                 observation = self.runtime.observe(sandbox_id)
                 action, model_output = self._next_action(context, observation, sandbox_id, lease_id)
+            except InvalidActionOutputError as exc:
+                # Record the rejected output as a step (its raw text becomes a training row with the
+                # episode's penalty), then end the episode as invalid output; nothing runs on the screen.
+                invalid = str(exc)
+                action = {"type": "terminate", "reason": "invalid_output"}
+                model_output = {"raw_output": exc.raw_output, "model_version": context["policy_version"],
+                                "output_format": exc.output_format, "invalid": True}
             except ModelUnavailableError as exc:
                 # The H800 serving pod is preemptible: wait for the launcher to publish its replacement.
                 if context.get("accelerator") != "h800":
@@ -409,7 +417,16 @@ class Consumer:
                 time.sleep(H800_MODEL_POLL_SECONDS)
                 continue
             model_lost_at = None
-            result = self.runtime.execute(sandbox_id, action)
+            if invalid is None:
+                result = self.runtime.execute(sandbox_id, action)
+                if result["reward"].get("invalid_action"):
+                    # The runtime refused an action outside the task's controls (e.g. a Sokoban tap off the
+                    # four buttons): same outcome as unparseable output.
+                    invalid = f"invalid action-v1 output: {action} is outside the task controls"
+            else:
+                result = {"done": False, "reward": {"total": 0.0, "success": False}}
+            if invalid is not None:
+                result = {"done": False, "reward": {**result["reward"], "invalid_action": True}}
             final_observation = self._final_observation(sandbox_id) if result["done"] else None
             recorded_observation = self._upload_observation(observation, sandbox_id)
             recorded_final_observation = self._upload_observation(final_observation, sandbox_id)
@@ -426,6 +443,8 @@ class Consumer:
                 model_output,
                 recorded_final_observation,
             )
+            if invalid is not None and recorded:
+                raise InvalidActionOutputError(invalid)  # mark_failed_execution: outcome invalid_output.
             if not recorded or result["done"]:
                 if result["done"]:
                     self._destroy_if_lease_owner(sandbox_id, lease_id)

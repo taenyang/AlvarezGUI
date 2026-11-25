@@ -123,11 +123,23 @@ class TrainingConfig(BaseModel):
     learning_rate: float = Field(default=1e-6, gt=0, le=1e-3)
     epochs: int = Field(default=1, ge=1, le=10)
     gradient_accumulation: int = Field(default=1, ge=1, le=64)
+    # Clip range [1 - clip_epsilon, 1 + clip_epsilon_high]; clip_epsilon_high None means symmetric.
     clip_epsilon: float = Field(default=0.2, gt=0, le=1)
-    # DAPO clip-higher upper bound (paper 0.28); None means the symmetric clip_epsilon.
     clip_epsilon_high: float | None = Field(default=None, gt=0, le=1)
+    # Policy-algorithm components (training_agent.step_advantages). None takes the algorithm's preset
+    # (ALGORITHM_PRESETS), so a run that sets none of them trains exactly as that algorithm did before.
+    advantage_std: bool | None = None  # divide (r - mean) by the group std
+    drop_zero_variance_groups: bool | None = None  # drop equal-reward groups before the loss normalization
+    overlong: Literal["fail", "mask", "penalty"] | None = None  # rollouts that hit max_steps
+    overlong_penalty: float = Field(default=-0.1, ge=-1, le=0)  # their reward under overlong="penalty"
+    loss_normalization: Literal["per_rollout", "batch_steps", "constant"] | None = None
+    loss_normalization_constant: int | None = Field(default=None, ge=1, le=1000)  # None: max_steps
+    step_advantage_omega: float | None = Field(default=None, ge=0, le=10)  # GiGPO step term; 0 turns it off
+    step_advantage_gamma: float | None = Field(default=None, gt=0, le=1)
+    invalid_output_reward: float = Field(default=-0.2, ge=-1, le=0)
     group_size: int = Field(default=4, ge=2, le=16)
-    rounds: int = Field(default=1, ge=1, le=20)
+    # ponytail: 100 is only a runaway guard (about 18-36 h at 11-23 min a round), not a tuned limit.
+    rounds: int = Field(default=1, ge=1, le=100)
     # Online RL pool; SFT and runs without eval_tasks also evaluate on it.
     tasks: list[TaskSpec] = Field(default_factory=list, max_length=64)
     # Online RL draws this many pool tasks per round (seeded, every task once before repeats); None = all.
@@ -182,6 +194,10 @@ class TrainingRunRequest(BaseModel):
             raise ValueError("merger, multiview, shuffling and structured output currently require SFT")
         if self.config.train_merger_mlp and self.config.finetuning_method != "lora":
             raise ValueError("train_merger_mlp requires LoRA")
+        components = ("advantage_std", "drop_zero_variance_groups", "overlong", "loss_normalization",
+                      "loss_normalization_constant", "step_advantage_omega", "step_advantage_gamma")
+        if self.algorithm == "sft" and any(getattr(self.config, name) is not None for name in components):
+            raise ValueError("policy-algorithm components apply only to grpo, dapo, dr_grpo and gigpo")
         if self.algorithm == "sft" and self.dataset_version is None:
             raise ValueError("sft requires dataset_version")
         if self.algorithm != "sft" and self.dataset_version is None and not self.config.tasks:

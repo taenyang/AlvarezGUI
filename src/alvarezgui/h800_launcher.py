@@ -34,7 +34,7 @@ from urllib.error import HTTPError
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
-from alvarezgui.training_agent import ControlPlane, TrainingAgent, rollout_metrics, train_options
+from alvarezgui.training_agent import ControlPlane, TrainingAgent, checkpoint_retained, rollout_metrics, train_options
 
 log = logging.getLogger("alvarezgui.h800_launcher")
 CFS_ROOT = Path("/ainf-cfs/yangtianze")
@@ -98,7 +98,7 @@ if [ ! -f "$work/FAILED" ]; then
 fi
 exec sleep infinity
 """
-# Resident online-RL training worker (docs/h800-resident-pods.md): one process trains every round of a run.
+# Resident online-RL training worker: one process trains every round of a run.
 # Not a signal exit -> FAILED is written per round by the worker, so the container itself never ends.
 WORKER_POD_SCRIPT = """#!/bin/bash
 run={run}
@@ -142,7 +142,7 @@ def rollout_probes(work: Path, models: int = 1) -> dict[str, Any]:
                               "timeoutSeconds": 10}}
 
 
-# Rollout services for full MiniCPM-V 4.7 weights run sglang (docs/h800-sglang-rollout.md).
+# Rollout services for full MiniCPM-V 4.7 weights run sglang.
 SGLANG_POD_SCRIPT = """#!/bin/bash
 work={work}
 root={root}
@@ -172,12 +172,18 @@ def rollout_weights(policy_path: str) -> str:
     return policy_path.rstrip("/") + "-merged"
 
 
+# Architectures verified on sglang 0.5.23 against HF serving (greedy parity on real screenshots):
+# MiniCPM-V 4.7 (needs sglang_patch) and Qwen3-VL (no patch).
+SGLANG_MODEL_TYPES = ("minicpmv4_7", "qwen3_vl")
+
+
 def sglang_servable(path: str | Path) -> bool:
-    """Full MiniCPM-V 4.7 weights with a plain generation policy; everything else stays on HF serving."""
+    """Full weights of a verified architecture with a plain generation policy; the rest stays on HF serving
+    (adapters sglang cannot merge, perception heads, custom inference modes)."""
     checkpoint = Path(path)
     if (checkpoint / "adapter_config.json").is_file() or not (checkpoint / "config.json").is_file():
         return False
-    if json.loads((checkpoint / "config.json").read_text()).get("model_type") != "minicpmv4_7":
+    if json.loads((checkpoint / "config.json").read_text()).get("model_type") not in SGLANG_MODEL_TYPES:
         return False
     return _plain_policy(checkpoint)
 
@@ -643,11 +649,18 @@ class H800Launcher:
                    **json.loads((output / "metrics.json").read_text())}
         if state.get("resident"):
             # The 4090 copy is only for serving and evaluation there; the next round samples from CFS.
-            # Registration waits for the verified copy (see publish_copies), so the version name is known now.
             uri = Path(from_cfs(str(output), self.root)).as_uri()
             version = f"{run['config'].get('model_name') or run_id}-r{number}"
-            self.queue_copy(run_dir, {"round": number, "output": str(output), "metrics": metrics})
-            self.publish_copies(run, run_dir)  # Start it now rather than on the next tick.
+            if number + 1 == config["rounds"] or checkpoint_retained(uri, config.get("checkpoint_every")):
+                # Registration waits for the verified copy (see publish_copies), so the version name is known now.
+                self.queue_copy(run_dir, {"round": number, "output": str(output), "metrics": metrics})
+                self.publish_copies(run, run_dir)  # Start it now rather than on the next tick.
+            else:
+                # prune_checkpoints deletes this round once the next one registers, so skip the 3 GB copy.
+                # Rollout tasks still need a registered version. Keep the usual 4090 URI: deleting the version
+                # then removes the CFS original (cfs_checkpoint), and the 4090 delete finds nothing to remove.
+                # Until then the 4090 cannot load this version (an evaluation of it would fail).
+                version = self.agent.register(run, output, metrics, f"r{number}", checkpoint_uri=uri)
         else:
             uri = self.copy_to_serving(run_id, output)
             version = self.agent.register(run, output, metrics, f"r{number}", checkpoint_uri=uri)
@@ -712,7 +725,7 @@ class H800Launcher:
                      {"endpoint": target, "token": token if target else None})
         return target is not None
 
-    # --- resident rollout service (docs/h800-resident-pods.md) ---------------------------
+    # --- resident rollout service ---------------------------------------------------------
     # One sglang Deployment per run under <run>/serve; each round's policy is swapped in through next.json.
 
     def resident_rollout_name(self, run_id: str) -> str:
@@ -923,7 +936,6 @@ class H800Launcher:
         """One pod per model: each has its own directory, token and endpoint, and fails or restarts alone.
 
         Per model: sglang for full MiniCPM-V 4.7 weights or a LoRA over them (merged in its pod), else HF.
-        See docs/h800-sglang-evaluation.md.
         """
         eval_id = evaluation["eval_id"]
         work = self.serving_root / eval_id
@@ -1143,7 +1155,7 @@ def run_pod(run_dir: Path) -> None:
         rows = load_dataset(spec["dataset"])
         print(f"training {run['run_id']}: {len(rows)} rows from {spec['dataset']}", flush=True)
         metrics = train(run["algorithm"], spec["base_model"], rows, spec["output_dir"],
-                        **train_options(run["config"]), checkpoint_dir=spec.get("checkpoint_dir"),
+                        **train_options(run["config"], run["algorithm"]), checkpoint_dir=spec.get("checkpoint_dir"),
                         save_every=spec.get("save_every"),
                         sampling_temperature=spec.get("sampling_temperature"),
                         compute_old_logprob=run["algorithm"] != "sft", on_step=on_step)

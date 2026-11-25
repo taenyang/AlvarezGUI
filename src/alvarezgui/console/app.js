@@ -661,12 +661,25 @@ function algorithmLabel(algorithm) {
 
 // Config knobs each algorithm consumes; the form shows and submits only these.
 const SHARED_KNOBS = ["accelerator", "learning_rate", "epochs", "gradient_accumulation", "batch_size", "cache_preprocessed", "gradient_checkpointing", "max_steps", "checkpoint_every", "eval_trials", "seed"];
+// Policy-algorithm components (training_agent.ALGORITHM_PRESETS); blank keeps the algorithm's preset.
+const COMPONENT_KNOBS = ["advantage_std", "drop_zero_variance_groups", "clip_epsilon_high", "overlong", "overlong_penalty",
+  "loss_normalization", "loss_normalization_constant", "step_advantage_omega", "step_advantage_gamma", "invalid_output_reward"];
 const ALGORITHM_KNOBS = {
   sft: ["finetuning_method", "train_merger_mlp", "multiview", "output_format", ...SHARED_KNOBS],
-  grpo: ["rounds", "tasks_per_round", "group_size", "temperature", "clip_epsilon", ...SHARED_KNOBS],
+  grpo: ["finetuning_method", "rounds", "tasks_per_round", "group_size", "temperature", "clip_epsilon", ...SHARED_KNOBS, ...COMPONENT_KNOBS],
 };
-ALGORITHM_KNOBS.dapo = [...ALGORITHM_KNOBS.grpo, "clip_epsilon_high"];
-ALGORITHM_KNOBS.dr_grpo = ALGORITHM_KNOBS.gigpo = ALGORITHM_KNOBS.grpo;
+ALGORITHM_KNOBS.dapo = ALGORITHM_KNOBS.dr_grpo = ALGORITHM_KNOBS.gigpo = ALGORITHM_KNOBS.grpo;
+// Shown next to each component: what blank means for the chosen algorithm. Mirrors ALGORITHM_PRESETS.
+const PRESET_LABELS = {
+  advantage_std: { grpo: "除", dapo: "除", dr_grpo: "不除", gigpo: "不除" },
+  drop_zero_variance_groups: { grpo: "不舍弃", dapo: "舍弃", dr_grpo: "不舍弃", gigpo: "不舍弃" },
+  clip_epsilon_high: { grpo: "同 clip ε", dapo: "0.28", dr_grpo: "同 clip ε", gigpo: "同 clip ε" },
+  overlong: { grpo: "当作失败", dapo: "屏蔽", dr_grpo: "当作失败", gigpo: "当作失败" },
+  loss_normalization: { grpo: "每条轨迹步数", dapo: "整批总步数", dr_grpo: "常数", gigpo: "整批总步数" },
+  step_advantage_omega: { grpo: "0（关）", dapo: "0（关）", dr_grpo: "0（关）", gigpo: "1" },
+};
+const presetSelect = (options) => h("select", {}, h("option", { value: "" }, "按算法默认"),
+  options.map(([value, label]) => h("option", { value }, label)));
 
 // Set by "复用配置" on a run detail page and consumed by the next runs page render.
 let pendingRecipe = null;
@@ -707,6 +720,21 @@ function taskSetLabel(set) {
   return `${set.label}（${set.tasks.length} 题）`;
 }
 
+// An evaluation's tasks, short: the task set's name when they are exactly one set, else the first few and a count.
+// The full list stays available as the hover title.
+function taskSummary(tasks, taskSets = [], shown = 3) {
+  const images = tasks.map((t) => t.app_image);
+  const full = images.join(", ");
+  const set = taskSets.find((s) => s.tasks.length === images.length && s.tasks.every((t, i) => t.app_image === images[i]));
+  // Tasks of one app share its image name; show it once ("android-sokoban-v1: train-000, train-001").
+  const apps = new Set(images.map((image) => image.split(":")[0]));
+  const app = apps.size === 1 && images[0].includes(":") ? [...apps][0] : null;
+  const names = app ? images.map((image) => image.slice(app.length + 1)) : images;
+  const listed = names.length <= shown ? names.join(", ") : `${names.slice(0, shown).join(", ")} … 共 ${names.length} 题`;
+  const text = set ? taskSetLabel(set) : app ? `${app}: ${listed}` : listed;
+  return h("span", { title: full }, text);
+}
+
 function field(label, input, hint) {
   return h("label", {}, label, input, hint ? h("span", { class: "hint" }, hint) : null);
 }
@@ -744,8 +772,8 @@ function runForm(catalog) {
         "option", { value: `ds:${d.dataset_version}` }, `${d.dataset_version}（${d.sample_count} 条）`)))),
     eval_set: h("select", {}, catalog.task_sets.map((s) => h(
       "option", { value: s.name, selected: s.name === "sokoban-validation" }, taskSetLabel(s)))),
-    rounds: h("input", { type: "number", min: 1, max: 20, value: 12 }),
-    tasks_per_round: h("input", { type: "number", min: 1, max: 16, value: 4 }),
+    rounds: h("input", { type: "number", min: 1, max: 100, value: 20 }),
+    tasks_per_round: h("input", { type: "number", min: 1, max: 16, value: 8 }),
     group_size: h("input", { type: "number", min: 2, max: 16, value: 8 }),
     temperature: h("input", { type: "number", min: 0, max: 2, step: 0.1, value: 1.0 }),
     max_steps: h("input", { type: "number", min: 1, max: 50, value: 20 }),
@@ -756,13 +784,40 @@ function runForm(catalog) {
     cache_preprocessed: h("input", { type: "checkbox", checked: true }),
     gradient_checkpointing: h("input", { type: "checkbox" }),
     clip_epsilon: h("input", { type: "number", min: 0.01, max: 1, step: 0.01, value: 0.2 }),
-    clip_epsilon_high: h("input", { type: "number", min: 0.01, max: 1, step: 0.01, value: 0.28 }),
+    clip_epsilon_high: h("input", { type: "number", min: 0.01, max: 1, step: 0.01, placeholder: "按算法默认" }),
+    advantage_std: presetSelect([["true", "除以组内 std"], ["false", "不除（只减均值）"]]),
+    drop_zero_variance_groups: presetSelect([["true", "舍弃"], ["false", "不舍弃"]]),
+    overlong: presetSelect([["fail", "当作失败（reward 0）"], ["mask", "屏蔽（不训练，仍计入基线）"], ["penalty", "惩罚（reward 取下面的值）"]]),
+    overlong_penalty: h("input", { type: "number", min: -1, max: 0, step: 0.05, value: -0.1 }),
+    loss_normalization: presetSelect([["per_rollout", "每条轨迹步数 |o_i|"], ["batch_steps", "整批总步数 Σ|o_i|"], ["constant", "常数（见下）"]]),
+    loss_normalization_constant: h("input", { type: "number", min: 1, max: 1000, placeholder: "默认 = 最大步数" }),
+    step_advantage_omega: h("input", { type: "number", min: 0, max: 10, step: 0.1, placeholder: "按算法默认" }),
+    step_advantage_gamma: h("input", { type: "number", min: 0.01, max: 1, step: 0.01, placeholder: "默认 0.95" }),
+    invalid_output_reward: h("input", { type: "number", min: -1, max: 0, step: 0.05, value: -0.2 }),
     eval_trials: h("input", { type: "number", min: 0, max: 50, value: 1 }),
     checkpoint_every: h("input", { type: "number", min: 1, max: 100, value: 5, placeholder: "只保留正式模型" }),
     seed: h("input", { type: "number", value: 0 }),
   };
   const knobLabels = {};
   const knob = (key, label, hint) => (knobLabels[key] = field(label, inputs[key], hint));
+  const presetHints = {};
+  const component = (key, label, hint) => {
+    presetHints[key] = h("span", { class: "hint" });
+    return (knobLabels[key] = h("label", {}, label, inputs[key], presetHints[key], h("span", { class: "hint" }, hint)));
+  };
+  // Collapsed by default: every blank component keeps the chosen algorithm's preset (README 策略优化算法).
+  const components = h("details", { class: "wide" }, h("summary", {}, "高级：算法组件（留空 = 按算法默认）"),
+    h("div", { class: "form", style: "margin-top:8px" },
+      component("advantage_std", "优势除以组内 std", "GRPO 的 (r − mean) / std；不除就是 Dr. GRPO 的 r − mean，避免 reward 方差小的组被放大"),
+      component("drop_zero_variance_groups", "舍弃优势全为 0 的组", "组内 reward 全相同时没有梯度。舍弃后它不再占用长度归一化的分母（DAPO 的动态采样，但不补采）"),
+      component("clip_epsilon_high", "clip ε 上界", "比值上界为 1 + 这个值，下界仍是 1 − clip ε。留空：DAPO 0.28，其余同 clip ε（对称）"),
+      component("overlong", "超长轨迹（到最大步数）", "当作失败：reward 0；屏蔽：不训练，但计入组内基线（DAPO overlong filtering）；惩罚：reward 改为下面的值"),
+      component("overlong_penalty", "超长惩罚 reward", "仅在“超长轨迹 = 惩罚”时生效，−1 到 0；无效输出默认 −0.2，未解出 0"),
+      component("loss_normalization", "长度归一化", "每步 loss 的权重分母。每条轨迹步数：每条轨迹权重相同；整批总步数：每步权重相同；常数：Dr. GRPO 的 1 / (常数 × 轨迹数)"),
+      component("loss_normalization_constant", "归一化常数", "仅在“长度归一化 = 常数”时生效，留空 = 每条 rollout 最大步数"),
+      component("step_advantage_omega", "步级优势权重 ω", "GiGPO 的 A_E + ω · A_S：同组里相同棋盘的步按折扣回报比较。0 关闭；其它算法也可以打开"),
+      component("step_advantage_gamma", "步级折扣 γ", "GiGPO 的回报 γ^(T−t) · R，留空 0.95"),
+      component("invalid_output_reward", "无效输出 reward", "JSON 不合法或点到按钮以外的轨迹的 reward，−1 到 0，默认 −0.2；只影响训练，评测成功率不变")));
   const submit = h("button", { class: "primary", type: "submit", disabled: !models.length }, "创建实验");
   const form = h("form", { class: "form", onsubmit: async (event) => {
     event.preventDefault();
@@ -770,6 +825,9 @@ function runForm(catalog) {
     const backend = inputs.runtime_backend.value;
     const knobs = ALGORITHM_KNOBS[inputs.algorithm.value].filter((key) => !inputs[key].disabled).map((key) => {
       const input = inputs[key];
+      if (input.tagName === "SELECT" && COMPONENT_KNOBS.includes(key)) {
+        return [key, input.value === "" ? null : input.value === "true" ? true : input.value === "false" ? false : input.value];
+      }
       return [key, input.type === "number" ? (input.value === "" ? null : Number(input.value)) : input.type === "checkbox" ? input.checked : input.value];
     });
     const body = {
@@ -796,13 +854,13 @@ function runForm(catalog) {
   field("基础模型", inputs.base_model, models.length ? "也可以选择 checkpoint 接着训练。在线算法要求完整权重；LoRA adapter 只能继续 LoRA SFT" : "尚未注册模型，请先运行 import_artifacts"),
   field("模型产物名称", inputs.model_name, "可选，默认用实验 ID。只允许字母、数字、点、下划线和短横线；每轮自动加后缀，如 -r0、-r11"),
   field("数据集", inputs.data, "在线算法选题目集：每轮从中抽题，在真实 Android 上采样。选轨迹数据集则离线训练。SFT 只能选轨迹数据集"),
-  knob("finetuning_method", "微调方式", "全参数：最近几个在线实验都用它。LoRA：rank 16 / alpha 32，只训语言侧注意力层，FP32 adapter，lr 1e-5 时 clip 比例约 45%，需要更小的学习率"),
+  knob("finetuning_method", "微调方式", "全参数：最近几个在线实验都用它。LoRA：rank 16 / alpha 32，只训语言侧注意力层，FP32 adapter，lr 1e-5 时 clip 比例约 45%，需要更小的学习率；在线算法每轮把 adapter 合并成完整权重再用 sglang 采样"),
   knob("train_merger_mlp", "全量训练视觉 merger", "仅 LoRA；额外全量训练视觉-语言投影层（MiniCPM-V：model.merger.mlp.0，约 2,597 万参数；Qwen3-VL：model.visual.merger）"),
   knob("multiview", "双视图输入", "完整截图 + 棋盘裁剪两张图；推理时按 checkpoint 的配置自动使用"),
   knob("output_format", "输出协议", "必须与数据集一致。结构化输出多出棋盘和决策文本，执行器仍只执行其中的 action"),
   field("评测题目集", inputs.eval_set, "训练结束后自动评测用，最多 48 题。要和训练题目集不同，否则测不出泛化；选训练集时默认换成 sokoban-validation"),
-  knob("rounds", "轮数", "每轮：用上一轮的策略采样、再训练一次。H800 上一轮约 10 分钟（12 轮约 2 小时），实际随题目和步数变化"),
-  knob("tasks_per_round", "每轮题目数", "按 seed 洗牌后依次取题，题目集做完一遍才会重复。每轮 rollout 数 = 题目数 × group size，默认 4 × 8 = 32"),
+  knob("rounds", "轮数", "每轮：用上一轮的策略采样、再训练一次，最多 100 轮。每道题练到的次数 = 轮数 × 每轮题目数 ÷ 题目集大小，默认 20 × 8 ÷ 48 ≈ 3.3 次；想多练同一批题就缩小题目集或加轮数。H800 上每轮 4 题约 10 分钟，8 题约 15–20 分钟（估计），实际随题目和步数变化"),
+  knob("tasks_per_round", "每轮题目数", "按 seed 洗牌后依次取题，题目集做完一遍才会重复，最多 16。每轮 rollout 数 = 题目数 × group size，默认 8 × 8 = 64。题少则每次更新只来自几道题、噪声大；题多则每轮更慢、两次采样之间策略改得更多"),
   knob("group_size", "每组 rollout 数 (group size)", "同一道题采样几次，advantage 在组内比较。组内 reward 全相同时这组不参与训练；8 比 4 更容易出现成功和失败混在一组"),
   knob("temperature", "采样 temperature", "rollout 的采样温度。组内需要 reward 差异，建议 ≥ 0.7；训练时 logprob 也按这个温度计算"),
   knob("max_steps", "每条 rollout 最大步数", "到步数还没通关记为失败。训练题最优解 4–10 步，20 给模型留出试错的余地"),
@@ -810,13 +868,14 @@ function runForm(catalog) {
   knob("epochs", "epochs", "每轮样本训练几遍。在线算法建议 1：多遍会偏离采样时的策略，clip 比例上升"),
   knob("gradient_accumulation", "梯度累积", "每多少个样本做一次 optimizer 更新（有效 batch = micro-batch × 梯度累积）。默认 16：一轮约 300–500 行，约 20–30 次更新；设成 1 相当于每个样本更新一次"),
   knob("clip_epsilon", "clip ε", "PPO-clip 范围：新旧策略概率比超出 1 ± ε 的样本不再贡献梯度"),
-  knob("clip_epsilon_high", "clip ε 上界（DAPO）", "DAPO 的 clip-higher：上界单独放宽到 1 + 这个值（论文 0.28），下界仍用 clip ε"),
+
   knob("batch_size", "micro-batch", "一次前向放几个样本。在线算法建议 1：H800 上 batch 4 只快 10%，峰值显存已到 78.7 GB（80 GB 卡），长样本会爆显存。SFT 在 H800 常用 4"),
   knob("cache_preprocessed", "缓存预处理输入", "把截图预处理结果放在 CPU 内存里复用。在线算法的 old_logprob 和训练共用一份，预处理时间减半；SFT 多个 epoch 也只做一遍。333 条双视图约需 10 GiB 内存"),
   knob("gradient_checkpointing", "梯度检查点", "开启后反向时重算前向，省显存但更慢。H800 上关闭训练快约 21%，在线算法 batch 1 显存 20 → 30 GB，远低于 80 GB；4090 显存不够时再开"),
   knob("checkpoint_every", "checkpoint 保存间隔", "在线算法每 N 轮、SFT 每 N 个 epoch 保留一个 checkpoint，其余训练结束后删除；最后一轮总是正式模型。留空只保留正式模型"),
   knob("eval_trials", "训练后每任务评测次数", "训练成功后在 4090 上对比评测基础模型和正式模型，题目集见上，步数同 rollout，0 表示不评测。自动评测用 temperature 0，同一题重复结果基本相同，所以默认 1"),
   knob("seed", "随机 seed", "决定抽题顺序和采样 seed；同一个 seed 重跑，每轮抽到的题相同"),
+  components,
   h("div", { class: "wide row" }, submit, message));
   const syncAlgorithm = () => {
     const visible = new Set(ALGORITHM_KNOBS[inputs.algorithm.value]);
@@ -824,6 +883,11 @@ function runForm(catalog) {
 
     // Disabled controls skip validation, so a hidden knob can never block submit.
     for (const [key, label] of Object.entries(knobLabels)) label.hidden = inputs[key].disabled = !visible.has(key);
+    components.hidden = inputs.algorithm.value === "sft";
+    for (const [key, hint] of Object.entries(presetHints)) {
+      const preset = PRESET_LABELS[key]?.[inputs.algorithm.value];
+      hint.textContent = preset ? `当前算法默认：${preset}` : "";
+    }
     onlineSets.disabled = inputs.algorithm.value === "sft";
     if (inputs.data.selectedOptions[0]?.parentElement.disabled) inputs.data.value = "";
   };
@@ -851,7 +915,7 @@ function runForm(catalog) {
       if (value === null) { if (inputs[key].placeholder) inputs[key].value = ""; continue; }
       const input = inputs[key];
       if (input.type === "checkbox") { input.checked = Boolean(value); continue; }
-      input.value = value;
+      input.value = typeof value === "boolean" ? String(value) : value;
       if (input.type === "number" ? Number(input.value) !== Number(value) : input.value !== String(value)) {
         missing.push(`${key}=${value}`);
       }
@@ -983,7 +1047,7 @@ async function evaluationsPage() {
       { label: "Runtime", render: (e) => e.runtime_backend || "unknown" },
       { label: "推理", render: (e) => inferenceLabel(e) },
       { label: "模型", render: (e) => e.model_versions.join(" vs ") },
-      { label: "任务", render: (e) => e.task_set.map((t) => t.app_image).join(", ") },
+      { label: "任务", render: (e) => taskSummary(e.task_set, catalog.task_sets) },
       { label: "状态", render: (e) => badge(e.status) },
       { label: "成功 / trial", num: true, render: (e) => `${e.successes} / ${e.trials}` },
       { label: "来源", render: (e) => (e.run_id ? h("a", { href: `#/runs/${e.run_id}` }, "训练后自动评测") : "手动") },
@@ -1050,7 +1114,7 @@ function evalForm(catalog) {
     checkpoints.length ? h("details", {}, h("summary", { class: "secondary" }, `Checkpoint（${checkpoints.length} 个）`), boxes(checkpoints)) : null),
   field("评测名称", name, "可选，不填时自动生成"),
   field("Runtime", runtimeBackend, "Firecracker：Android microVM，约 1 秒就绪。Docker：Redroid 容器。两者截图不完全相同，成功率只在同一种 runtime 之间比"),
-  field("推理资源", accelerator, "H800：每个模型单独一个 Pod、一张卡，哪个模型先加载好，它的 trial 就先开始；完整 MiniCPM-V 权重走 sglang 确定性推理（重跑结果一致），LoRA 在 Pod 里合并，其余（如 Qwen3-VL）走 HF。选几个模型就起几个 Pod，集群没空卡时 Pod 会等调度。结束自动删除。4090：常驻 HF 服务，和训练、其他评测共用"),
+  field("推理资源", accelerator, "H800：每个模型单独一个 Pod、一张卡，哪个模型先加载好，它的 trial 就先开始；MiniCPM-V 和 Qwen3-VL 的完整权重走 sglang 确定性推理（重跑结果一致），LoRA 在 Pod 里合并，perception 等特殊模型走 HF。选几个模型就起几个 Pod，集群没空卡时 Pod 会等调度。结束自动删除。4090：常驻 HF 服务，和训练、其他评测共用"),
   field("任务 / 题目集", taskSelect, "题目集里每题都会跑。默认 sokoban-validation（8 题，训练时没见过）；sokoban-test 已反复用于回归，不宜作泛化结论。单次最多 48 题、2304 个 trial（模型数 × 题数 × 每题次数）"),
   field("每题 trial 次数", trials, "temperature 0 时同一题重复结果基本相同，默认 1；要更多样本就换更大的题目集。temperature > 0 时才值得重复，对比成功率建议每模型总 trial ≥ 20"),
   field("最大步数", maxSteps, "到步数还没通关记为失败。推箱子题最优解 4–10 步，默认 20 与训练 rollout 一致"),
@@ -1095,13 +1159,15 @@ async function evaluationDetailPage(evalId) {
   const live = h("div");
   view.replaceChildren(h("div", { class: "row" }, h("a", { href: "#/evaluations" }, "← 模型评测")), root, live);
   let liveEpisode = null;
+  const taskSets = (await api("/api/v1/catalog")).task_sets;
   await poll(async () => {
     const ev = await api(`/api/v1/evaluations/${evalId}`);
     root.replaceChildren(
       h("div", { class: "row" }, h("h2", {}, ev.name || `评测 ${fmt.short(ev.eval_id)}`), badge(ev.status), h("div", { class: "spacer" }),
         evalActions(ev, "#/evaluations")),
       h("div", { class: "card" },
-        h("div", { class: "secondary" }, `Runtime ${ev.runtime_backend || "unknown"} · 推理 ${inferenceLabel(ev)} · 任务 ${ev.task_set.map((t) => `${t.task_type}/${t.app_image}`).join(", ")} · 每模型 ${ev.trials_per_task} 次 · 最多 ${ev.max_steps} 步 · temperature ${ev.temperature} · seeds ${ev.seeds.join(", ")}`),
+        h("div", { class: "secondary" }, `Runtime ${ev.runtime_backend || "unknown"} · 推理 ${inferenceLabel(ev)} · 任务 `,
+          taskSummary(ev.task_set, taskSets), ` · 每模型 ${ev.trials_per_task} 次 · 最多 ${ev.max_steps} 步 · temperature ${ev.temperature} · seeds ${ev.seeds.length > 4 ? `${ev.seeds.slice(0, 4).join(", ")} … 共 ${ev.seeds.length} 个` : ev.seeds.join(", ")}`),
         evalSummary(ev)),
       h("h3", {}, "每次 trial"),
       h("div", { class: "card" }, table([
@@ -1124,7 +1190,8 @@ async function evaluationDetailPage(evalId) {
 
 // ---------------------------------------------------------------- episodes
 
-function modelOutput(raw) {
+function modelOutput(raw, invalid) {
+  if (invalid) return raw ? `${raw}（非法输出，未执行）` : "（非法输出，模型服务未返回原文）";
   if (!raw) return "（固定策略）";
   try {
     const output = JSON.parse(raw);
@@ -1156,7 +1223,7 @@ async function episodeView(episodeId) {
         h("dl", { class: "kv" },
           h("dt", {}, "步骤"), h("dd", {}, String(s.step_id)),
           h("dt", {}, "动作"), h("dd", {}, describeAction(s.action)),
-          h("dt", {}, "模型输出"), h("dd", { class: "mono" }, modelOutput(s.model_output?.raw_output)),
+          h("dt", {}, "模型输出"), h("dd", { class: "mono" }, modelOutput(s.model_output?.raw_output, s.model_output?.invalid)),
           h("dt", {}, "延迟"), h("dd", {}, fmt.ms(s.model_output?.latency_ms)),
           s.model_output?.entropy != null ? [h("dt", {}, "采样熵"), h("dd", {}, `${fmt.num(s.model_output.entropy, 3)} nats/token`)] : null,
           h("dt", {}, "reward"), h("dd", {}, `${fmt.num(s.reward.total)}${s.reward.success ? " · 成功" : ""}${s.done ? " · 结束" : ""}`),

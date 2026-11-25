@@ -1,4 +1,4 @@
-"""Resident H800 training worker for one online RL run (docs/h800-resident-pods.md, T1).
+"""Resident H800 training worker for one online RL run.
 
 One process per run waits for each round's ``spec.json`` under the run directory and trains it with the
 same ``run_pod`` a per-round pod runs, so a round's result does not depend on which of the two ran it.

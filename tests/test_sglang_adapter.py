@@ -69,6 +69,7 @@ class SglangAdapterTest(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as directory:
                 Path(directory, "policy_config.json").write_text(json.dumps({"visual_views": "full+board-crop"}))
+                Path(directory, "config.json").write_text(json.dumps({"model_type": "minicpmv4_7"}))
                 service = SglangService("v", directory, f"http://127.0.0.1:{server.server_address[1]}")
                 request = InferenceRequest(request_id="r", model_version="v", instruction="solve",
                                            image_uri="data:image/png;base64," + png, temperature=1.0, seed=7)
@@ -94,8 +95,13 @@ class SglangAdapterTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             self.assertFalse(sglang_servable(path))
-            (path / "config.json").write_text(json.dumps({"model_type": "minicpmv4_7"}))
-            self.assertTrue(sglang_servable(path))
+            for model_type, servable in (("minicpmv4_7", True), ("qwen3_vl", True), ("llava", False)):
+                (path / "config.json").write_text(json.dumps({"model_type": model_type}))
+                self.assertEqual(sglang_servable(path), servable, model_type)
+            (path / "config.json").write_text(json.dumps({"model_type": "qwen3_vl"}))
+            (path / "policy_config.json").write_text(json.dumps({"inference_mode": "perception_direction"}))
+            self.assertFalse(sglang_servable(path))  # Custom inference heads stay on HF.
+            (path / "policy_config.json").unlink()
             (path / "adapter_config.json").write_text("{}")
             self.assertFalse(sglang_servable(path))
         template = {"metadata": {"namespace": "ns"},
@@ -155,7 +161,7 @@ class MergeForRolloutTest(unittest.TestCase):
             training = types.SimpleNamespace(load_dataset=lambda _: [], train=train)
             with patch.dict(sys.modules, {"alvarezgui.minicpm_training": training}), \
                     patch("alvarezgui.minicpm_service.merge_adapter", lambda src, dst: merged.append((src, dst))), \
-                    patch("alvarezgui.h800_launcher.train_options", lambda config: {}):
+                    patch("alvarezgui.h800_launcher.train_options", lambda config, algorithm=None: {}):
                 run_pod(run_dir)
             self.assertEqual(merged, [(output, Path(str(output) + "-merged"))])
             self.assertTrue((run_dir / "COMPLETE").exists())
@@ -260,6 +266,7 @@ class StartRetryTest(unittest.TestCase):
             work = Path(directory)
             (work / "spec.json").write_text(json.dumps({"models": {"v": str(work)}}))
             (work / "token").write_text("secret")
+            (work / "config.json").write_text(json.dumps({"model_type": "minicpmv4_7"}))
             with patch.object(sglang_adapter, "_start", start), \
                     patch.object(sglang_adapter, "serve", lambda service, *args, **kwargs: served.append((service, kwargs))), \
                     patch.object(sglang_adapter.signal, "signal"):
@@ -294,30 +301,32 @@ class EvaluationServingTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory, "cfs")
-            full, lora, other = (root / "alvarez-checkpoints" / name for name in ("full", "lora", "qwen"))
-            for path in (full, lora, other):
+            full, lora, qwen, other = (root / "alvarez-checkpoints" / name for name in ("full", "lora", "qwen", "other"))
+            for path in (full, lora, qwen, other):
                 path.mkdir(parents=True)
             (full / "config.json").write_text(json.dumps({"model_type": "minicpmv4_7"}))
             (lora / "adapter_config.json").write_text(json.dumps({"base_model_name_or_path": str(full)}))
+            (qwen / "config.json").write_text(json.dumps({"model_type": "qwen3_vl"}))
             (other / "config.json").write_text(json.dumps({"model_type": "qwen3_vl"}))
+            (other / "perception_config.json").write_text("{}")  # Perception heads: HF only.
             launcher = FakeLauncher(root, Path(directory, "gpu"), MagicMock())
             launcher.serving_model = lambda version: root / "alvarez-checkpoints" / version
-            launcher.start_serving({"eval_id": "eval_1", "model_versions": ["full", "lora", "qwen"]})
+            launcher.start_serving({"eval_id": "eval_1", "model_versions": ["full", "lora", "qwen", "other"]})
             work = root / "alvarez-serving/eval_1"
             # One pod per model, each with its own spec, script, token and deployment.
-            specs = [json.loads((work / f"models/{index}/spec.json").read_text()) for index in range(3)]
-            self.assertEqual([spec["model_version"] for spec in specs], ["full", "lora", "qwen"])
+            specs = [json.loads((work / f"models/{index}/spec.json").read_text()) for index in range(4)]
+            self.assertEqual([spec["model_version"] for spec in specs], ["full", "lora", "qwen", "other"])
             self.assertTrue(all(spec["sglang_args"] == ["--enable-deterministic-inference"] for spec in specs))
             models = {spec["model_version"]: spec["models"][spec["model_version"]] for spec in specs}
             self.assertEqual({version: entry["backend"] for version, entry in models.items()},
-                             {"full": "sglang", "lora": "sglang", "qwen": "hf"})
+                             {"full": "sglang", "lora": "sglang", "qwen": "sglang", "other": "hf"})
             self.assertEqual(models["lora"]["merged_copy"], str(work / "merged/lora"))
             self.assertIn("sglang-adapter", (work / "models/0/pod.sh").read_text())
-            self.assertIn("serve-pod", (work / "models/2/pod.sh").read_text())  # HF model, HF pod.
-            self.assertEqual(sorted(launcher.deployments),
-                             ["alvarez-eval-1-m0", "alvarez-eval-1-m1", "alvarez-eval-1-m2"])
-            tokens = {(work / f"models/{index}/token").read_text() for index in range(3)}
-            self.assertEqual(len(tokens), 3)
+            self.assertIn("sglang-adapter", (work / "models/2/pod.sh").read_text())  # Qwen3-VL on sglang too.
+            self.assertIn("serve-pod", (work / "models/3/pod.sh").read_text())  # HF model, HF pod.
+            self.assertEqual(sorted(launcher.deployments), [f"alvarez-eval-1-m{index}" for index in range(4)])
+            tokens = {(work / f"models/{index}/token").read_text() for index in range(4)}
+            self.assertEqual(len(tokens), 4)
             (work / "merged/lora").mkdir(parents=True)
             launcher.stop_serving("eval_1", work, "done")
             self.assertFalse((work / "merged/lora").exists())
@@ -347,11 +356,14 @@ class EvaluationServingTest(unittest.TestCase):
             return f"http://127.0.0.1:{len(starts)}"
 
         def merge(src, dst):
-            dst.mkdir(parents=True)
+            dst.mkdir(parents=True, exist_ok=True)
 
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
             (work / "token").write_text("secret")
+            (work / "config.json").write_text(json.dumps({"model_type": "minicpmv4_7"}))
+            (work / "merged/b").mkdir(parents=True)
+            (work / "merged/b/config.json").write_text(json.dumps({"model_type": "minicpmv4_7"}))
             spec = {"models": {"a": {"path": str(work), "backend": "sglang"},
                                "b": {"path": "/adapter", "backend": "sglang", "merged_copy": str(work / "merged/b")},
                                "h": {"path": "/hf", "backend": "hf"}}, "sglang_memory": 0.8}
@@ -416,6 +428,7 @@ class ResidentSwapTest(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as directory:
                 url = f"http://127.0.0.1:{server.server_address[1]}"
+                Path(directory, "config.json").write_text(json.dumps({"model_type": "minicpmv4_7"}))
                 resident = ResidentService(SglangService("r0", directory, url))
                 request = lambda version: InferenceRequest(
                     request_id="q", model_version=version, image_uri="file:///x.png", instruction="go")

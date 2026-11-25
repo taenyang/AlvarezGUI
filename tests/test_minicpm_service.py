@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 
 from alvarezgui.consumer import _model_image_uri
+from alvarezgui.console_store import trial_outcome
 from alvarezgui.minicpm_service import MiniCPMService, _parse_action
 from alvarezgui.model import InvalidActionOutputError
 from alvarezgui.sokoban import ACTIONS
@@ -193,6 +194,38 @@ class MiniCPMServiceTest(unittest.TestCase):
         context["accelerator"] = "4090"
         with self.assertRaises(ModelUnavailableError):
             consumer._run_episode("t", "e", "s", "l")
+
+    def test_invalid_output_and_off_control_tap_are_recorded_then_fail_the_trial(self) -> None:
+        from alvarezgui.consumer import Consumer
+
+        consumer = Consumer.__new__(Consumer)
+        consumer.lease_ttl = None
+        consumer.runtime = Mock()
+        context = {"status": "RUNNING_ENV", "accelerator": "h800", "current_step": 3, "max_steps": 20,
+                   "policy_version": "v"}
+        recorded = []
+        consumer._store_call = lambda method, *args: (
+            context if method == "get_execution_context" else recorded.append(args) or True if method == "record_step"
+            else True)
+        consumer._final_observation = consumer._upload_observation = consumer._destroy_if_lease_owner = Mock()
+
+        consumer._next_action = Mock(side_effect=InvalidActionOutputError(
+            "model service returned HTTP 422: invalid action-v1 output", raw_output='{"type":"tap","x":544,980}',
+            output_format="action-v1"))
+        with self.assertRaisesRegex(InvalidActionOutputError, "HTTP 422"):
+            consumer._run_episode("t", "e", "s", "l")
+        consumer.runtime.execute.assert_not_called()  # Nothing ran on the screen.
+        _, _, step_id, _, action, reward, done, _, output, _ = recorded[-1]
+        self.assertEqual((step_id, action["type"], reward["invalid_action"], done), (3, "terminate", True, False))
+        self.assertEqual((output["raw_output"], output["invalid"]), ('{"type":"tap","x":544,980}', True))
+
+        tap = {"type": "tap", "x": 544, "y": 836}
+        consumer._next_action = Mock(return_value=(tap, {"raw_output": json.dumps(tap)}))
+        consumer.runtime.execute.return_value = {"done": False, "reward": {"total": 0.0, "invalid_action": True}}
+        with self.assertRaisesRegex(InvalidActionOutputError, "outside the task controls") as error:
+            consumer._run_episode("t", "e", "s", "l")
+        self.assertEqual(trial_outcome("FAILED", {"error": str(error.exception)}), "invalid_output")
+        self.assertEqual(recorded[-1][4], tap)  # The step keeps the action the model chose.
 
     def test_replayed_invalid_outputs_remain_rejected_with_evidence(self) -> None:
         for raw in (

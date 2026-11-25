@@ -4,7 +4,7 @@ from typing import Literal
 from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-MAX_SANDBOXES = 32  # Per runtime node, whatever its hardware.
+MAX_SANDBOXES = 64  # Per runtime node; the real ceiling is the smallest of this, CPU, memory and network.
 
 
 class Settings(BaseSettings):

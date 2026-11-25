@@ -304,7 +304,7 @@ class H800LauncherTest(unittest.TestCase):
             self.assertTrue((run_dir / "DONE").exists())
 
     def test_resident_online_run_keeps_one_worker_and_one_rollout_service(self) -> None:
-        """docs/h800-resident-pods.md: one worker and one sglang service for the whole run, weights swapped
+        """One worker and one sglang service for the whole run, weights swapped
         per round, endpoint published only for the round's own policy, 4090 copies off the critical path."""
         with tempfile.TemporaryDirectory() as directory:
             root, serving = Path(directory, "cfs"), Path(directory, "gpu")
@@ -385,12 +385,12 @@ class H800LauncherTest(unittest.TestCase):
             launcher.tick()  # Lost worker: recreated.
             self.assertIn("alvarez-train-abc-w", launcher.deployments)
             output0 = finish_round(0, merged=True)
-            launcher.tick()  # Round 0 done: copy in the background, swap the service to round 0's merge.
-            launcher.copy_threads["run_abc"].join()
-            self.assertEqual(copied, ["round-0"])
-            launcher.tick()  # Copy verified: register round 0. Not yet swapped: nothing published.
+            launcher.tick()  # Round 0 done: registered without a 4090 copy (retention drops it), swap to its merge.
+            self.assertEqual(copied, [])
             self.assertEqual(agent.register.call_args.args[3], "r0")
-            self.assertEqual(agent.register.call_args.kwargs["checkpoint_uri"], "file:///home/round-0")
+            self.assertEqual(agent.register.call_args.kwargs["checkpoint_uri"],
+                             "file:///home/alvarez-checkpoints/run_abc/round-0")
+            launcher.tick()  # Not yet swapped: nothing published.
             merged0 = Path(str(output0) + "-merged")
             swapped("run_abc-r0", merged0)
             launcher.tick()
@@ -401,6 +401,7 @@ class H800LauncherTest(unittest.TestCase):
             finish_round(1, merged=False)  # The last round is not merged.
             launcher.tick()
             launcher.copy_threads["run_abc"].join()
+            self.assertEqual(copied, ["round-1"])  # The last round is the run's model: copied to the 4090.
             agent.finish.assert_not_called()  # Round 1 is not on the 4090 yet.
             launcher.tick()  # Register round 1; all rounds on the 4090: succeed and delete both deployments.
             self.assertEqual(agent.finish.call_args.args[:2], ("run_abc", True))
@@ -408,6 +409,41 @@ class H800LauncherTest(unittest.TestCase):
             self.assertEqual(launcher.deployments, {})
             self.assertFalse(merged0.exists())  # The service's merged copies go with it.
             self.assertTrue(output0.exists())  # The checkpoint itself stays.
+
+    def test_resident_run_copies_only_rounds_that_retention_keeps(self) -> None:
+        """Rounds that prune_checkpoints will delete are registered (rollouts need a version) but not copied."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory, "cfs")
+            launcher = FakeLauncher(root, Path(directory, "gpu"), MagicMock())
+            launcher.agent.register.side_effect = lambda run, output, metrics, suffix, checkpoint_uri: f"run_abc-{suffix}"
+            copied = []
+            launcher.copy_to_serving = lambda run_id, output: copied.append(output.name) or f"file:///home/{output.name}"
+            launcher.trained_resident = MagicMock(return_value=True)
+            run = {"run_id": "run_abc", "base_model": "base",
+                   "config": {"rounds": 5, "checkpoint_every": 2}}
+            run_dir = root / "alvarez-runs/run_abc"
+            run_dir.mkdir(parents=True)
+            state = {"round": 0, "policy_version": "base", "policy_path": "/b", "step_offset": 0, "metrics": {},
+                     "resident": True}
+            (run_dir / "online.json").write_text(json.dumps(state))
+            for number in range(5):
+                work, output = run_dir / f"round-{number}", root / f"alvarez-checkpoints/run_abc/round-{number}"
+                output.mkdir(parents=True)
+                (output / "metrics.json").write_text(json.dumps({"step_count": 1}))
+                work.mkdir()
+                (work / "spec.json").write_text(json.dumps({"output_dir": str(output)}))
+                (work / "rollout-summary.json").write_text("{}")
+                launcher.advance_online(run, run_dir)
+                if launcher.copy_threads.get("run_abc"):
+                    launcher.copy_threads["run_abc"].join()
+                    launcher.publish_copies(run, run_dir)
+                state = json.loads((run_dir / "online.json").read_text())
+                self.assertEqual((state["round"], state["policy_version"]), (number + 1, f"run_abc-r{number}"))
+                self.assertEqual(state["checkpoint_uri"], f"file:///home/alvarez-checkpoints/run_abc/round-{number}")
+            # Kept by every-2 retention (rounds 1 and 3) and the last round; 0 and 2 only registered.
+            self.assertEqual(copied, ["round-1", "round-3", "round-4"])
+            registered = [c.args[3] for c in launcher.agent.register.call_args_list]
+            self.assertEqual(sorted(registered), ["r0", "r1", "r2", "r3", "r4"])
 
     def test_resident_pod_restart_cap_fails_the_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

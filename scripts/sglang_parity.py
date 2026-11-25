@@ -1,4 +1,4 @@
-"""T4 of docs/h800-sglang-rollout.md: compare two ``/internal/v1/model/infer`` endpoints on real screenshots.
+"""Compare two ``/internal/v1/model/infer`` endpoints on real screenshots.
 
 Both sides speak the same protocol, so this checks the whole sglang adapter path against HF serving.
 Run from the repo root with ``set -a; . var/platform.env; set +a`` and ``PYTHONPATH=src .venv/bin/python``:
@@ -138,7 +138,7 @@ def _kube(*args: str, stdin: str | None = None) -> str:
 
 def serve(name: str, models: dict, sglang_args: list[str]) -> None:
     """One adapter pod built like an evaluation service; ``models`` is spec.json's ``models``
-    (``{version: path}`` or ``{version: {path, backend, merged_copy?}}``, see docs/h800-sglang-evaluation.md)."""
+    (``{version: path}`` or ``{version: {path, backend, merged_copy?}}``)."""
     from alvarezgui.h800_launcher import CFS_ROOT, SGLANG_POD_SCRIPT, deployment_manifest
 
     work = PARITY_ROOT / name

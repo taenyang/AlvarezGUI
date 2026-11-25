@@ -54,6 +54,8 @@ def _validate_protocol(row: dict[str, Any], output_format: str) -> None:
         raise DatasetValidationError("structured rows require instruction to verify the final user prompt")
     elif PLAN_INSTRUCTION_MARKER in prompt:
         raise DatasetValidationError("action-v1 row contains a structured output prompt")
+    if row.get("invalid_output") is True and isinstance(turns[-1].get("content"), str):
+        return  # A rejected rollout output, trained only with its (negative) policy advantage.
     try:
         parse_policy_output(turns[-1].get("content"), output_format)
     except (TypeError, ValueError) as exc:
@@ -1056,6 +1058,8 @@ def train(
     logit_scale = float(sampling_temperature) if sampling_temperature else 1.0
     for row in rows:
         _validate_protocol(row, output_format)
+        if row.get("invalid_output") is True and algorithm not in POLICY_ALGORITHMS:
+            raise DatasetValidationError("invalid_output rows are only trainable by policy algorithms")
     if algorithm in POLICY_ALGORITHMS:
         if group_size < 2:
             raise ValueError(f"{algorithm.upper()} requires group_size >= 2")

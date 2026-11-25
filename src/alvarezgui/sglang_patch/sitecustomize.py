@@ -1,4 +1,4 @@
-"""Loaded by every sglang process (on PYTHONPATH, so spawned children load it too); see docs/h800-sglang-rollout.md.
+"""Loaded by every sglang process (on PYTHONPATH, so spawned children load it too).
 
 The MiniCPMV wrapper is a plain object that forwards attribute reads to the inner nn.Module, so the
 loader's ``model.shared_experts_config = ...`` lands on the wrapper while runners read it from the inner

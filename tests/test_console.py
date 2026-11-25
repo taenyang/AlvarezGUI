@@ -1389,6 +1389,35 @@ class ConsolePureTest(unittest.TestCase):
                                          + [{"outcome": "success", "attempts": 3, "reward_total": 0.0, "steps": 1,
                                              "group_id": "g"}])["rollout/retries"], 2.0)
 
+    def test_invalid_output_is_penalized_and_its_step_trains(self) -> None:
+        from alvarezgui.training_agent import INVALID_OUTPUT_REWARD
+
+        step = lambda i, raw, **extra: {"step_id": i, "done": False, "observation": {},
+                                        "model_output": {"raw_output": raw, **extra}}
+        tasks = [
+            {"episode_id": "ok", "group_id": "g", "outcome": "success", "reward_total": 1.0, "instruction": "i",
+             "step_records": [step(0, '{"type":"tap","x":360,"y":836}')]},
+            {"episode_id": "bad", "group_id": "g", "outcome": "invalid_output", "reward_total": 0.0, "instruction": "i",
+             "step_records": [step(0, '{"type":"tap","x":360,"y":836}'),
+                              step(1, '{"type":"tap","x":544,980}', invalid=True), step(2, None, invalid=True)]},
+        ]
+        cp = MagicMock()
+        cp.call.return_value = {"status": "RUNNING", "tasks": tasks}
+        agent = TrainingAgent(cp, node_id="t", checkpoint_root=Path("/tmp"), work_root=Path("/tmp"), model_service_url=None)
+        rollouts = agent.finished_rollouts({"run_id": "run_x"}, 0)
+        self.assertEqual([r["reward_total"] for r in rollouts], [1.0, INVALID_OUTPUT_REWARD])
+        rows = agent.rows({"run_id": "run_x", "algorithm": "dr_grpo", "config": {"max_steps": 20}}, 0, rollouts)
+        by_id = {row["id"]: row for row in rows}
+        # The rejected output trains with the episode's negative advantage; an output with no text is skipped.
+        self.assertEqual(sorted(by_id), ["bad-step-0", "bad-step-1", "ok-step-0"])
+        self.assertTrue(by_id["bad-step-1"]["invalid_output"])
+        self.assertNotIn("invalid_output", by_id["bad-step-0"])
+        self.assertLess(by_id["bad-step-1"]["advantage"], 0)
+        self.assertGreater(by_id["ok-step-0"]["advantage"], 0)
+        cp.call.return_value = {"status": "RUNNING", "tasks": [{**t, "reward_total": 0.0} for t in tasks]}
+        custom = agent.finished_rollouts({"run_id": "run_x", "config": {"invalid_output_reward": -0.5}}, 0)
+        self.assertEqual(custom[1]["reward_total"], -0.5)
+
     def test_round_tasks_cover_pool_before_repeating(self) -> None:
         pool = [{"task_type": "sokoban", "app_image": f"android-sokoban-v1:train-{i:03d}"} for i in range(5)]
         config = {"tasks": pool, "tasks_per_round": 2, "seed": 7}
@@ -1616,6 +1645,39 @@ class ConsolePureTest(unittest.TestCase):
         self.assertEqual(step_advantages([], "grpo", 3), {})
         with self.assertRaises(ValueError):
             step_advantages(rollouts, "ppo", 3)
+
+        # Components override a preset one at a time (config None keeps the preset, as above).
+        no_std = step_advantages(rollouts, "grpo", 3, {"advantage_std": False})
+        self.assertEqual(no_std[("a", 0)][0], 0.5)  # r - mean
+        dropped = step_advantages(rollouts, "grpo", 3, {"drop_zero_variance_groups": True})
+        self.assertNotIn(("c", 0), dropped)  # group h removed before the 1/|o_i| rollout count
+        self.assertEqual(dropped[("a", 0)], (1.0, 1 / (2 * 2)))
+        masked = step_advantages(rollouts, "grpo", 3, {"overlong": "mask"})
+        self.assertNotIn(("b", 1), masked)
+        self.assertEqual(masked[("a", 0)][0], 1.0)  # b still in the baseline
+        penalized = step_advantages(rollouts, "dr_grpo", 3, {"overlong": "penalty", "overlong_penalty": -0.5})
+        self.assertEqual(penalized[("a", 0)][0], 0.75)  # mean of 1 and -0.5
+        self.assertEqual(penalized[("b", 1)][0], -0.75)
+        constant = step_advantages(rollouts, "dr_grpo", 3, {"loss_normalization_constant": 10})
+        self.assertEqual(constant[("a", 0)][1], 1 / (10 * 4))
+        batch = step_advantages(rollouts, "grpo", 3, {"loss_normalization": "batch_steps"})
+        self.assertEqual(batch[("a", 0)][1], 1 / 7)
+        no_step = step_advantages(rollouts, "gigpo", 3, {"step_advantage_omega": 0})
+        self.assertAlmostEqual(no_step[("a", 0)][0], 0.5)
+        gamma = step_advantages(rollouts, "gigpo", 3, {"step_advantage_gamma": 0.5})
+        self.assertAlmostEqual(gamma[("a", 0)][0], 0.5 + 0.25)  # A_S = 0.5^1 * 1 / 2
+        grpo_with_step = step_advantages(rollouts, "grpo", 3, {"step_advantage_omega": 1.0})
+        self.assertAlmostEqual(grpo_with_step[("a", 0)][0], 1.0 + 0.475)
+
+    def test_train_options_apply_the_clip_preset(self) -> None:
+        from alvarezgui.training_agent import train_options
+
+        config = {"learning_rate": 1e-6, "epochs": 1, "gradient_accumulation": 1, "clip_epsilon": 0.2,
+                  "group_size": 8}
+        self.assertEqual(train_options(config, "dapo")["clip_epsilon_high"], 0.28)
+        self.assertIsNone(train_options(config, "grpo")["clip_epsilon_high"])
+        self.assertEqual(train_options({**config, "clip_epsilon_high": 0.4}, "grpo")["clip_epsilon_high"], 0.4)
+        self.assertEqual(train_options({**config, "clip_epsilon_high": 0.4}, "dapo")["clip_epsilon_high"], 0.4)
 
     def test_minicpm_service_loads_on_demand_and_evicts_lru(self) -> None:
         loads: list[str] = []

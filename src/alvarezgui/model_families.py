@@ -33,30 +33,6 @@ class ModelFamily:
     prepare_model: Callable[[Any], None] | None = None
 
 
-def _patch_embed_as_linear(model: Any) -> None:
-    """Qwen3-VL's patch Conv3d has kernel == stride, i.e. one linear map per flattened patch.
-
-    In the H800 image (torch 2.9.0+cu129) this Conv3d alone took 19.8 s for one 720x1280 screenshot
-    and the matmul 5 ms; whole Qwen inference fell from ~22 s to 0.45 s. The cause (cuDNN algorithm
-    choice vs. version) was not isolated. On the 4090 (torch 2.11) a whole inference averaged 0.8 s
-    with the Conv3d. Results differ only by bf16 rounding and are slightly closer to an fp64
-    reference. The same weight tensor is used, so checkpoints are unchanged.
-    """
-    import torch
-
-    embed = model.get_submodule("model.visual.patch_embed")
-    proj = embed.proj
-    if proj.kernel_size != proj.stride or any(proj.padding) or proj.groups != 1:
-        raise ValueError("Qwen3-VL patch embedding is not a non-overlapping Conv3d")
-
-    def forward(hidden_states: Any) -> Any:
-        weight = proj.weight
-        patches = hidden_states.reshape(-1, weight[0].numel()).to(weight.dtype)
-        return torch.nn.functional.linear(patches, weight.reshape(weight.shape[0], -1), proj.bias)
-
-    embed.forward = forward
-
-
 MINICPM_V_4_7 = ModelFamily(
     name="MiniCPM-V 4.7",
     model_type="minicpmv4_7",
@@ -74,7 +50,8 @@ QWEN3_VL = ModelFamily(
     # Patches of all images are flattened along dim 0; grid_thw has one row per image.
     image_concat={"pixel_values": 0, "image_grid_thw": 0},
     merger_module="model.visual.merger",
-    prepare_model=_patch_embed_as_linear,
+    # No prepare_model: the Conv3d-as-matmul patch fixed a 19.8 s patch embedding under torch 2.9; with torch
+    # 2.14+ Conv3d takes 0.7-1.8 ms, and the patch changed 18/96 greedy outputs (WORKLOG 11-25).
 )
 FAMILIES = {family.model_type: family for family in (MINICPM_V_4_7, QWEN3_VL)}
 

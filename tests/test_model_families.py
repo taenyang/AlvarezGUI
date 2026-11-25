@@ -14,43 +14,11 @@ class ModelFamilyTest(unittest.TestCase):
             self.assertIn("input_ids", family.text_keys)
             self.assertFalse(set(family.text_keys) & set(family.image_concat))
 
-    def test_qwen_patch_embedding_runs_as_identical_linear_map(self) -> None:
-        try:
-            import torch
-        except ImportError:
-            self.skipTest("requires torch")
-
-        class PatchEmbed(torch.nn.Module):
-            # Same shape logic as transformers' Qwen3VLVisionPatchEmbed.
-            def __init__(self):
-                super().__init__()
-                self.proj = torch.nn.Conv3d(3, 8, kernel_size=[2, 4, 4], stride=[2, 4, 4], bias=True)
-
-            def forward(self, hidden_states):
-                hidden_states = hidden_states.view(-1, 3, 2, 4, 4)
-                return self.proj(hidden_states.to(self.proj.weight.dtype)).view(-1, 8)
-
-        model = torch.nn.Module()
-        model.config = SimpleNamespace(model_type="qwen3_vl")
-        model.model = torch.nn.Module()
-        model.model.visual = torch.nn.Module()
-        model.model.visual.patch_embed = PatchEmbed()
-        torch.manual_seed(0)
-        patches = torch.randn(5, 3 * 2 * 4 * 4)
-        expected = model.model.visual.patch_embed(patches)
-        weight = model.model.visual.patch_embed.proj.weight
-        self.assertIs(prepare_model(model), model)
-        actual = model.model.visual.patch_embed(patches)
-        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
-        self.assertIs(model.model.visual.patch_embed.proj.weight, weight)  # Checkpoints are unchanged.
-        actual.sum().backward()
-        self.assertIsNotNone(weight.grad)
-
-        model.model.visual.patch_embed.proj = torch.nn.Conv3d(3, 8, kernel_size=[2, 4, 4], stride=[1, 4, 4])
-        with self.assertRaisesRegex(ValueError, "non-overlapping"):
-            prepare_model(model)
-        minicpm = SimpleNamespace(config=SimpleNamespace(model_type="minicpmv4_7"))
-        self.assertIs(prepare_model(minicpm), minicpm)
+    def test_prepare_model_leaves_models_without_a_hook_unchanged(self) -> None:
+        for model_type in ("minicpmv4_7", "qwen3_vl"):
+            model = SimpleNamespace(config=SimpleNamespace(model_type=model_type))
+            self.assertIs(prepare_model(model), model)
+        self.assertIsNone(QWEN3_VL.prepare_model)  # Removed: torch 2.14+ runs its Conv3d in ~1 ms.
 
 
 if __name__ == "__main__":

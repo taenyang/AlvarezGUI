@@ -25,6 +25,10 @@ from urllib.request import Request, urlopen
 log = logging.getLogger("alvarezgui.training_agent")
 TERMINAL = {"SUCCEEDED", "FAILED", "CANCELED"}
 SCORED_OUTCOMES = {"success", "unsuccessful", "invalid_output", "max_steps"}
+# Episode reward of an invalid output (unparseable JSON, or a tap outside the task controls): worse than
+# not solving (0) so the policy learns to stay in the action protocol, small next to success (1).
+# ponytail: fixed constant; make it a TrainingConfig knob if a run needs another value.
+INVALID_OUTPUT_REWARD = -0.2
 POLICY_ALGORITHMS = {"grpo", "dapo", "dr_grpo", "gigpo"}
 # Runtime errors (sandbox, ADB, artifact storage) say nothing about the policy, so a slot is rerun
 # with its seed instead of being dropped from the group baseline.
@@ -110,24 +114,41 @@ def episode_advantages(rollouts: list[dict[str, Any]], *, std: bool = True) -> d
     return advantages
 
 
-# Policy algorithms share rollout collection and the clipped ratio; they differ in the advantage of
-# each step (one screenshot -> one action) and in how steps are weighted in the batch loss.
-#   grpo     DeepSeekMath GRPO: episode advantage (r - mean) / std, each rollout's steps averaged
-#            (1/|o_i|) so every rollout weighs the same, symmetric clip, no KL.
-#   dapo     DAPO: same advantage, mean over all steps of the batch (token-level loss, 1/sum|o_i|),
-#            clip [1-eps, 1+eps_high], rollouts truncated at max_steps masked out (overlong filtering),
-#            no KL. Its dynamic sampling refills the batch; that refill is not implemented.
-# Every algorithm skips zero-advantage steps (rows()), so groups with identical rewards never train
-# except under GiGPO, whose step advantage can still separate shorter and longer successes.
-#   dr_grpo  Dr. GRPO: advantage r - mean (no std), every step divided by the constant max_steps
-#            instead of its rollout length, symmetric clip, no KL.
+# Policy algorithms share rollout collection and the clipped ratio. Each one is a preset of the components
+# below (one screenshot -> one action is one "step"); a run's config overrides any of them.
+#   grpo     DeepSeekMath GRPO: advantage (r - mean) / std, each rollout's steps averaged (1/|o_i|).
+#   dapo     DAPO: same advantage, zero-variance groups dropped (dynamic sampling, without its refill),
+#            mean over all steps of the batch (1/sum|o_i|), clip-higher 0.28, rollouts that hit max_steps
+#            masked (overlong filtering) but kept in the baseline.
+#   dr_grpo  Dr. GRPO: advantage r - mean (no std), every step divided by the constant max_steps.
 #   gigpo    GiGPO: A_E(episode) + omega * A_S(step); A_S groups steps of the same group by identical
 #            screen (anchor state) and compares discounted returns gamma^(T-t) * R. Paper defaults
 #            omega=1, gamma=0.95; F_norm=1 here. Steps averaged over the batch as in its Eq. 9.
+# Every preset skips zero-advantage steps (rows()), so groups with identical rewards never train
+# except under a step term, which can still separate shorter and longer successes.
 # ponytail: no KL term anywhere (beta=0, as DAPO/Dr. GRPO); add a reference model if drift appears.
-GIGPO_OMEGA = 1.0
-GIGPO_GAMMA = 0.95
-DAPO_CLIP_HIGH = 0.28
+ALGORITHM_PRESETS: dict[str, dict[str, Any]] = {
+    "grpo": {"advantage_std": True, "drop_zero_variance_groups": False, "overlong": "fail",
+             "loss_normalization": "per_rollout", "step_advantage_omega": 0.0, "clip_epsilon_high": None},
+    "dapo": {"advantage_std": True, "drop_zero_variance_groups": True, "overlong": "mask",
+             "loss_normalization": "batch_steps", "step_advantage_omega": 0.0, "clip_epsilon_high": 0.28},
+    "dr_grpo": {"advantage_std": False, "drop_zero_variance_groups": False, "overlong": "fail",
+                "loss_normalization": "constant", "step_advantage_omega": 0.0, "clip_epsilon_high": None},
+    "gigpo": {"advantage_std": False, "drop_zero_variance_groups": False, "overlong": "fail",
+              "loss_normalization": "batch_steps", "step_advantage_omega": 1.0, "clip_epsilon_high": None},
+}
+STEP_ADVANTAGE_GAMMA = 0.95
+
+
+def policy_components(algorithm: str, config: dict[str, Any]) -> dict[str, Any]:
+    """The algorithm's preset with the run's explicit (non-None) overrides applied."""
+    if algorithm not in ALGORITHM_PRESETS:
+        raise ValueError(f"unknown policy algorithm {algorithm!r}")
+    keys = (*ALGORITHM_PRESETS[algorithm], "step_advantage_gamma", "loss_normalization_constant")
+    return {**ALGORITHM_PRESETS[algorithm], "step_advantage_gamma": STEP_ADVANTAGE_GAMMA,
+            "loss_normalization_constant": config.get("max_steps"), "overlong_penalty": -0.1,
+            **{key: config[key] for key in keys if config.get(key) is not None},
+            **{key: config[key] for key in ("overlong_penalty",) if key in config}}
 
 
 def anchor_state(step: dict[str, Any]) -> str | None:
@@ -139,34 +160,36 @@ def anchor_state(step: dict[str, Any]) -> str | None:
 
 
 def step_advantages(rollouts: list[dict[str, Any]], algorithm: str, max_steps: int,
-                    *, omega: float = GIGPO_OMEGA, gamma: float = GIGPO_GAMMA) -> dict[tuple[str, int], tuple[float, float]]:
+                    config: dict[str, Any] | None = None) -> dict[tuple[str, int], tuple[float, float]]:
     """``(episode_id, step_id) -> (advantage, loss_weight)`` for every trainable model step.
 
     The trainer minimizes ``sum(loss_weight * clipped_ratio_loss)`` over a round, so loss weights encode
-    each algorithm's normalization. Steps without model output (fixture setup) are not trainable."""
-    if algorithm not in POLICY_ALGORITHMS:
-        raise ValueError(f"unknown policy algorithm {algorithm!r}")
+    each algorithm's normalization. Steps without model output (fixture setup) are not trainable.
+    ``config`` overrides the algorithm's components (see ALGORITHM_PRESETS)."""
+    c = policy_components(algorithm, {"max_steps": max_steps, **(config or {})})
     scored = [r for r in rollouts if r["outcome"] in SCORED_OUTCOMES]
-    if algorithm == "dapo":
-        # A group whose rewards are all equal has zero advantage; drop it before the step count so its
-        # steps do not dilute the 1/sum|o_i| weight of the rest (the other algorithms get this from rows()).
+    if c["overlong"] == "penalty":
+        scored = [{**r, "reward_total": c["overlong_penalty"]} if r["outcome"] == "max_steps" else r for r in scored]
+    if c["drop_zero_variance_groups"]:
+        # An equal-reward group has zero advantage; drop it before the step count so its steps do not
+        # dilute the normalization of the rest (without this, rows() still skips its zero-advantage steps).
         rewards: dict[str, set[float]] = {}
         for rollout in scored:
             rewards.setdefault(rollout["group_id"], set()).add(rollout["reward_total"])
         scored = [r for r in scored if len(rewards[r["group_id"]]) > 1]
-        # Overlong filtering: a rollout cut off at max_steps is masked, not punished as a failure. It still
-        # counts in the baseline above (its reward is a real observation of the policy).
-        baseline = episode_advantages(scored)
+    baseline = episode_advantages(scored, std=c["advantage_std"])
+    if c["overlong"] == "mask":
+        # Overlong filtering: a rollout cut off at max_steps is not trained, but it stays in the baseline
+        # above (its reward is a real observation of the policy).
         scored = [r for r in scored if r["outcome"] != "max_steps"]
-    else:
-        baseline = episode_advantages(scored, std=algorithm == "grpo")
     trainable = {r["episode_id"]: [s for s in r.get("step_records", []) if s.get("model_output")] for r in scored}
     step_count = sum(len(steps) for steps in trainable.values())
     if not step_count:
         return {}
-    result: dict[tuple[str, int], tuple[float, float]] = {}
-    if algorithm == "gigpo":
+    step_relative: dict[tuple[str, int], float] = {}
+    if c["step_advantage_omega"]:
         # Discounted return of each step: the only reward is the episode's final one, at its last step.
+        gamma = c["step_advantage_gamma"]
         returns: dict[tuple[str, int], float] = {}
         anchors: dict[tuple[str, str], list[tuple[str, int]]] = {}
         for rollout in scored:
@@ -176,25 +199,22 @@ def step_advantages(rollouts: list[dict[str, Any]], algorithm: str, max_steps: i
                 returns[key] = gamma ** (len(steps) - 1 - position) * rollout["reward_total"]
                 if (state := anchor_state(step)) is not None:
                     anchors.setdefault((rollout["group_id"], state), []).append(key)
-        step_relative: dict[tuple[str, int], float] = {}
         for members in anchors.values():
             if len(members) > 1:  # A singleton anchor has no peers to compare with: A_S = 0.
                 mean = statistics.fmean(returns[key] for key in members)
                 for key in members:
                     step_relative[key] = returns[key] - mean
-        for rollout in scored:
-            for step in trainable[rollout["episode_id"]]:
-                key = (rollout["episode_id"], step["step_id"])
-                result[key] = (baseline[rollout["episode_id"]] + omega * step_relative.get(key, 0.0), 1 / step_count)
-        return result
     rollout_count = sum(1 for steps in trainable.values() if steps)
+    result: dict[tuple[str, int], tuple[float, float]] = {}
     for rollout in scored:
         steps = trainable[rollout["episode_id"]]
         for step in steps:
-            weight = {"grpo": 1 / (len(steps) * rollout_count),
-                      "dapo": 1 / step_count,
-                      "dr_grpo": 1 / (max_steps * rollout_count)}[algorithm]
-            result[(rollout["episode_id"], step["step_id"])] = (baseline[rollout["episode_id"]], weight)
+            key = (rollout["episode_id"], step["step_id"])
+            weight = {"per_rollout": lambda: 1 / (len(steps) * rollout_count),
+                      "batch_steps": lambda: 1 / step_count,
+                      "constant": lambda: 1 / (c["loss_normalization_constant"] * rollout_count)}[c["loss_normalization"]]()
+            result[key] = (baseline[rollout["episode_id"]] + c["step_advantage_omega"] * step_relative.get(key, 0.0),
+                           weight)
     return result
 
 
@@ -490,6 +510,9 @@ class TrainingAgent:
         rollouts = state["tasks"]
         if any(r["outcome"] in {"queued", "running"} for r in rollouts):
             return None
+        for rollout in rollouts:
+            if rollout["outcome"] == "invalid_output":
+                rollout["reward_total"] = run.get("config", {}).get("invalid_output_reward", INVALID_OUTPUT_REWARD)
         errors = sum(r["outcome"] == "error" for r in rollouts)
         if errors:
             retried = self.cp.call("POST", f"/internal/v1/training/runs/{run['run_id']}/rollouts/retry",
@@ -506,7 +529,7 @@ class TrainingAgent:
         from alvarezgui.minicpm_service import service_instruction
 
         algorithm = run["algorithm"]
-        advantages = step_advantages(rollouts, algorithm, run["config"]["max_steps"])
+        advantages = step_advantages(rollouts, algorithm, run["config"]["max_steps"], run["config"])
         image_dir = self.work_root / run["run_id"] / f"round-{round_number}"
         rows = []
         for rollout in rollouts:
@@ -515,6 +538,8 @@ class TrainingAgent:
                 if advantage == 0.0:  # No gradient; skip the screenshot download and forward pass.
                     continue
                 output = step["model_output"]
+                if not output.get("raw_output"):
+                    continue  # An invalid output the model service did not return text for.
                 image = image_dir / f"{rollout['episode_id']}-{step['step_id']}.png"
                 self.cp.download(
                     f"/api/v1/episodes/{rollout['episode_id']}/steps/{step['step_id']}/screenshot", image
@@ -533,6 +558,8 @@ class TrainingAgent:
                     "advantage": advantage,
                     "loss_weight": loss_weight,
                     "done": step["done"],
+                    # Unparseable completions are trainable only as penalized policy steps, never as SFT.
+                    **({"invalid_output": True} if output.get("invalid") else {}),
                 })
         self.log(run["run_id"], f"round {round_number}: {len(rows)} training rows from {len(rollouts)} rollouts")
         return rows
@@ -547,7 +574,7 @@ class TrainingAgent:
             base_path,
             rows,
             output_dir,
-            **train_options(run["config"]),
+            **train_options(run["config"], run["algorithm"]),
             save_every=save_every,
             sampling_temperature=sampling_temperature,
             compute_old_logprob=True,
@@ -624,7 +651,7 @@ def round_tasks(config: dict[str, Any], round_number: int) -> list[dict[str, Any
     return order[round_number * per_round:(round_number + 1) * per_round]
 
 
-def train_options(config: dict[str, Any]) -> dict[str, Any]:
+def train_options(config: dict[str, Any], algorithm: str | None = None) -> dict[str, Any]:
     """Map a run's TrainingConfig onto ``minicpm_training.train`` keyword arguments."""
     return {
         "learning_rate": config["learning_rate"],
@@ -640,7 +667,9 @@ def train_options(config: dict[str, Any]) -> dict[str, Any]:
         "output_format": config.get("output_format", "action-v1"),
         "seed": config.get("seed", 0),
         "clip_epsilon": config["clip_epsilon"],
-        "clip_epsilon_high": config.get("clip_epsilon_high"),
+        # The algorithm preset's upper bound (DAPO 0.28) unless the run sets one.
+        "clip_epsilon_high": (config.get("clip_epsilon_high") if config.get("clip_epsilon_high") is not None
+                              else ALGORITHM_PRESETS.get(algorithm, {}).get("clip_epsilon_high")),
         "group_size": config["group_size"],
     }
 
